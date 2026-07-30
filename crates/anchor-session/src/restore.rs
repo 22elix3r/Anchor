@@ -1,20 +1,31 @@
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
 use std::fs;
-use std::io::{self, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use anchor_core::ObjectStore;
 use anchor_core::{
     CaptureEngine, CaptureOptions, ConflictReason, ManifestEntry, ManifestNode, NativeRelativePath,
-    NoChangeReason, ObjectStore, ObservedKind, RestoreOutcome, RestorePlan, ScopeClassifier,
-    ScopeDecision, ScopeError,
+    NoChangeReason, ObservedKind, RestoreOutcome, RestorePlan, ScopeClassifier, ScopeDecision,
+    ScopeError,
 };
 use anchor_git::GitContext;
+#[cfg(unix)]
 use atomic_write_file::AtomicWriteFile;
+#[cfg(unix)]
 use cap_std::ambient_authority;
+#[cfg(unix)]
 use cap_std::fs::{Dir, OpenOptions};
+#[cfg(unix)]
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+#[cfg(unix)]
 use uuid::Uuid;
 
 use crate::{SessionError, SessionId, SessionStore};
@@ -421,6 +432,7 @@ fn remove_node(
     Ok(())
 }
 
+#[cfg(unix)]
 fn private_transaction_dir(path: &Path) -> Result<(), RestoreError> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
@@ -431,6 +443,7 @@ fn private_transaction_dir(path: &Path) -> Result<(), RestoreError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn save_journal(path: &Path, journal: &RestoreJournal) -> Result<(), RestoreError> {
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(journal, &mut bytes)
@@ -441,6 +454,7 @@ fn save_journal(path: &Path, journal: &RestoreJournal) -> Result<(), RestoreErro
     Ok(())
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RestoreJournal {
     schema: u16,
@@ -450,6 +464,7 @@ struct RestoreJournal {
     state: JournalState,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 enum JournalState {
     Prepared,
