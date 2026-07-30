@@ -14,15 +14,18 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_OFFLINE,
     FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FileAttributeTagInfo, FileBasicInfo, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo,
-    FileIdInfo, FileStandardInfo, FileStreamInfo, GetFileInformationByHandleEx,
-    GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_DOS,
+    FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
+    FileCaseSensitiveInfo, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo,
+    FileStandardInfo, FileStreamInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    OPEN_EXISTING, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
-use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_SYMLINK;
+use windows_sys::Win32::System::SystemServices::{
+    FILE_CS_FLAG_CASE_SENSITIVE_DIR, IO_REPARSE_TAG_SYMLINK,
+};
 
 use crate::{VerbatimPath, WindowsError, io_error};
 
@@ -210,6 +213,17 @@ impl DirectoryHandle {
     /// Returns an error for malformed native records or filesystem query failure.
     pub fn entries(&self) -> Result<Vec<DirectoryEntry>, WindowsError> {
         enumerate(&self.handle)
+    }
+
+    /// Whether this directory uses per-directory case-sensitive lookup semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the filesystem cannot report case semantics.
+    pub fn is_case_sensitive(&self) -> Result<bool, WindowsError> {
+        let info: FILE_CASE_SENSITIVE_INFO =
+            query_fixed(&self.handle, FileCaseSensitiveInfo, "FileCaseSensitiveInfo")?;
+        Ok(info.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0)
     }
 
     /// Open an enumerated child without following a reparse point and verify its identity.

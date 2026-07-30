@@ -78,6 +78,10 @@ impl<C: ScopeClassifier> WindowsCapture<'_, C> {
         relative: &NativeRelativePath,
         is_root: bool,
     ) -> Result<(), CaptureError> {
+        if directory.is_case_sensitive()? {
+            self.degrade_or_fail(relative.clone(), OmissionReason::CaseSemanticsUnknown)?;
+            return Ok(());
+        }
         let first = sorted_entries(directory, relative)?;
         if first.is_empty() && !is_root {
             self.entries.push(ManifestEntry {

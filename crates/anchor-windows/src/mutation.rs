@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, c_void};
 use std::fs::File;
-use std::mem::{offset_of, size_of};
+use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
 use std::path::Path;
@@ -365,8 +365,10 @@ fn rename_handle(
         .len()
         .checked_mul(2)
         .ok_or(WindowsError::TooLarge("rename filename"))?;
-    let header = offset_of!(FILE_RENAME_INFO, FileName);
-    let total = header
+    // Windows requires the buffer to contain the complete declared structure plus the variable
+    // filename bytes. Using only `offset_of(FileName) + name_bytes` is rejected with
+    // ERROR_INVALID_PARAMETER even though the payload itself would fit.
+    let total = size_of::<FILE_RENAME_INFO>()
         .checked_add(name_bytes)
         .ok_or(WindowsError::TooLarge("rename information"))?;
     let mut buffer = vec![0_usize; total.div_ceil(size_of::<usize>())];
