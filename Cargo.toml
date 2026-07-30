@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/anchor-windows",
     "crates/anchor-core",
     "crates/anchor-git",
     "crates/anchor-session",
@@ -18,6 +19,7 @@ homepage = "https://github.com/22elix3r/Anchor"
 authors = ["Anchor contributors"]
 
 [workspace.dependencies]
+anchor-windows = { version = "0.1.0", path = "crates/anchor-windows" }
 anchor-core = { version = "0.1.0", path = "crates/anchor-core" }
 anchor-git = { version = "0.1.0", path = "crates/anchor-git" }
 anchor-session = { version = "0.1.0", path = "crates/anchor-session" }
@@ -49,6 +51,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1.24.0", features = ["serde", "v7"] }
 zstd = { version = "0.13.3", default-features = false }
+windows-sys = { version = "0.61.2", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
