@@ -611,6 +611,11 @@ fn execute(cli: Cli) -> Result<i32> {
                         "incomplete_sessions": report.incomplete_sessions,
                         "manifests_verified": report.manifests_verified,
                         "objects_verified": report.objects_verified,
+                        "legacy_manifests_review_only": report.legacy_manifests_review_only,
+                        "hardlink_refusal_entries": report.hardlink_refusal_entries,
+                        "unmodeled_metadata_refusal_entries": report.unmodeled_metadata_refusal_entries,
+                        "metadata_unavailable_refusal_entries": report.metadata_unavailable_refusal_entries,
+                        "platform_managed_entries": report.platform_managed_entries,
                         "transactions": report.transactions,
                         "transactions_needing_recovery": report.transactions_needing_recovery,
                         "unfinished_transactions": report.unfinished_transactions,
@@ -625,6 +630,26 @@ fn execute(cli: Cli) -> Result<i32> {
                 println!("incomplete sessions: {}", report.incomplete_sessions);
                 println!("manifests verified: {}", report.manifests_verified);
                 println!("objects verified: {}", report.objects_verified);
+                println!(
+                    "legacy manifests (review-only): {}",
+                    report.legacy_manifests_review_only
+                );
+                println!(
+                    "hard-link restore refusals: {}",
+                    report.hardlink_refusal_entries
+                );
+                println!(
+                    "unmodeled-metadata restore refusals: {}",
+                    report.unmodeled_metadata_refusal_entries
+                );
+                println!(
+                    "metadata-query restore refusals: {}",
+                    report.metadata_unavailable_refusal_entries
+                );
+                println!(
+                    "platform-managed metadata entries: {}",
+                    report.platform_managed_entries
+                );
                 println!("restore transactions: {}", report.transactions);
                 println!(
                     "transactions needing recovery: {}",

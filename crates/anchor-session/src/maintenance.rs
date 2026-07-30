@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use anchor_core::{Manifest, ManifestNode, ObjectId};
+use anchor_core::{Manifest, ManifestNode, MetadataObservation, ObjectId};
 use anchor_git::{GitContext, IndexCapture};
 use thiserror::Error;
 
@@ -16,6 +16,11 @@ pub struct DoctorReport {
     pub incomplete_sessions: u64,
     pub manifests_verified: u64,
     pub objects_verified: u64,
+    pub legacy_manifests_review_only: u64,
+    pub hardlink_refusal_entries: u64,
+    pub unmodeled_metadata_refusal_entries: u64,
+    pub metadata_unavailable_refusal_entries: u64,
+    pub platform_managed_entries: u64,
     pub transactions: u64,
     pub transactions_needing_recovery: u64,
     pub unfinished_transactions: u64,
@@ -53,6 +58,11 @@ impl MaintenanceService {
         let mut objects = BTreeSet::new();
         let mut policies = BTreeSet::new();
         let mut incomplete = 0_u64;
+        let mut legacy_manifests_review_only = 0_u64;
+        let mut hardlink_refusal_entries = 0_u64;
+        let mut unmodeled_metadata_refusal_entries = 0_u64;
+        let mut metadata_unavailable_refusal_entries = 0_u64;
+        let mut platform_managed_entries = 0_u64;
         for session in &sessions {
             if !session.state.is_terminal()
                 || matches!(
@@ -79,6 +89,36 @@ impl MaintenanceService {
         }
         for id in &manifests {
             let manifest = store.load_manifest(*id)?;
+            if manifest.schema_version() < 3 {
+                legacy_manifests_review_only = legacy_manifests_review_only.saturating_add(1);
+            }
+            for entry in manifest.entries() {
+                if matches!(&entry.node, ManifestNode::Regular { .. })
+                    && (entry.safety.link_count > 1 || entry.safety.hardlink_group.is_some())
+                {
+                    hardlink_refusal_entries = hardlink_refusal_entries.saturating_add(1);
+                }
+                match entry.safety.extended_metadata {
+                    MetadataObservation::Present => {
+                        unmodeled_metadata_refusal_entries =
+                            unmodeled_metadata_refusal_entries.saturating_add(1);
+                    }
+                    MetadataObservation::Unknown
+                        if !matches!(&entry.node, ManifestNode::Symlink { .. }) =>
+                    {
+                        metadata_unavailable_refusal_entries =
+                            metadata_unavailable_refusal_entries.saturating_add(1);
+                    }
+                    MetadataObservation::Unavailable => {
+                        metadata_unavailable_refusal_entries =
+                            metadata_unavailable_refusal_entries.saturating_add(1);
+                    }
+                    MetadataObservation::PlatformManaged => {
+                        platform_managed_entries = platform_managed_entries.saturating_add(1);
+                    }
+                    MetadataObservation::Unknown | MetadataObservation::Absent => {}
+                }
+            }
             collect_manifest_objects(&manifest, &mut objects);
         }
         for (id, raw_size) in &objects {
@@ -95,6 +135,11 @@ impl MaintenanceService {
             incomplete_sessions: incomplete,
             manifests_verified: u64::try_from(manifests.len()).unwrap_or(u64::MAX),
             objects_verified: u64::try_from(objects.len()).unwrap_or(u64::MAX),
+            legacy_manifests_review_only,
+            hardlink_refusal_entries,
+            unmodeled_metadata_refusal_entries,
+            metadata_unavailable_refusal_entries,
+            platform_managed_entries,
             transactions: transactions.total,
             transactions_needing_recovery: transactions.needs_recovery,
             unfinished_transactions: transactions.unfinished,
@@ -367,6 +412,36 @@ mod tests {
         let swept = MaintenanceService::gc(&store, false).unwrap();
         assert_eq!(swept.objects_removed, 1);
         assert!(!store.objects().object_path(object).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_reports_metadata_based_restore_refusals() {
+        let root = repository();
+        let file = root.path().join("file");
+        fs::write(&file, b"before").unwrap();
+        fs::hard_link(&file, root.path().join("alias")).unwrap();
+        rustix::fs::setxattr(
+            &file,
+            "user.anchor-doctor-test",
+            b"present",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+        SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: change_command(),
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+
+        let report = MaintenanceService::doctor(&store, &context).unwrap();
+
+        assert!(report.hardlink_refusal_entries >= 2);
+        assert!(report.unmodeled_metadata_refusal_entries >= 2);
     }
 
     #[test]
