@@ -25,6 +25,10 @@ tested and documented.
 
 ### R1. Restoration fault-injection matrix
 
+Status: in progress. Deterministic crashes at all whole-batch and first-item
+boundaries, post-commit roll-forward, concurrent-creator refusal, and duplicate
+journal-path refusal are implemented.
+
 Objective: prove that every persisted batch state either rolls back to the
 recorded current state or rolls forward from the verified commit point.
 
@@ -105,6 +109,10 @@ Acceptance:
 - the default rollback continues to leave the index untouched.
 
 ### R4. Integration, property, and fuzz suites
+
+Status: in progress. Core absent/present/content restoration invariants use
+`proptest`; manifest and native-path parser harnesses run in an isolated
+`cargo-fuzz` workspace with a scheduled smoke workflow.
 
 Objective: move safety claims out of unit-only fixtures.
 
