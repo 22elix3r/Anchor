@@ -100,6 +100,18 @@ impl NativeRelativePath {
         Self::new(self.encoding, components)
     }
 
+    /// Return a new path with one native host component appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError`] if the host component is unsafe or the path exceeds its limits.
+    pub fn join_host_component(&self, component: &OsStr) -> Result<Self, PathError> {
+        if self.encoding != PathEncoding::host() {
+            return Err(PathError::WrongHostEncoding);
+        }
+        self.join_component(native_component_from_os_str(component))
+    }
+
     /// Convert a relative host path to its lossless persistent representation.
     ///
     /// # Errors
@@ -243,6 +255,8 @@ pub enum PathError {
     TooLong,
     #[error("path has too many components")]
     TooManyComponents,
+    #[error("operation requires a path encoded for the current host")]
+    WrongHostEncoding,
 }
 
 fn validate_components(encoding: PathEncoding, components: &[Vec<u8>]) -> Result<(), PathError> {

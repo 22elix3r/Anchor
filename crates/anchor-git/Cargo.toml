@@ -11,8 +11,15 @@ authors.workspace = true
 
 [dependencies]
 anchor-core.workspace = true
+blake3.workspace = true
+gix.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
-
