@@ -41,6 +41,10 @@ changes “session-window changes,” never “changes made by the agent.”
 10. Index restoration requires the current raw index to equal the recorded
     session-end index. It uses Git's `index.lock` convention plus evacuation and
     no-replace installation; split indexes are refused.
+11. Whole restore requires a fresh current-manifest preview token and refuses
+    the entire batch if any path has a structured conflict. It stages every
+    output before mutation and retains every evacuated node until every target
+    verifies.
 
 ## Restore decisions
 
@@ -77,6 +81,13 @@ worktree identity, and sibling staging names. `anchor recover-transactions
 discovery, then rolls an interrupted file or index operation back to its
 pre-restore state. Live, staged, or backup byte drift is a hard conflict.
 Incomplete schema-v1/v2 journals are reported but not guessed at.
+
+Batch journals record every path, expected and desired node, sibling temporary
+name, and item state. `Verified` is the batch commit point: before it, recovery
+restores every pre-operation node in reverse order; after it, recovery preserves
+the verified inverse and only finishes cleanup. Multi-path mutation is therefore
+recoverable but is not claimed to be globally atomic to concurrent observers.
+Missing parent reconstruction is refused before target evacuation.
 
 Deleting a session is recoverable until explicit purge. Tombstoned sessions
 remain garbage-collection roots, so `anchor delete` cannot silently make their
@@ -173,14 +184,15 @@ Manifests and sessions are treated as untrusted:
 
 - no process-level or prompt-level attribution;
 - no globally atomic snapshot;
-- no atomic multi-file restore;
+- no globally atomic multi-file visibility or filesystem-wide transaction;
 - no speculative binary merge or conflict-marker-only text merge;
+- no worktree-plus-index combined transaction;
 - no split-index restoration or Git history restoration;
 - no recursive dirty-submodule capture or restoration;
 - no preservation of hard-link topology, ACLs, xattrs, ownership, or timestamps;
 - no Windows session capture or mutation yet;
 - `SIGKILL`, power loss, or machine failure can leave an incomplete session
   that must be marked abandoned after its child lock is free;
-- interrupted multi-file rollback is not yet supported.
+- no automatic reconstruction of missing uncaptured parent directories.
 
 These cases must remain visible limitations, not silent fallbacks.

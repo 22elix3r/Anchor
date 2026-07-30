@@ -40,15 +40,19 @@ Anchor is pre-release software. The implemented safety-first subset is:
 - bounded inverse three-way text merge with structured overlap conflicts;
 - single-path regular-file and symlink restore on Unix when safety is proven;
 - byte-verified empty-directory restore on Unix;
+- preview-token-bound whole-session restore of all unambiguous included paths,
+  with staged outputs and a recoverable multi-path journal on Unix;
 - exact raw-index restore on Unix when the current index still equals the
   session-end index (split indexes are refused);
-- byte-verified rollback of interrupted schema-v3 file and index transactions;
+- byte-verified rollback of interrupted file, index, and pre-commit batch
+  transactions, plus roll-forward cleanup after a verified batch commit point;
 - refusal when current bytes, type, symlink target, mode, HEAD, or repository
   operation state is ambiguous;
 - storage integrity checking and reachability-based garbage collection.
 
-Not yet implemented: whole-session transactional rollback and Windows
-filesystem mutation. Those cases are refused rather than approximated.
+Not yet implemented: combining index restoration into the worktree batch,
+hunk-level restore, and Windows filesystem mutation. Those cases are refused
+rather than approximated.
 
 ## Build
 
@@ -88,6 +92,9 @@ anchor restore <session-id> --file src/main.rs --yes
 anchor restore <session-id> --file src/main.rs --merge
 anchor restore <session-id> --file src/main.rs --merge --yes \
   --expect-merged <previewed-object-id>
+anchor restore <session-id> --all
+anchor restore <session-id> --all --yes \
+  --expect-current <previewed-manifest-id>
 anchor restore-index <session-id> --yes
 ```
 
@@ -98,6 +105,14 @@ no change. `--merge` previews a clean, bounded inverse text merge without changi
 the worktree and prints its object ID. `--merge --yes --expect-merged <id>`
 recalculates and applies only that exact result. Overlapping edits,
 binary/opaque input, and oversized text remain conflicts.
+
+`--all` first performs a nonmutating preview. It applies only when every changed
+path is unambiguous and `--expect-current` matches a freshly recaptured whole
+worktree manifest. All outputs are staged before any target is evacuated. A
+persistent batch journal retains every backup until all targets verify. Anchor
+refuses a batch that would require reconstructing a missing parent directory;
+it does not infer uncaptured structural directories. The index remains a
+separate opt-in operation.
 
 Verify retained data and preview garbage collection:
 
@@ -121,7 +136,9 @@ The default diff is `before → session end`. `--current` is `before → current
 index drift. `anchor recover` never guesses a missing session end: after it can
 acquire the worktree lock, it marks stale nonterminal records `Abandoned`.
 `anchor recover-transactions --yes` is separate: it byte-verifies and rolls
-back interrupted schema-v3 restore transactions. Legacy incomplete journals
+back interrupted schema-v3 single-path/index or pre-commit batch transactions.
+Once every batch target verified, recovery instead finishes backup cleanup
+because that state is the durable commit point. Legacy incomplete journals
 remain visible but require manual recovery because they lack sufficient state.
 
 Session deletion is recoverable by default. Tombstoned sessions continue to
@@ -154,8 +171,8 @@ See [Safety and threat model](docs/safety.md) and
 
 | Platform | Capture/review | Filesystem restore |
 |---|---|---|
-| Linux | Supported | Experimental single-path |
-| macOS | Supported | Experimental single-path |
+| Linux | Supported | Experimental single-path and batch |
+| macOS | Supported | Experimental single-path and batch |
 | Windows | Wire-format and core tests only | Refused |
 
 Windows paths are represented losslessly from the start. Session capture and

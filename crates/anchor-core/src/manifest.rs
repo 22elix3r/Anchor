@@ -25,6 +25,34 @@ impl ManifestId {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Parse a lowercase or uppercase hexadecimal BLAKE3 manifest identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::InvalidManifestId`] unless `value` contains exactly 64
+    /// hexadecimal ASCII characters.
+    pub fn from_hex(value: &str) -> Result<Self, ManifestError> {
+        if value.len() != 64 {
+            return Err(ManifestError::InvalidManifestId);
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_nibble(pair[0]).ok_or(ManifestError::InvalidManifestId)?;
+            let low = hex_nibble(pair[1]).ok_or(ManifestError::InvalidManifestId)?;
+            bytes[index] = high << 4 | low;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl fmt::Display for ManifestId {
@@ -481,6 +509,8 @@ fn validate_entry_tree(entries: &[ManifestEntry]) -> Result<(), ManifestError> {
 
 #[derive(Debug, Error)]
 pub enum ManifestError {
+    #[error("manifest ID must contain exactly 64 hexadecimal characters")]
+    InvalidManifestId,
     #[error("failed to encode manifest: {0}")]
     Encode(String),
     #[error("failed to decode manifest: {0}")]
@@ -533,6 +563,24 @@ mod tests {
             node: ManifestNode::EmptyDirectory,
             safety: SafetyObservations::default(),
         }
+    }
+
+    #[test]
+    fn manifest_id_hex_round_trips_and_rejects_invalid_input() {
+        let id = ManifestId::from_bytes([0xab; 32]);
+        let text = id.to_string();
+        assert_eq!(ManifestId::from_hex(&text).unwrap(), id);
+        assert_eq!(ManifestId::from_hex(&text.to_uppercase()).unwrap(), id);
+        assert!(matches!(
+            ManifestId::from_hex("abcd"),
+            Err(ManifestError::InvalidManifestId)
+        ));
+        assert!(matches!(
+            ManifestId::from_hex(
+                "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+            ),
+            Err(ManifestError::InvalidManifestId)
+        ));
     }
 
     #[test]

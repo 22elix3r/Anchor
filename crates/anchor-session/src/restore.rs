@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use anchor_core::ObjectStore;
 use anchor_core::{
-    CaptureEngine, ConflictReason, ManifestEntry, ManifestNode, NativeRelativePath, NoChangeReason,
-    ObjectId, ObservedKind, RestoreConflict, RestoreOutcome, RestorePlan, ScopeClassifier,
-    ScopeDecision, ScopeError, TextMergeConflict, TextMergeLimits, TextMergeResult,
-    inverse_three_way_text_merge,
+    CaptureEngine, ConflictReason, ManifestEntry, ManifestId, ManifestNode, NativeRelativePath,
+    NoChangeReason, ObjectId, ObservedKind, RestoreConflict, RestoreOutcome, RestorePlan,
+    ScopeClassifier, ScopeDecision, ScopeError, TextMergeConflict, TextMergeLimits,
+    TextMergeResult, inverse_three_way_text_merge,
 };
 use anchor_git::{GitContext, IndexCapture};
 #[cfg(unix)]
@@ -32,7 +32,9 @@ use uuid::Uuid;
 use crate::{SessionError, SessionId, SessionStore};
 
 #[cfg(unix)]
-const MAX_JOURNAL_BYTES: u64 = 1024 * 1024;
+const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(unix)]
+const BATCH_JOURNAL_TAG: u64 = 0x414e_4348_4f52_424a;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RestoreApplyResult {
@@ -74,9 +76,37 @@ pub enum TextMergeMode {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WholeRestoreMode {
+    Preview,
+    Apply { expected_current: ManifestId },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WholeRestoreResult {
+    Preview {
+        current_manifest: ManifestId,
+        writes: u64,
+        no_changes: u64,
+    },
+    Applied {
+        paths: u64,
+    },
+    Conflicts {
+        conflicts: Vec<WholeRestoreConflict>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WholeRestoreConflict {
+    pub path: NativeRelativePath,
+    pub reason: ConflictReason,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TransactionRecoveryReport {
     pub rolled_back: Vec<String>,
+    pub completed: Vec<String>,
     pub skipped_other_worktrees: u64,
 }
 
@@ -104,6 +134,108 @@ impl TransactionRecoveryService {
 pub struct RestoreService;
 
 impl RestoreService {
+    /// Preview or apply every unambiguous included session-window inverse as one batch.
+    ///
+    /// Apply requires the exact current-manifest ID returned by a fresh preview. All desired
+    /// outputs are staged before mutation; all current nodes are evacuated and retained until
+    /// every installed target verifies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RestoreError`] for incomplete sessions, drift, unsupported parent-tree
+    /// reconstruction, a changed preview token, transaction failure, or corruption.
+    #[allow(clippy::too_many_lines)]
+    pub fn restore_all(
+        store: &SessionStore,
+        session_id: SessionId,
+        mode: WholeRestoreMode,
+    ) -> Result<WholeRestoreResult, RestoreError> {
+        let _store_lease = store.acquire_store_read_lease()?;
+        let _lock = store.acquire_active_lock()?;
+        ensure_no_unresolved_transactions(store.root())?;
+        let session = store.load_session(session_id)?;
+        if !matches!(
+            session.state,
+            crate::SessionState::Completed | crate::SessionState::Interrupted
+        ) {
+            return Err(RestoreError::IncompleteSession);
+        }
+        let after = session
+            .after
+            .as_ref()
+            .ok_or(RestoreError::IncompleteSession)?;
+        if session.before.repository != after.repository {
+            return Err(RestoreError::RepositoryChangedDuringSession);
+        }
+        let worktree = PathBuf::from(session.worktree_root.to_host()?);
+        let context = GitContext::discover(&worktree)?;
+        if context.repository_state()? != after.repository {
+            return Err(RestoreError::RepositoryDrift);
+        }
+        let base = store.load_manifest(session.before.manifest)?;
+        let endpoint = store.load_manifest(after.manifest)?;
+        let frozen_scope = context.frozen_scope(&base, store.objects(), context.tracked_paths())?;
+        let current_endpoint = crate::capture_frozen_endpoint(
+            &context,
+            store,
+            session.capture_policy.capture_options(),
+            frozen_scope,
+        )?;
+        let current = store.load_manifest(current_endpoint.manifest)?;
+        if let WholeRestoreMode::Apply { expected_current } = mode
+            && current_endpoint.manifest != expected_current
+        {
+            return Err(RestoreError::WholePreviewChanged {
+                expected: expected_current,
+                actual: current_endpoint.manifest,
+            });
+        }
+        let plan = RestorePlan::calculate(&base, &endpoint, &current, &BTreeSet::new())?;
+        let conflicts = plan
+            .outcomes
+            .iter()
+            .filter_map(|item| match &item.outcome {
+                RestoreOutcome::Conflict(conflict) => Some(WholeRestoreConflict {
+                    path: item.path.clone(),
+                    reason: conflict.reason,
+                }),
+                RestoreOutcome::Write(_) | RestoreOutcome::NoChange(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if !conflicts.is_empty() {
+            return Ok(WholeRestoreResult::Conflicts { conflicts });
+        }
+        let writes = plan
+            .outcomes
+            .iter()
+            .filter_map(|item| match &item.outcome {
+                RestoreOutcome::Write(desired) => Some(BatchWrite {
+                    path: item.path.clone(),
+                    expected: current
+                        .entries()
+                        .binary_search_by(|entry| entry.path.cmp(&item.path))
+                        .ok()
+                        .map(|index| &current.entries()[index])
+                        .cloned(),
+                    desired: desired.clone(),
+                }),
+                RestoreOutcome::NoChange(_) | RestoreOutcome::Conflict(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let no_changes = plan.outcomes.len().saturating_sub(writes.len());
+        if mode == WholeRestoreMode::Preview {
+            return Ok(WholeRestoreResult::Preview {
+                current_manifest: current_endpoint.manifest,
+                writes: u64::try_from(writes.len()).unwrap_or(u64::MAX),
+                no_changes: u64::try_from(no_changes).unwrap_or(u64::MAX),
+            });
+        }
+        apply_batch(store, session_id, &worktree, &writes)?;
+        Ok(WholeRestoreResult::Applied {
+            paths: u64::try_from(writes.len()).unwrap_or(u64::MAX),
+        })
+    }
+
     /// Safely restore one path when the three-state planner can prove an inverse.
     ///
     /// # Errors
@@ -450,6 +582,239 @@ fn node_kind(node: &ManifestNode) -> ObservedKind {
         ManifestNode::Symlink { .. } => ObservedKind::Symlink,
         ManifestNode::EmptyDirectory => ObservedKind::Directory,
     }
+}
+
+#[derive(Clone)]
+struct BatchWrite {
+    path: NativeRelativePath,
+    expected: Option<ManifestEntry>,
+    desired: Option<ManifestEntry>,
+}
+
+#[cfg(unix)]
+fn apply_batch(
+    store: &SessionStore,
+    session_id: SessionId,
+    worktree: &Path,
+    writes: &[BatchWrite],
+) -> Result<(), RestoreError> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    let transaction_id = Uuid::now_v7();
+    let transaction_path = store
+        .root()
+        .join("transactions")
+        .join(format!("batch-{transaction_id}"));
+    private_transaction_dir(&transaction_path)?;
+    let journal_path = transaction_path.join("journal.cbor");
+    let mut journal = BatchRestoreJournal {
+        tag: BATCH_JOURNAL_TAG,
+        schema: 1,
+        session_id,
+        worktree_root: anchor_core::NativeString::from_host(worktree.as_os_str()),
+        worktree_key: store.worktree_key.clone(),
+        state: BatchJournalState::Prepared,
+        items: writes
+            .iter()
+            .enumerate()
+            .map(|(index, write)| BatchJournalItem {
+                path: write.path.clone(),
+                stage_name: format!(".anchor-stage-{transaction_id}-{index}"),
+                backup_name: format!(".anchor-backup-{transaction_id}-{index}"),
+                expected: JournalPresence::from_entry(write.expected.as_ref()),
+                desired: JournalPresence::from_entry(write.desired.as_ref()),
+                state: BatchItemState::Prepared,
+            })
+            .collect(),
+    };
+    save_batch_journal(&journal_path, &journal)?;
+    if let Err(error) = apply_batch_inner(store, worktree, writes, &mut journal, &journal_path) {
+        if journal.state == BatchJournalState::Verified {
+            // Verified is the transaction commit point. Some backups may already be gone, so
+            // recovery must finish cleanup rather than attempting to reconstruct the old tree.
+            return Err(error);
+        }
+        journal.state = BatchJournalState::NeedsRecovery;
+        save_batch_journal(&journal_path, &journal)?;
+        if let Err(rollback) = rollback_batch(store, worktree, &journal) {
+            return Err(RestoreError::BatchRollbackFailed {
+                apply: error.to_string(),
+                rollback: rollback.to_string(),
+            });
+        }
+        journal.state = BatchJournalState::RolledBack;
+        save_batch_journal(&journal_path, &journal)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_batch(
+    _store: &SessionStore,
+    _session_id: SessionId,
+    _worktree: &Path,
+    _writes: &[BatchWrite],
+) -> Result<(), RestoreError> {
+    Err(RestoreError::PlatformMutationUnsupported)
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+fn apply_batch_inner(
+    store: &SessionStore,
+    worktree: &Path,
+    writes: &[BatchWrite],
+    journal: &mut BatchRestoreJournal,
+    journal_path: &Path,
+) -> Result<(), RestoreError> {
+    for (index, write) in writes.iter().enumerate() {
+        let (parent, _) = open_batch_parent(worktree, &write.path)?;
+        let stage = OsString::from(&journal.items[index].stage_name);
+        if let Some(desired) = &write.desired {
+            stage_node(&parent, &stage, desired, store.objects())?;
+        }
+        journal.items[index].state = BatchItemState::Staged;
+        save_batch_journal(journal_path, journal)?;
+    }
+
+    journal.state = BatchJournalState::Evacuating;
+    save_batch_journal(journal_path, journal)?;
+    for (index, write) in writes.iter().enumerate() {
+        let (parent, name) = open_batch_parent(worktree, &write.path)?;
+        let backup = OsString::from(&journal.items[index].backup_name);
+        if write.expected.is_some() {
+            if !verify_node(&parent, &name, write.expected.as_ref(), store.objects())? {
+                return Err(RestoreError::CurrentChanged);
+            }
+            rename_noreplace(&parent, &name, &parent, &backup)?;
+            if !verify_node(&parent, &backup, write.expected.as_ref(), store.objects())? {
+                return Err(RestoreError::CurrentChanged);
+            }
+            if let Some(ManifestEntry {
+                node:
+                    ManifestNode::Regular {
+                        unix_exec_bits: Some(bits),
+                        ..
+                    },
+                ..
+            }) = &write.desired
+            {
+                let stage = OsString::from(&journal.items[index].stage_name);
+                apply_stage_mode(&parent, &stage, &backup, *bits)?;
+            }
+        } else if !verify_node(&parent, &name, None, store.objects())? {
+            return Err(RestoreError::CurrentChanged);
+        }
+        journal.items[index].state = BatchItemState::Evacuated;
+        save_batch_journal(journal_path, journal)?;
+    }
+
+    journal.state = BatchJournalState::Installing;
+    save_batch_journal(journal_path, journal)?;
+    for (index, write) in writes.iter().enumerate() {
+        let (parent, name) = open_batch_parent(worktree, &write.path)?;
+        if write.desired.is_some() {
+            let stage = OsString::from(&journal.items[index].stage_name);
+            rename_noreplace(&parent, &stage, &parent, &name)?;
+        }
+        journal.items[index].state = BatchItemState::Installed;
+        save_batch_journal(journal_path, journal)?;
+    }
+
+    for (index, write) in writes.iter().enumerate() {
+        let (parent, name) = open_batch_parent(worktree, &write.path)?;
+        if !verify_node(&parent, &name, write.desired.as_ref(), store.objects())? {
+            return Err(RestoreError::VerificationFailed);
+        }
+        journal.items[index].state = BatchItemState::Verified;
+        save_batch_journal(journal_path, journal)?;
+    }
+    journal.state = BatchJournalState::Verified;
+    save_batch_journal(journal_path, journal)?;
+    finish_batch(store, worktree, journal, journal_path)
+}
+
+#[cfg(unix)]
+fn finish_batch(
+    store: &SessionStore,
+    worktree: &Path,
+    journal: &mut BatchRestoreJournal,
+    journal_path: &Path,
+) -> Result<(), RestoreError> {
+    for item in &journal.items {
+        let desired = item.desired.to_entry(&item.path);
+        let expected = item.expected.to_entry(&item.path);
+        let (parent, name) = open_batch_parent(worktree, &item.path)?;
+        if !verify_node(&parent, &name, desired.as_ref(), store.objects())? {
+            return Err(RestoreError::RecoveryCurrentChanged);
+        }
+        let backup = validate_journal_temp_name(&item.backup_name, ".anchor-backup-")?;
+        if parent.symlink_metadata(&backup).is_ok() {
+            if !verify_node(&parent, &backup, expected.as_ref(), store.objects())? {
+                return Err(RestoreError::RecoveryBackupMismatch);
+            }
+            remove_node(&parent, &backup, expected.as_ref())?;
+        }
+        let stage = validate_journal_temp_name(&item.stage_name, ".anchor-stage-")?;
+        if parent.symlink_metadata(&stage).is_ok() {
+            if desired.is_none()
+                || !verify_node(&parent, &stage, desired.as_ref(), store.objects())?
+            {
+                return Err(RestoreError::RecoveryStageMismatch);
+            }
+            remove_node(&parent, &stage, desired.as_ref())?;
+        }
+    }
+    journal.state = BatchJournalState::Complete;
+    save_batch_journal(journal_path, journal)
+}
+
+#[cfg(unix)]
+fn rollback_batch(
+    store: &SessionStore,
+    worktree: &Path,
+    journal: &BatchRestoreJournal,
+) -> Result<(), RestoreError> {
+    for item in journal.items.iter().rev() {
+        let expected = item.expected.to_entry(&item.path);
+        let desired = item.desired.to_entry(&item.path);
+        let (parent, name) = open_batch_parent(worktree, &item.path)?;
+        let stage = validate_journal_temp_name(&item.stage_name, ".anchor-stage-")?;
+        let backup = validate_journal_temp_name(&item.backup_name, ".anchor-backup-")?;
+        rollback_node(
+            &parent,
+            &name,
+            &stage,
+            &backup,
+            expected.as_ref(),
+            desired.as_ref(),
+            store.objects(),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_batch_parent(
+    worktree: &Path,
+    path: &NativeRelativePath,
+) -> Result<(Dir, OsString), RestoreError> {
+    let host = path.to_host_path()?;
+    let name = host
+        .file_name()
+        .ok_or(RestoreError::UnsafeRootPath)?
+        .to_owned();
+    let parent_path = host.parent().unwrap_or_else(|| Path::new(""));
+    let root = Dir::open_ambient_dir(worktree, ambient_authority())?;
+    let parent = if parent_path.as_os_str().is_empty() {
+        root
+    } else {
+        root.open_dir(parent_path)
+            .map_err(|_| RestoreError::BatchParentUnavailable(path.clone()))?
+    };
+    Ok((parent, name))
 }
 
 #[cfg(unix)]
@@ -926,6 +1291,20 @@ fn save_index_journal(path: &Path, journal: &IndexRestoreJournal) -> Result<(), 
 }
 
 #[cfg(unix)]
+fn save_batch_journal(path: &Path, journal: &BatchRestoreJournal) -> Result<(), RestoreError> {
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(journal, &mut bytes)
+        .map_err(|error| RestoreError::Journal(error.to_string()))?;
+    if bytes.len() > usize::try_from(MAX_JOURNAL_BYTES).unwrap_or(usize::MAX) {
+        return Err(RestoreError::JournalTooLarge(path.to_path_buf()));
+    }
+    let mut file = AtomicWriteFile::open(path)?;
+    file.write_all(&bytes)?;
+    file.commit()?;
+    Ok(())
+}
+
+#[cfg(unix)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RestoreJournal {
     schema: u16,
@@ -961,6 +1340,51 @@ struct IndexRestoreJournal {
     #[serde(default)]
     desired: Option<IndexCapture>,
     state: JournalState,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BatchRestoreJournal {
+    tag: u64,
+    schema: u16,
+    session_id: SessionId,
+    worktree_root: anchor_core::NativeString,
+    worktree_key: String,
+    state: BatchJournalState,
+    items: Vec<BatchJournalItem>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BatchJournalItem {
+    path: NativeRelativePath,
+    stage_name: String,
+    backup_name: String,
+    expected: JournalPresence,
+    desired: JournalPresence,
+    state: BatchItemState,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum BatchJournalState {
+    Prepared,
+    Evacuating,
+    Installing,
+    Verified,
+    Complete,
+    NeedsRecovery,
+    RolledBack,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum BatchItemState {
+    Prepared,
+    Staged,
+    Evacuated,
+    Installed,
+    Verified,
 }
 
 #[cfg(unix)]
@@ -1099,29 +1523,63 @@ pub(crate) fn scan_transactions(root: &Path) -> Result<TransactionSummary, Resto
             return Err(RestoreError::JournalTooLarge(journal_path));
         }
         let bytes = fs::read(&journal_path)?;
-        let state = ciborium::de::from_reader::<RestoreJournal, _>(Cursor::new(&bytes))
-            .map(|journal| journal.state)
-            .or_else(|_| {
-                ciborium::de::from_reader::<IndexRestoreJournal, _>(Cursor::new(&bytes))
-                    .map(|journal| journal.state)
-            })
-            .map_err(|error| RestoreError::Journal(error.to_string()))?;
-        match state {
-            JournalState::Complete | JournalState::RolledBack => {
-                summary.complete = summary.complete.saturating_add(1);
+        if let Ok(journal) =
+            ciborium::de::from_reader::<BatchRestoreJournal, _>(Cursor::new(&bytes))
+        {
+            if journal.tag != BATCH_JOURNAL_TAG || journal.schema != 1 {
+                return Err(RestoreError::Journal(format!(
+                    "transaction {} has an unsupported batch journal",
+                    entry.file_name().to_string_lossy()
+                )));
             }
-            JournalState::NeedsRecovery => {
-                summary.needs_recovery = summary.needs_recovery.saturating_add(1);
+            match journal.state {
+                BatchJournalState::Complete | BatchJournalState::RolledBack => {
+                    summary.complete = summary.complete.saturating_add(1);
+                }
+                BatchJournalState::NeedsRecovery => {
+                    summary.needs_recovery = summary.needs_recovery.saturating_add(1);
+                }
+                BatchJournalState::Prepared
+                | BatchJournalState::Evacuating
+                | BatchJournalState::Installing
+                | BatchJournalState::Verified => {
+                    summary.unfinished = summary.unfinished.saturating_add(1);
+                }
             }
-            JournalState::Prepared
-            | JournalState::Evacuated
-            | JournalState::Installed
-            | JournalState::Verified => {
-                summary.unfinished = summary.unfinished.saturating_add(1);
-            }
+        } else if let Ok(journal) =
+            ciborium::de::from_reader::<RestoreJournal, _>(Cursor::new(&bytes))
+        {
+            record_journal_state(&mut summary, journal.state);
+        } else if let Ok(journal) =
+            ciborium::de::from_reader::<IndexRestoreJournal, _>(Cursor::new(&bytes))
+        {
+            record_journal_state(&mut summary, journal.state);
+        } else {
+            return Err(RestoreError::Journal(format!(
+                "transaction {} has an unknown journal record",
+                entry.file_name().to_string_lossy()
+            )));
         }
     }
     Ok(summary)
+}
+
+#[cfg(unix)]
+fn record_journal_state(summary: &mut TransactionSummary, state: JournalState) {
+    match state {
+        JournalState::Complete | JournalState::RolledBack => {
+            summary.complete = summary.complete.saturating_add(1);
+        }
+        JournalState::NeedsRecovery => {
+            summary.needs_recovery = summary.needs_recovery.saturating_add(1);
+        }
+        JournalState::Prepared
+        | JournalState::Evacuated
+        | JournalState::Installed
+        | JournalState::Verified => {
+            summary.unfinished = summary.unfinished.saturating_add(1);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1142,6 +1600,28 @@ fn recover_transactions(store: &SessionStore) -> Result<TransactionRecoveryRepor
             .map_err(|_| RestoreError::UnsafeJournalName)?;
         let journal_path = entry.path().join("journal.cbor");
         let bytes = read_journal(&journal_path)?;
+        if let Ok(mut journal) =
+            ciborium::de::from_reader::<BatchRestoreJournal, _>(Cursor::new(&bytes))
+        {
+            if matches!(
+                journal.state,
+                BatchJournalState::Complete | BatchJournalState::RolledBack
+            ) {
+                continue;
+            }
+            if journal.worktree_key != store.worktree_key {
+                report.skipped_other_worktrees = report.skipped_other_worktrees.saturating_add(1);
+                continue;
+            }
+            let completed = journal.state == BatchJournalState::Verified;
+            recover_batch_journal(store, &mut journal, &journal_path)?;
+            if completed {
+                report.completed.push(id);
+            } else {
+                report.rolled_back.push(id);
+            }
+            continue;
+        }
         if let Ok(mut journal) = ciborium::de::from_reader::<RestoreJournal, _>(Cursor::new(&bytes))
         {
             if matches!(
@@ -1186,6 +1666,39 @@ fn recover_transactions(store: &SessionStore) -> Result<TransactionRecoveryRepor
         )));
     }
     Ok(report)
+}
+
+#[cfg(unix)]
+fn recover_batch_journal(
+    store: &SessionStore,
+    journal: &mut BatchRestoreJournal,
+    journal_path: &Path,
+) -> Result<(), RestoreError> {
+    if journal.tag != BATCH_JOURNAL_TAG || journal.schema != 1 {
+        return Err(RestoreError::LegacyRecoveryUnsupported(
+            journal_path.display().to_string(),
+        ));
+    }
+    let worktree = validated_journal_worktree(store, journal.session_id, &journal.worktree_root)?;
+    let mut paths = BTreeSet::new();
+    let mut temporary_names = BTreeSet::new();
+    for item in &journal.items {
+        if !paths.insert(item.path.clone()) {
+            return Err(RestoreError::BatchJournalDuplicatePath);
+        }
+        let stage = validate_journal_temp_name(&item.stage_name, ".anchor-stage-")?;
+        let backup = validate_journal_temp_name(&item.backup_name, ".anchor-backup-")?;
+        if !temporary_names.insert(stage) || !temporary_names.insert(backup) {
+            return Err(RestoreError::UnsafeJournalName);
+        }
+    }
+    if journal.state == BatchJournalState::Verified {
+        finish_batch(store, &worktree, journal, journal_path)
+    } else {
+        rollback_batch(store, &worktree, journal)?;
+        journal.state = BatchJournalState::RolledBack;
+        save_batch_journal(journal_path, journal)
+    }
 }
 
 #[cfg(not(unix))]
@@ -1528,6 +2041,19 @@ pub enum RestoreError {
         expected: ObjectId,
         actual: ObjectId,
     },
+    #[error(
+        "worktree changed since whole-restore preview (expected {expected}, captured {actual}); review again"
+    )]
+    WholePreviewChanged {
+        expected: ManifestId,
+        actual: ManifestId,
+    },
+    #[error("batch restore cannot reconstruct a missing parent for {0:?}")]
+    BatchParentUnavailable(NativeRelativePath),
+    #[error("batch restore failed ({apply}) and its automatic rollback also failed ({rollback})")]
+    BatchRollbackFailed { apply: String, rollback: String },
+    #[error("batch restore journal contains the same path more than once")]
+    BatchJournalDuplicatePath,
     #[error("restore journal encoding failed: {0}")]
     Journal(String),
     #[error("restore journal exceeds its size limit: {0}")]
@@ -1644,6 +2170,136 @@ mod tests {
         let transactions = scan_transactions(store.root()).unwrap();
         assert_eq!(transactions.total, 1);
         assert_eq!(transactions.complete, 1);
+    }
+
+    #[test]
+    fn previews_then_restores_multiple_paths_as_one_batch() {
+        let root = repository();
+        fs::write(root.path().join("alpha"), b"alpha-before").unwrap();
+        fs::write(root.path().join("beta"), b"beta-before").unwrap();
+        let (store, session) = run_change(
+            root.path(),
+            "printf alpha-session > alpha; printf beta-session > beta",
+        );
+
+        let preview =
+            RestoreService::restore_all(&store, session, WholeRestoreMode::Preview).unwrap();
+        let WholeRestoreResult::Preview {
+            current_manifest,
+            writes,
+            no_changes,
+        } = preview
+        else {
+            panic!("expected a whole-restore preview");
+        };
+        assert_eq!(writes, 2);
+        assert_eq!(no_changes, 0);
+        assert_eq!(
+            fs::read(root.path().join("alpha")).unwrap(),
+            b"alpha-session"
+        );
+
+        let applied = RestoreService::restore_all(
+            &store,
+            session,
+            WholeRestoreMode::Apply {
+                expected_current: current_manifest,
+            },
+        )
+        .unwrap();
+        assert_eq!(applied, WholeRestoreResult::Applied { paths: 2 });
+        assert_eq!(
+            fs::read(root.path().join("alpha")).unwrap(),
+            b"alpha-before"
+        );
+        assert_eq!(fs::read(root.path().join("beta")).unwrap(), b"beta-before");
+        let transactions = scan_transactions(store.root()).unwrap();
+        assert_eq!(transactions.total, 1);
+        assert_eq!(transactions.complete, 1);
+    }
+
+    #[test]
+    fn whole_restore_refuses_every_path_when_one_path_conflicts() {
+        let root = repository();
+        fs::write(root.path().join("alpha"), b"alpha-before").unwrap();
+        fs::write(root.path().join("beta"), b"beta-before").unwrap();
+        let (store, session) = run_change(
+            root.path(),
+            "printf alpha-session > alpha; printf beta-session > beta",
+        );
+        fs::write(root.path().join("beta"), b"beta-post-session").unwrap();
+
+        let result =
+            RestoreService::restore_all(&store, session, WholeRestoreMode::Preview).unwrap();
+        let WholeRestoreResult::Conflicts { conflicts } = result else {
+            panic!("expected a structured whole-restore conflict");
+        };
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, selected(b"beta"));
+        assert_eq!(conflicts[0].reason, ConflictReason::OpaqueContentDrifted);
+        assert_eq!(
+            fs::read(root.path().join("alpha")).unwrap(),
+            b"alpha-session"
+        );
+        assert_eq!(
+            fs::read(root.path().join("beta")).unwrap(),
+            b"beta-post-session"
+        );
+        assert!(!store.root().join("transactions").exists());
+    }
+
+    #[test]
+    fn whole_restore_preview_token_detects_later_worktree_drift() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"before").unwrap();
+        let (store, session) = run_change(root.path(), "printf session > file");
+        let preview =
+            RestoreService::restore_all(&store, session, WholeRestoreMode::Preview).unwrap();
+        let WholeRestoreResult::Preview {
+            current_manifest, ..
+        } = preview
+        else {
+            panic!("expected a whole-restore preview");
+        };
+        fs::write(root.path().join("unrelated"), b"later").unwrap();
+
+        let error = RestoreService::restore_all(
+            &store,
+            session,
+            WholeRestoreMode::Apply {
+                expected_current: current_manifest,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, RestoreError::WholePreviewChanged { .. }));
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"session");
+        assert_eq!(fs::read(root.path().join("unrelated")).unwrap(), b"later");
+    }
+
+    #[test]
+    fn whole_restore_handles_an_exact_session_rename() {
+        let root = repository();
+        fs::write(root.path().join("old"), b"bytes").unwrap();
+        let (store, session) = run_change(root.path(), "mv old new");
+        let preview =
+            RestoreService::restore_all(&store, session, WholeRestoreMode::Preview).unwrap();
+        let WholeRestoreResult::Preview {
+            current_manifest, ..
+        } = preview
+        else {
+            panic!("expected a whole-restore preview");
+        };
+
+        RestoreService::restore_all(
+            &store,
+            session,
+            WholeRestoreMode::Apply {
+                expected_current: current_manifest,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.path().join("old")).unwrap(), b"bytes");
+        assert!(!root.path().join("new").exists());
     }
 
     #[test]
@@ -1821,6 +2477,72 @@ mod tests {
         assert_eq!(report.rolled_back, vec![transaction_id.to_string()]);
         assert_eq!(fs::read(root.path().join("file")).unwrap(), b"session");
         assert!(!root.path().join(stage_text).exists());
+        assert!(!root.path().join(backup_text).exists());
+        let summary = scan_transactions(store.root()).unwrap();
+        assert_eq!(summary.total, summary.complete);
+    }
+
+    #[test]
+    fn recovery_finishes_cleanup_after_a_batch_commit_point() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"base").unwrap();
+        let (store, session_id) = run_change(root.path(), "printf session > file");
+        let session = store.load_session(session_id).unwrap();
+        let base = store.load_manifest(session.before.manifest).unwrap();
+        let after = store
+            .load_manifest(session.after.as_ref().unwrap().manifest)
+            .unwrap();
+        let desired = base.entries().first().unwrap();
+        let expected = after.entries().first().unwrap();
+
+        let transaction_id = Uuid::now_v7();
+        let transaction_name = format!("batch-{transaction_id}");
+        let transaction_path = store.root().join("transactions").join(&transaction_name);
+        private_transaction_dir(&transaction_path).unwrap();
+        let stage_text = format!(".anchor-stage-{transaction_id}-0");
+        let backup_text = format!(".anchor-backup-{transaction_id}-0");
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).unwrap();
+        stage_node(&parent, OsStr::new(&stage_text), desired, store.objects()).unwrap();
+        rename_noreplace(
+            &parent,
+            OsStr::new("file"),
+            &parent,
+            OsStr::new(&backup_text),
+        )
+        .unwrap();
+        rename_noreplace(
+            &parent,
+            OsStr::new(&stage_text),
+            &parent,
+            OsStr::new("file"),
+        )
+        .unwrap();
+        let journal_path = transaction_path.join("journal.cbor");
+        save_batch_journal(
+            &journal_path,
+            &BatchRestoreJournal {
+                tag: BATCH_JOURNAL_TAG,
+                schema: 1,
+                session_id,
+                worktree_root: anchor_core::NativeString::from_host(root.path().as_os_str()),
+                worktree_key: store.worktree_key.clone(),
+                state: BatchJournalState::Verified,
+                items: vec![BatchJournalItem {
+                    path: selected(b"file"),
+                    stage_name: stage_text,
+                    backup_name: backup_text.clone(),
+                    expected: JournalPresence::Present(JournalNode::from_entry(expected)),
+                    desired: JournalPresence::Present(JournalNode::from_entry(desired)),
+                    state: BatchItemState::Verified,
+                }],
+            },
+        )
+        .unwrap();
+
+        let report = TransactionRecoveryService::recover(&store).unwrap();
+        assert_eq!(report.completed, vec![transaction_name]);
+        assert!(report.rolled_back.is_empty());
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"base");
         assert!(!root.path().join(backup_text).exists());
         let summary = scan_transactions(store.root()).unwrap();
         assert_eq!(summary.total, summary.complete);

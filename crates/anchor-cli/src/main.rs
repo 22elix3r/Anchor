@@ -5,14 +5,15 @@ use std::process::ExitCode;
 use std::str::FromStr;
 
 use anchor_core::{
-    ChangeKind, ManifestChange, ManifestDiff, ManifestNode, NativeRelativePath, NativeString,
-    ObjectId, ObjectStore, PathEncoding,
+    ChangeKind, ManifestChange, ManifestDiff, ManifestId, ManifestNode, NativeRelativePath,
+    NativeString, ObjectId, ObjectStore, PathEncoding,
 };
 use anchor_git::GitContext;
 use anchor_session::{
     CapturePolicy, ConfigLoader, IndexRestoreResult, MaintenanceService, PolicyOverrides,
     RecoveryService, RestoreApplyResult, RestoreService, RunRequest, Session, SessionId,
     SessionInspection, SessionRunner, SessionStore, TextMergeMode, TransactionRecoveryService,
+    WholeRestoreMode, WholeRestoreResult,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
@@ -89,14 +90,17 @@ enum Commands {
     },
     /// Open a read-only terminal reviewer for a completed session.
     Review { session: String },
-    /// Remove one path's session-window change when it is provably safe.
+    /// Remove one or all session-window changes when they are provably safe.
     Restore {
         session: String,
         /// Worktree-root-relative path to restore.
-        #[arg(long)]
-        file: PathBuf,
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        file: Option<PathBuf>,
+        /// Restore every included path as one recoverable batch.
+        #[arg(long, conflicts_with_all = ["file", "merge", "expect_merged"])]
+        all: bool,
         /// Attempt a bounded inverse three-way text merge when current content drifted.
-        #[arg(long)]
+        #[arg(long, requires = "file")]
         merge: bool,
         /// Confirm filesystem mutation after reviewing the relevant diff.
         #[arg(long)]
@@ -104,6 +108,9 @@ enum Commands {
         /// Require the recalculated merge to match this previewed BLAKE3 object ID.
         #[arg(long, requires_all = ["merge", "yes"])]
         expect_merged: Option<String>,
+        /// Require the current worktree to match this whole-restore preview manifest.
+        #[arg(long, requires_all = ["all", "yes"])]
+        expect_current: Option<String>,
     },
     /// Restore exact raw index bytes if no post-session index drift exists.
     RestoreIndex {
@@ -431,10 +438,69 @@ fn execute(cli: Cli) -> Result<i32> {
         Commands::Restore {
             session,
             file,
+            all,
             merge,
             yes,
             expect_merged,
+            expect_current,
         } => {
+            let store = current_store()?;
+            let id = SessionId::from_str(&session)
+                .into_diagnostic()
+                .wrap_err("session ID is not a UUID")?;
+            if all {
+                let mode = if yes {
+                    let expected =
+                        ManifestId::from_hex(expect_current.as_deref().ok_or_else(|| {
+                            miette::miette!(
+                                "whole restoration requires --expect-current from a fresh preview"
+                            )
+                        })?)
+                        .into_diagnostic()
+                        .wrap_err("--expect-current is not a BLAKE3 manifest ID")?;
+                    WholeRestoreMode::Apply {
+                        expected_current: expected,
+                    }
+                } else {
+                    WholeRestoreMode::Preview
+                };
+                let result = RestoreService::restore_all(&store, id, mode)
+                    .into_diagnostic()
+                    .wrap_err("whole restore was refused")?;
+                return match result {
+                    WholeRestoreResult::Preview {
+                        current_manifest,
+                        writes,
+                        no_changes,
+                    } => {
+                        println!(
+                            "whole restore preview: {writes} path(s) would change; \
+                             {no_changes} already safe/no-op"
+                        );
+                        eprintln!(
+                            "no change made; apply this exact preview with \
+                             `anchor restore {session} --all --yes --expect-current \
+                             {current_manifest}`"
+                        );
+                        Ok(3)
+                    }
+                    WholeRestoreResult::Applied { paths } => {
+                        println!("restored {paths} included path(s) as a verified batch");
+                        Ok(0)
+                    }
+                    WholeRestoreResult::Conflicts { conflicts } => {
+                        for conflict in conflicts {
+                            eprintln!(
+                                "conflict {}: {:?}",
+                                display_path(&conflict.path),
+                                conflict.reason
+                            );
+                        }
+                        eprintln!("no paths changed because the batch contains conflicts");
+                        Ok(4)
+                    }
+                };
+            }
             if !merge && !yes {
                 eprintln!(
                     "no change made; review `anchor diff {session}` and rerun this command with --yes"
@@ -444,13 +510,12 @@ fn execute(cli: Cli) -> Result<i32> {
             if merge && yes && expect_merged.is_none() {
                 miette::bail!("merged restoration requires --expect-merged from a fresh preview");
             }
-            let store = current_store()?;
-            let id = SessionId::from_str(&session)
-                .into_diagnostic()
-                .wrap_err("session ID is not a UUID")?;
-            let path = NativeRelativePath::from_host_path(&file)
-                .into_diagnostic()
-                .wrap_err("--file must be a safe worktree-root-relative path")?;
+            let path = NativeRelativePath::from_host_path(
+                file.as_deref()
+                    .ok_or_else(|| miette::miette!("one of --file or --all is required"))?,
+            )
+            .into_diagnostic()
+            .wrap_err("--file must be a safe worktree-root-relative path")?;
             let merge_mode = if !merge {
                 TextMergeMode::Disabled
             } else if yes {
@@ -647,6 +712,7 @@ fn execute(cli: Cli) -> Result<i32> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "rolled_back": report.rolled_back,
+                        "completed": report.completed,
                         "skipped_other_worktrees": report.skipped_other_worktrees,
                     }))
                     .into_diagnostic()?
@@ -655,7 +721,10 @@ fn execute(cli: Cli) -> Result<i32> {
                 for transaction in &report.rolled_back {
                     println!("rolled back transaction {transaction}");
                 }
-                if report.rolled_back.is_empty() {
+                for transaction in &report.completed {
+                    println!("completed committed transaction {transaction}");
+                }
+                if report.rolled_back.is_empty() && report.completed.is_empty() {
                     println!("No recoverable transactions for this worktree.");
                 }
                 if report.skipped_other_worktrees > 0 {

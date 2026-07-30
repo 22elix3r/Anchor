@@ -97,11 +97,19 @@ stage and backup names, exact expected node, desired node, and progress state.
 Index journals additionally record the freshly validated index path and raw
 before/after captures.
 
+Batch-journal schema v1 stores the owning session/worktree and an ordered list
+of validated relative paths, exact expected/desired nodes, collision-resistant
+sibling stage/backup names, per-item progress, and a batch state. Journal input
+is capped at 256 MiB and duplicate paths or temporary names are rejected during
+recovery. `Verified` is the durable commit point: recovery rolls earlier states
+back and rolls this state forward by verifying targets and removing backups.
+
 Completed and safely rolled-back journals are terminal. Any other state blocks
 new sessions, restoration, and garbage collection. Recovery never trusts a
 stored absolute path alone: it loads the owning session, rediscovers the Git
 worktree with `gix`, verifies that the common-store identity and index path
-match, then validates live/staged/backup bytes before a no-replace rollback.
+match, then validates live/staged/backup bytes before a no-replace rollback or
+post-commit batch cleanup.
 Legacy incomplete journals do not contain enough information for this and are
 refused.
 

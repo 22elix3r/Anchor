@@ -37,7 +37,8 @@ pub use maintenance::{
 };
 pub use restore::{
     IndexRestoreResult, RestoreApplyResult, RestoreError, RestoreService, TextMergeMode,
-    TransactionRecoveryReport, TransactionRecoveryService,
+    TransactionRecoveryReport, TransactionRecoveryService, WholeRestoreConflict, WholeRestoreMode,
+    WholeRestoreResult,
 };
 
 const SESSION_TAG: u64 = 0x4153_4553;
