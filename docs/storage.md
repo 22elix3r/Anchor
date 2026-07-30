@@ -57,8 +57,11 @@ contains:
 - the full BLAKE3 object ID.
 
 Compression level and future codec choices do not affect identity. Publication
-uses a private temporary file, `fsync`, and no-clobber persistence. An existing
-object is fully verified instead of overwritten.
+uses a private temporary file, synchronizes its content, and publishes through a
+no-clobber hard link. Unix also synchronizes the destination directory. Windows
+cannot flush directory handles; Fence therefore claims process-crash recovery,
+not machine-power-loss durability, on that platform. An existing object is fully
+verified instead of overwritten.
 
 ## Manifests
 

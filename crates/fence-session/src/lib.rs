@@ -576,11 +576,8 @@ impl SessionStore {
             let _ = destination_directory.remove_file(destination_name);
             return Err(error.into());
         }
-        source_directory.try_clone()?.into_std_file().sync_all()?;
-        destination_directory
-            .try_clone()?
-            .into_std_file()
-            .sync_all()?;
+        self.filesystem.sync_dir(source_parent)?;
+        self.filesystem.sync_dir(destination_parent)?;
         Ok(())
     }
 

@@ -286,13 +286,28 @@ impl StoreFs {
         Ok(same_identity(expected, &current.metadata()?))
     }
 
-    /// Sync the retained root directory.
+    /// Request durable synchronization of the retained root directory where the platform
+    /// provides it.
+    ///
+    /// Windows does not permit `FlushFileBuffers` on directory handles, so this is an intentional
+    /// no-op there. Fence does not claim machine-power-loss durability on Windows.
     ///
     /// # Errors
     ///
     /// Returns [`StoreFsError`] if the directory cannot be cloned or synchronized.
     pub fn sync_root(&self) -> Result<(), StoreFsError> {
-        self.directory.try_clone()?.into_std_file().sync_all()?;
+        sync_directory(&self.directory)?;
+        Ok(())
+    }
+
+    /// Request durable synchronization of a relative store directory where supported.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreFsError`] if the directory is unsafe or cannot be synchronized.
+    pub fn sync_dir(&self, relative: impl AsRef<Path>) -> Result<(), StoreFsError> {
+        let directory = self.open_dir(relative)?;
+        sync_directory(&directory)?;
         Ok(())
     }
 
@@ -365,16 +380,18 @@ impl StoreTempFile {
         // the temporary file without delete sharing. Close it after durable content has been
         // established; the private temporary name still retains the file until publication.
         self.file.take();
-        self.directory.hard_link(
-            &self.name,
-            destination_directory,
-            Path::new(destination.as_ref()),
-        )?;
-        self.directory.remove_file(&self.name)?;
-        destination_directory
-            .try_clone()?
-            .into_std_file()
-            .sync_all()
+        self.directory
+            .hard_link(
+                &self.name,
+                destination_directory,
+                Path::new(destination.as_ref()),
+            )
+            .map_err(|error| contextual_io("publish private record", &error))?;
+        self.directory
+            .remove_file(&self.name)
+            .map_err(|error| contextual_io("remove published temporary name", &error))?;
+        sync_directory(destination_directory)
+            .map_err(|error| contextual_io("synchronize publication directory", &error))
     }
 
     /// Atomically replace a mutable destination.
@@ -387,7 +404,7 @@ impl StoreTempFile {
         self.directory
             .rename(&self.name, &self.directory, Path::new(destination.as_ref()))?;
         self.file.take();
-        self.directory.try_clone()?.into_std_file().sync_all()
+        sync_directory(&self.directory)
     }
 }
 
@@ -417,6 +434,24 @@ impl Drop for StoreTempFile {
     fn drop(&mut self) {
         let _ = self.directory.remove_file(&self.name);
     }
+}
+
+#[cfg(not(windows))]
+fn sync_directory(directory: &Dir) -> io::Result<()> {
+    directory.try_clone()?.into_std_file().sync_all()
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn sync_directory(_directory: &Dir) -> io::Result<()> {
+    // `FlushFileBuffers` returns `ERROR_ACCESS_DENIED` for directory handles. Namespace
+    // operations have completed when their Win32 calls return, which is sufficient for Fence's
+    // process-crash model; machine-power-loss durability remains explicitly out of scope.
+    Ok(())
+}
+
+fn contextual_io(operation: &str, error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
 }
 
 fn validate_relative(path: &Path) -> Result<&Path, StoreFsError> {
