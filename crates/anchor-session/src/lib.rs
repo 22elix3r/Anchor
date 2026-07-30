@@ -1,5 +1,6 @@
 //! Durable session lifecycle and interactive command execution.
 
+mod config;
 mod maintenance;
 mod restore;
 
@@ -24,13 +25,16 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub use config::{
+    CapturePolicy, CommandRecording, ConfigError, ConfigLoader, ConfigResolution, PolicyOverrides,
+};
 pub use maintenance::{
     DoctorReport, GarbageCollectionReport, MaintenanceError, MaintenanceService,
 };
 pub use restore::{IndexRestoreResult, RestoreApplyResult, RestoreError, RestoreService};
 
 const SESSION_TAG: u64 = 0x4153_4553;
-const SESSION_SCHEMA: u16 = 1;
+const SESSION_SCHEMA: u16 = 2;
 const MAX_SESSION_BYTES: usize = 16 * 1024 * 1024;
 const ENDPOINT_RETRIES: usize = 2;
 
@@ -69,6 +73,8 @@ impl FromStr for SessionId {
 pub struct Session {
     pub id: SessionId,
     pub command: Vec<NativeString>,
+    pub redacted_argument_count: u64,
+    pub capture_policy: CapturePolicy,
     pub invocation_directory: NativeString,
     pub worktree_root: NativeString,
     pub worktree_key: String,
@@ -177,7 +183,7 @@ impl SessionState {
 pub struct RunRequest {
     pub invocation_directory: PathBuf,
     pub command: Vec<OsString>,
-    pub capture_options: CaptureOptions,
+    pub capture_policy: CapturePolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -303,7 +309,7 @@ impl SessionStore {
         if session.worktree_key != self.worktree_key {
             return Err(SessionError::WrongWorktreeNamespace);
         }
-        let wire = SessionWire::from_session(session);
+        let wire = SessionWireV2::from_session(session);
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&wire, &mut bytes)
             .map_err(|error| SessionError::Encode(error.to_string()))?;
@@ -323,9 +329,7 @@ impl SessionStore {
     /// Returns [`SessionError`] for malformed, missing, oversized, or unsupported data.
     pub fn load_session(&self, id: SessionId) -> Result<Session, SessionError> {
         let bytes = bounded_read(&self.session_path(id), MAX_SESSION_BYTES)?;
-        let wire: SessionWire = ciborium::de::from_reader(Cursor::new(bytes))
-            .map_err(|error| SessionError::Decode(error.to_string()))?;
-        wire.into_session()
+        decode_session(&bytes)
     }
 
     /// Load all sessions in this worktree namespace, newest first.
@@ -387,9 +391,7 @@ impl SessionStore {
                     .is_some_and(|extension| extension == "cbor")
             {
                 let bytes = bounded_read(&entry.path(), MAX_SESSION_BYTES)?;
-                let wire: SessionWire = ciborium::de::from_reader(Cursor::new(bytes))
-                    .map_err(|error| SessionError::Decode(error.to_string()))?;
-                let session = wire.into_session()?;
+                let session = decode_session(&bytes)?;
                 if session.worktree_key != expected_worktree_key {
                     return Err(SessionError::WrongWorktreeNamespace);
                 }
@@ -506,7 +508,9 @@ impl SessionRunner {
             restore::ensure_no_unresolved_transactions(store.root())
                 .map_err(|error| SessionError::TransactionState(error.to_string()))?;
 
-            let before = capture_live_endpoint(&before_context, &store, request.capture_options)?;
+            let capture_policy = request.capture_policy.validate()?;
+            let capture_options = capture_policy.capture_options();
+            let before = capture_live_endpoint(&before_context, &store, capture_options)?;
             let before_manifest = store.load_manifest(before.manifest)?;
             let frozen_scope = before_context.frozen_scope(
                 &before_manifest,
@@ -514,13 +518,29 @@ impl SessionRunner {
                 before_context.tracked_paths(),
             )?;
             let id = SessionId::new();
+            let command = request
+                .command
+                .iter()
+                .take(
+                    if capture_policy.command_recording == CommandRecording::FullArguments {
+                        usize::MAX
+                    } else {
+                        1
+                    },
+                )
+                .map(|value| NativeString::from_host(value))
+                .collect();
             let mut session = Session {
                 id,
-                command: request
-                    .command
-                    .iter()
-                    .map(|value| NativeString::from_host(value))
-                    .collect(),
+                command,
+                redacted_argument_count: if capture_policy.command_recording
+                    == CommandRecording::ProgramOnly
+                {
+                    u64::try_from(request.command.len().saturating_sub(1)).unwrap_or(u64::MAX)
+                } else {
+                    0
+                },
+                capture_policy,
                 invocation_directory: NativeString::from_host(
                     request.invocation_directory.as_os_str(),
                 ),
@@ -577,12 +597,7 @@ impl SessionRunner {
 
             let after_result = (|| {
                 let after_context = GitContext::discover(&request.invocation_directory)?;
-                capture_frozen_endpoint(
-                    &after_context,
-                    &store,
-                    request.capture_options,
-                    frozen_scope,
-                )
+                capture_frozen_endpoint(&after_context, &store, capture_options, frozen_scope)
             })();
             session.finished_at = Some(Timestamp::now()?);
             match after_result {
@@ -714,7 +729,7 @@ fn private_directory(path: &Path) -> Result<(), SessionError> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct SessionWire(
+struct SessionWireV1(
     u64,
     u16,
     SessionId,
@@ -731,7 +746,62 @@ struct SessionWire(
     Option<String>,
 );
 
-impl SessionWire {
+impl SessionWireV1 {
+    fn into_session(self) -> Result<Session, SessionError> {
+        if self.0 != SESSION_TAG {
+            return Err(SessionError::WrongTag);
+        }
+        if self.1 != 1 {
+            return Err(SessionError::UnsupportedSchema(self.1));
+        }
+        let policy = CapturePolicy {
+            command_recording: CommandRecording::FullArguments,
+            ..CapturePolicy::default()
+        };
+        Ok(Session {
+            id: self.2,
+            command: self
+                .3
+                .into_iter()
+                .map(NativeStringWire::into_native)
+                .collect::<Result<_, _>>()?,
+            redacted_argument_count: 0,
+            capture_policy: policy,
+            invocation_directory: self.4.into_native()?,
+            worktree_root: self.5.into_native()?,
+            worktree_key: self.6,
+            before: self.7,
+            after: self.8,
+            started_at: self.9,
+            finished_at: self.10,
+            exit: self.11,
+            state: self.12,
+            failure: self.13,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SessionWireV2(
+    u64,
+    u16,
+    SessionId,
+    Vec<NativeStringWire>,
+    NativeStringWire,
+    NativeStringWire,
+    String,
+    EndpointSnapshot,
+    Option<EndpointSnapshot>,
+    Timestamp,
+    Option<Timestamp>,
+    Option<ExitRecord>,
+    SessionState,
+    Option<String>,
+    u64,
+    CapturePolicy,
+);
+
+impl SessionWireV2 {
     fn from_session(session: &Session) -> Self {
         Self(
             SESSION_TAG,
@@ -752,6 +822,8 @@ impl SessionWire {
             session.exit,
             session.state,
             session.failure.clone(),
+            session.redacted_argument_count,
+            session.capture_policy,
         )
     }
 
@@ -769,6 +841,8 @@ impl SessionWire {
                 .into_iter()
                 .map(NativeStringWire::into_native)
                 .collect::<Result<_, _>>()?,
+            redacted_argument_count: self.14,
+            capture_policy: self.15.validate()?,
             invocation_directory: self.4.into_native()?,
             worktree_root: self.5.into_native()?,
             worktree_key: self.6,
@@ -781,6 +855,15 @@ impl SessionWire {
             failure: self.13,
         })
     }
+}
+
+fn decode_session(bytes: &[u8]) -> Result<Session, SessionError> {
+    if let Ok(wire) = ciborium::de::from_reader::<SessionWireV2, _>(Cursor::new(bytes)) {
+        return wire.into_session();
+    }
+    let wire: SessionWireV1 = ciborium::de::from_reader(Cursor::new(bytes))
+        .map_err(|error| SessionError::Decode(error.to_string()))?;
+    wire.into_session()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -852,6 +935,8 @@ pub enum SessionError {
     UnsupportedSchema(u16),
     #[error("native string has unknown encoding {0}")]
     InvalidPathEncoding(u8),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
     #[error("manifest object {0} has a colliding encoding")]
     ManifestCollision(ManifestId),
     #[error("manifest object {0} failed identity verification")]
@@ -910,12 +995,12 @@ mod tests {
                 OsString::from("echo after>changed"),
             ]
         } else {
-            vec![script.into_os_string()]
+            vec![script.into_os_string(), OsString::from("not-recorded")]
         };
         let result = SessionRunner::run(&RunRequest {
             invocation_directory: root.path().to_path_buf(),
             command,
-            capture_options: CaptureOptions::default(),
+            capture_policy: CapturePolicy::default(),
         })
         .unwrap();
         assert_eq!(result.state, SessionState::Completed);
@@ -925,6 +1010,12 @@ mod tests {
         let location = context.store_location();
         let store = SessionStore::open(location.root, location.worktree_key).unwrap();
         let session = store.load_session(result.session_id).unwrap();
+        assert_eq!(session.command.len(), 1);
+        assert_eq!(session.redacted_argument_count, 1);
+        assert_eq!(
+            session.capture_policy.command_recording,
+            CommandRecording::ProgramOnly
+        );
         assert!(session.after.is_some());
         assert_ne!(
             session.before.manifest,
@@ -949,6 +1040,11 @@ mod tests {
         let session = Session {
             id: SessionId::new(),
             command: vec![argument],
+            redacted_argument_count: 0,
+            capture_policy: CapturePolicy {
+                command_recording: CommandRecording::FullArguments,
+                ..CapturePolicy::default()
+            },
             invocation_directory: NativeString::from_host(root.path().as_os_str()),
             worktree_root: NativeString::from_host(root.path().as_os_str()),
             worktree_key: store.worktree_key.clone(),
@@ -962,6 +1058,49 @@ mod tests {
         };
         store.save_session(&session).unwrap();
         assert_eq!(store.load_session(session.id).unwrap(), session);
+    }
+
+    #[test]
+    fn schema_v1_session_migrates_to_full_argument_policy() {
+        let root = repository();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let endpoint = capture_live_endpoint(&context, &store, CaptureOptions::default()).unwrap();
+        let id = SessionId::new();
+        let wire = SessionWireV1(
+            SESSION_TAG,
+            1,
+            id,
+            vec![
+                NativeStringWire::from_native(&NativeString::from_host(
+                    OsString::from("agent").as_os_str(),
+                )),
+                NativeStringWire::from_native(&NativeString::from_host(
+                    OsString::from("--secret").as_os_str(),
+                )),
+            ],
+            NativeStringWire::from_native(&NativeString::from_host(root.path().as_os_str())),
+            NativeStringWire::from_native(&NativeString::from_host(root.path().as_os_str())),
+            store.worktree_key.clone(),
+            endpoint,
+            None,
+            Timestamp::now().unwrap(),
+            None,
+            None,
+            SessionState::BeforeSnapshotComplete,
+            None,
+        );
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&wire, &mut bytes).unwrap();
+        let migrated = decode_session(&bytes).unwrap();
+        assert_eq!(migrated.id, id);
+        assert_eq!(migrated.command.len(), 2);
+        assert_eq!(migrated.redacted_argument_count, 0);
+        assert_eq!(
+            migrated.capture_policy.command_recording,
+            CommandRecording::FullArguments
+        );
     }
 
     #[test]

@@ -9,8 +9,9 @@ use anchor_core::{
 };
 use anchor_git::GitContext;
 use anchor_session::{
-    IndexRestoreResult, MaintenanceService, RestoreApplyResult, RestoreService, RunRequest,
-    Session, SessionId, SessionRunner, SessionStore,
+    CapturePolicy, ConfigLoader, IndexRestoreResult, MaintenanceService, PolicyOverrides,
+    RestoreApplyResult, RestoreService, RunRequest, Session, SessionId, SessionRunner,
+    SessionStore,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
@@ -31,6 +32,24 @@ struct Cli {
 enum Commands {
     /// Capture the worktree before and after an arbitrary interactive command.
     Run {
+        /// Permit a degraded snapshot when unsupported or unreadable paths are encountered.
+        #[arg(long)]
+        allow_degraded: bool,
+        /// Traverse mount boundaries under the worktree.
+        #[arg(long)]
+        cross_mounts: bool,
+        /// Retain all native command arguments in session metadata.
+        #[arg(long)]
+        record_arguments: bool,
+        /// Override the maximum number of included filesystem nodes.
+        #[arg(long)]
+        max_files: Option<u64>,
+        /// Override the maximum total raw bytes captured per endpoint.
+        #[arg(long)]
+        max_total_bytes: Option<u64>,
+        /// Override the maximum raw bytes captured for one file.
+        #[arg(long)]
+        max_file_bytes: Option<u64>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
@@ -101,14 +120,39 @@ fn main() -> ExitCode {
 #[allow(clippy::too_many_lines)]
 fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
-        Commands::Run { command } => {
+        Commands::Run {
+            allow_degraded,
+            cross_mounts,
+            record_arguments,
+            max_files,
+            max_total_bytes,
+            max_file_bytes,
+            command,
+        } => {
             let invocation_directory = std::env::current_dir()
                 .into_diagnostic()
                 .wrap_err("cannot read current directory")?;
+            let context = GitContext::discover(&invocation_directory)
+                .into_diagnostic()
+                .wrap_err("cannot discover a Git worktree")?;
+            let resolution = ConfigLoader::load(context.worktree_root())
+                .into_diagnostic()
+                .wrap_err("cannot resolve Anchor configuration")?;
+            let capture_policy = PolicyOverrides {
+                max_files,
+                max_total_bytes,
+                max_file_bytes,
+                allow_degraded,
+                cross_mounts,
+                record_arguments,
+            }
+            .apply(resolution.policy)
+            .into_diagnostic()
+            .wrap_err("invalid capture policy")?;
             let result = SessionRunner::run(&RunRequest {
                 invocation_directory,
                 command,
-                capture_options: anchor_core::CaptureOptions::default(),
+                capture_policy,
             })
             .into_diagnostic()
             .wrap_err("session failed")?;
@@ -394,9 +438,17 @@ fn print_sessions(sessions: &[Session], format: OutputFormat) -> Result<()> {
             .map(display_native)
             .collect::<Vec<_>>()
             .join(" ");
+        let redacted = if session.redacted_argument_count == 0 {
+            String::new()
+        } else {
+            format!(
+                " [+{} argument(s) not recorded]",
+                session.redacted_argument_count
+            )
+        };
         println!(
-            "{}  {:?}  {}  {}",
-            session.id, session.state, session.started_at.seconds, command
+            "{}  {:?}  {}  {}{}",
+            session.id, session.state, session.started_at.seconds, command, redacted
         );
         if let Some(failure) = &session.failure {
             println!("  failure: {failure}");
@@ -654,6 +706,8 @@ struct SessionJson {
     id: String,
     state: String,
     command: Vec<NativeStringJson>,
+    redacted_argument_count: u64,
+    capture_policy: CapturePolicy,
     worktree: NativeStringJson,
     before_manifest: String,
     after_manifest: Option<String>,
@@ -668,6 +722,8 @@ impl From<&Session> for SessionJson {
             id: session.id.to_string(),
             state: format!("{:?}", session.state),
             command: session.command.iter().map(NativeStringJson::from).collect(),
+            redacted_argument_count: session.redacted_argument_count,
+            capture_policy: session.capture_policy,
             worktree: NativeStringJson::from(&session.worktree_root),
             before_manifest: session.before.manifest.to_string(),
             after_manifest: session

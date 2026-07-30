@@ -8,6 +8,7 @@ $GIT_COMMON_DIR/anchor/users/<principal>/v1/
 ├── manifests/b3/<prefix>/<suffix>.cbor
 ├── sessions/<worktree-key>/<session-id>.cbor
 ├── locks/<worktree-key>.active.lock
+├── locks/store.activity.lock
 └── transactions/<transaction-id>/
 ```
 
@@ -54,24 +55,30 @@ are never encoded as regular files.
 
 ## Sessions
 
-Session records are mutable, atomically replaced CBOR records. They contain:
+Session records are mutable, atomically replaced CBOR records. Schema v2
+contains:
 
 - a UUIDv7 session ID;
-- native command arguments, invocation directory, and worktree root;
+- the native command program and, only when opted in, its arguments;
+- the count of arguments deliberately omitted from metadata;
+- the frozen capture limits, completeness switches, and recording policy;
+- the native invocation directory and worktree root;
 - before and optional after endpoint records;
 - raw-index object references and parsed summaries;
 - repository state;
 - timestamps, child result, lifecycle state, and a bounded failure message.
 
 The environment is not recorded. Command arguments can contain secrets and are
-stored because they are needed to identify the invocation; users should avoid
-passing secrets on command lines.
+therefore omitted by default. Schema-v1 sessions remain readable and are
+reported as having recorded full arguments because that was the v1 behavior.
 
 ## Garbage collection
 
-`anchor gc` acquires the worktree mutation lock, decodes every retained session,
-loads every referenced manifest, and verifies every reachable object before
-sweeping anything. Any corrupt retained record aborts the operation.
+`anchor gc` acquires an exclusive lease on the common store, decodes sessions
+from every linked-worktree namespace, loads every referenced manifest, and
+verifies every reachable object before sweeping anything. Normal readers,
+session capture, and restoration hold shared leases. Any corrupt retained
+record or unresolved restore transaction aborts collection.
 
 `anchor gc --dry-run` reports the same reachability result without deletion.
 Objects published by a crashed capture but never referenced by a session are

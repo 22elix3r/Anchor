@@ -26,6 +26,7 @@ Anchor is pre-release software. The implemented safety-first subset is:
 - lossless Unix-byte and Windows-WTF-16 path records;
 - immutable BLAKE3-addressed, Zstandard-compressed raw-byte objects;
 - versioned CBOR manifests and session records;
+- frozen per-session capture policy with schema-v1 migration support;
 - read-only Git discovery, index capture, tracked-path and ignore awareness via
   `gix`;
 - stable before/after capture around inherited interactive terminal streams;
@@ -103,6 +104,12 @@ Default capture limits are 250,000 regular files, 2 GiB of raw content, and
 256 MiB per file. Exceeding a limit aborts before the child starts. Ignored
 files are not a security boundary: a nonignored `.env`, credential, or key file
 is stored exactly like source code.
+
+Command arguments are not retained by default because they commonly contain
+tokens and other secrets. Use `anchor run --record-arguments -- <command>` only
+when the complete invocation is safe to store. Capture limits and the two
+degraded-behavior switches can be configured or overridden explicitly; see
+[Configuration](docs/configuration.md).
 
 See [Safety and threat model](docs/safety.md) and
 [Storage format](docs/storage.md) before using Anchor on sensitive worktrees.

@@ -11,9 +11,8 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use anchor_core::ObjectStore;
 use anchor_core::{
-    CaptureEngine, CaptureOptions, ConflictReason, ManifestEntry, ManifestNode, NativeRelativePath,
-    NoChangeReason, ObservedKind, RestoreOutcome, RestorePlan, ScopeClassifier, ScopeDecision,
-    ScopeError,
+    CaptureEngine, ConflictReason, ManifestEntry, ManifestNode, NativeRelativePath, NoChangeReason,
+    ObservedKind, RestoreOutcome, RestorePlan, ScopeClassifier, ScopeDecision, ScopeError,
 };
 use anchor_git::{GitContext, IndexCapture};
 #[cfg(unix)]
@@ -102,7 +101,7 @@ impl RestoreService {
             selected: selected.clone(),
             expected_kind: expected.map(|entry| node_kind(&entry.node)),
         };
-        let current = CaptureEngine::new(store.objects(), CaptureOptions::default())
+        let current = CaptureEngine::new(store.objects(), session.capture_policy.capture_options())
             .capture(&worktree, &scope)?
             .manifest;
         let selected_set = BTreeSet::from([selected.clone()]);
@@ -862,10 +861,10 @@ pub enum RestoreError {
 mod tests {
     use std::ffi::OsString;
 
-    use anchor_core::{CaptureOptions, PathEncoding};
+    use anchor_core::PathEncoding;
 
     use super::*;
-    use crate::{RunRequest, SessionRunner};
+    use crate::{CapturePolicy, RunRequest, SessionRunner};
 
     fn repository() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
@@ -889,7 +888,7 @@ mod tests {
                 OsString::from("-c"),
                 OsString::from(script),
             ],
-            capture_options: CaptureOptions::default(),
+            capture_policy: CapturePolicy::default(),
         })
         .unwrap();
         let context = GitContext::discover(root).unwrap();

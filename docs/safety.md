@@ -109,6 +109,11 @@ read captured contents. Unix store directories are forced to mode `0700`.
 Windows ACL hardening is not yet implemented, and `doctor` reports the store as
 not private there.
 
+Only the command program is recorded by default. Arguments are represented by a
+count unless `--record-arguments` is explicitly enabled. The process environment
+is never recorded. This metadata policy does not affect file inclusion: a
+nonignored secret file is still captured.
+
 Sparse checkout, sparse indexes, and split indexes are refused before launch.
 The current implementation cannot yet freeze index-sourced ignore files from a
 sparse worktree or retain every shared-index dependency, so claiming a complete

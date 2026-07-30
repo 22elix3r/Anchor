@@ -257,12 +257,12 @@ mod tests {
     use std::ffi::OsString;
 
     use anchor_core::{
-        CaptureOptions, Completeness, Coverage, Manifest, ManifestEntry, ManifestNode,
-        NativeRelativePath, PathEncoding, SafetyObservations,
+        Completeness, Coverage, Manifest, ManifestEntry, ManifestNode, NativeRelativePath,
+        PathEncoding, SafetyObservations,
     };
 
     use super::*;
-    use crate::{RunRequest, SessionRunner};
+    use crate::{CapturePolicy, RunRequest, SessionRunner};
 
     fn repository() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
@@ -286,7 +286,7 @@ mod tests {
         SessionRunner::run(&RunRequest {
             invocation_directory: root.path().to_path_buf(),
             command: change_command(),
-            capture_options: CaptureOptions::default(),
+            capture_policy: CapturePolicy::default(),
         })
         .unwrap();
         let context = GitContext::discover(root.path()).unwrap();
@@ -326,7 +326,7 @@ mod tests {
         let result = SessionRunner::run(&RunRequest {
             invocation_directory: root.path().to_path_buf(),
             command: change_command(),
-            capture_options: CaptureOptions::default(),
+            capture_policy: CapturePolicy::default(),
         })
         .unwrap();
         let context = GitContext::discover(root.path()).unwrap();
