@@ -132,7 +132,7 @@ impl StoreFs {
         #[cfg(not(unix))]
         parent.create_dir(name)?;
         #[cfg(windows)]
-        fence_windows::harden_private_directory(self.root.join(relative))?;
+        fence_windows::harden_private_directory(&self.root.join(relative))?;
         open_existing_private_component(&parent, name)
     }
 
@@ -447,6 +447,8 @@ fn open_or_create_private_component(
         }
         Err(error) => return Err(error.into()),
     };
+    #[cfg(not(unix))]
+    let _ = (repair_permissions, created);
     #[cfg(unix)]
     if repair_permissions && !created {
         use cap_std::fs::{Permissions, PermissionsExt as _};
@@ -545,9 +547,8 @@ fn same_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata) ->
 
 #[cfg(windows)]
 fn same_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata) -> bool {
-    use cap_std::fs::MetadataExt as _;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
+    use cap_fs_ext::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 #[cfg(not(any(unix, windows)))]

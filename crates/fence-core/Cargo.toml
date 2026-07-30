@@ -31,6 +31,7 @@ rustix.workspace = true
 fence-unix.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+cap-fs-ext.workspace = true
 fence-windows.workspace = true
 
 [dev-dependencies]

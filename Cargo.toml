@@ -30,6 +30,7 @@ fence-tui = { version = "0.1.0-alpha.1", path = "crates/fence-tui" }
 base64 = "0.23.0"
 atomic-write-file = "0.3.0"
 blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
+cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 ciborium = "0.2.2"
 clap = { version = "4.6.4", features = ["derive"] }
