@@ -247,6 +247,8 @@ pub enum PathError {
     ParentComponent,
     #[error("path component contains a separator")]
     Separator,
+    #[error("Windows path components cannot select alternate data streams")]
+    AlternateDataStream,
     #[error("native path data contains a NUL")]
     Nul,
     #[error("Windows native data has an odd byte length")]
@@ -310,6 +312,9 @@ fn validate_component(encoding: PathEncoding, component: &[u8]) -> Result<(), Pa
             }
             if units.iter().any(|unit| matches!(*unit, 0x2f | 0x5c)) {
                 return Err(PathError::Separator);
+            }
+            if units.contains(&u16::from(b':')) {
+                return Err(PathError::AlternateDataStream);
             }
             if units == [u16::from(b'.')] {
                 return Err(PathError::DotComponent);
@@ -381,5 +386,17 @@ mod tests {
     fn accepts_unpaired_windows_surrogate() {
         let bytes = 0xd800_u16.to_le_bytes().to_vec();
         assert!(NativeRelativePath::new(PathEncoding::WindowsWtf16Le, vec![bytes]).is_ok());
+    }
+
+    #[test]
+    fn rejects_windows_alternate_stream_component() {
+        let bytes = "file:stream"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            NativeRelativePath::new(PathEncoding::WindowsWtf16Le, vec![bytes]),
+            Err(PathError::AlternateDataStream)
+        );
     }
 }

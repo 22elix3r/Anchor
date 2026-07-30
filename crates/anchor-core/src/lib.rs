@@ -16,7 +16,7 @@ pub use capture::{
 pub use diff::{ChangeKind, ManifestChange, ManifestDiff};
 pub use manifest::{
     Completeness, Coverage, Manifest, ManifestEntry, ManifestError, ManifestId, ManifestNode,
-    Omission, OmissionReason, SafetyObservations,
+    Omission, OmissionReason, SafetyObservations, WindowsSymlinkKind,
 };
 pub use merge::{
     TextMergeConflict, TextMergeError, TextMergeLimits, TextMergeResult,

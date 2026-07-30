@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::{NativeRelativePath, NativeString, ObjectId, PathEncoding, PathError};
 
 const MANIFEST_TAG: u64 = 0x414d;
-const MANIFEST_SCHEMA: u16 = 1;
+const MANIFEST_SCHEMA: u16 = 2;
 const MAX_ENCODED_MANIFEST: usize = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 1_000_000;
 
@@ -97,6 +97,7 @@ pub enum Completeness {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Manifest {
+    schema: u16,
     path_encoding: PathEncoding,
     entries: Vec<ManifestEntry>,
     coverage: Coverage,
@@ -134,16 +135,25 @@ impl Manifest {
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         validate_entry_tree(&entries)?;
-        Ok(Self {
+        let manifest = Self {
+            schema: MANIFEST_SCHEMA,
             path_encoding,
             entries,
             coverage,
-        })
+        };
+        manifest.validate_platform_metadata()?;
+        Ok(manifest)
     }
 
     #[must_use]
     pub const fn path_encoding(&self) -> PathEncoding {
         self.path_encoding
+    }
+
+    /// Return the persistent schema used to identify this manifest.
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema
     }
 
     #[must_use]
@@ -156,29 +166,45 @@ impl Manifest {
         &self.coverage
     }
 
-    /// Encode the canonical manifest-v1 record.
+    /// Encode the canonical versioned manifest record.
     ///
     /// # Errors
     ///
     /// Returns [`ManifestError`] if CBOR serialization fails or exceeds the size limit.
     pub fn encode(&self) -> Result<Vec<u8>, ManifestError> {
-        let wire = ManifestWire(
-            MANIFEST_TAG,
-            MANIFEST_SCHEMA,
-            encoding_tag(self.path_encoding),
-            self.entries.iter().map(EntryWire::from).collect(),
-            CoverageWire::from(&self.coverage),
-        );
         let mut output = Vec::new();
-        ciborium::ser::into_writer(&wire, &mut output)
-            .map_err(|error| ManifestError::Encode(error.to_string()))?;
+        match self.schema {
+            1 => {
+                let wire = ManifestWireV1(
+                    MANIFEST_TAG,
+                    1,
+                    encoding_tag(self.path_encoding),
+                    self.entries.iter().map(EntryWireV1::from).collect(),
+                    CoverageWire::from(&self.coverage),
+                );
+                ciborium::ser::into_writer(&wire, &mut output)
+                    .map_err(|error| ManifestError::Encode(error.to_string()))?;
+            }
+            MANIFEST_SCHEMA => {
+                let wire = ManifestWireV2(
+                    MANIFEST_TAG,
+                    MANIFEST_SCHEMA,
+                    encoding_tag(self.path_encoding),
+                    self.entries.iter().map(EntryWireV2::from).collect(),
+                    CoverageWire::from(&self.coverage),
+                );
+                ciborium::ser::into_writer(&wire, &mut output)
+                    .map_err(|error| ManifestError::Encode(error.to_string()))?;
+            }
+            schema => return Err(ManifestError::UnsupportedSchema(schema)),
+        }
         if output.len() > MAX_ENCODED_MANIFEST {
             return Err(ManifestError::EncodedTooLarge);
         }
         Ok(output)
     }
 
-    /// Decode and validate a manifest-v1 record.
+    /// Decode and validate a supported manifest record.
     ///
     /// # Errors
     ///
@@ -187,25 +213,24 @@ impl Manifest {
         if bytes.len() > MAX_ENCODED_MANIFEST {
             return Err(ManifestError::EncodedTooLarge);
         }
-        let wire: ManifestWire = ciborium::de::from_reader(Cursor::new(bytes))
+        if let Ok(wire) = ciborium::de::from_reader::<ManifestWireV2, _>(Cursor::new(bytes)) {
+            if wire.0 != MANIFEST_TAG {
+                return Err(ManifestError::WrongTag);
+            }
+            if wire.1 != MANIFEST_SCHEMA {
+                return Err(ManifestError::UnsupportedSchema(wire.1));
+            }
+            return Self::from_v2_wire(wire);
+        }
+        let wire: ManifestWireV1 = ciborium::de::from_reader(Cursor::new(bytes))
             .map_err(|error| ManifestError::Decode(error.to_string()))?;
         if wire.0 != MANIFEST_TAG {
             return Err(ManifestError::WrongTag);
         }
-        if wire.1 != MANIFEST_SCHEMA {
+        if wire.1 != 1 {
             return Err(ManifestError::UnsupportedSchema(wire.1));
         }
-        if wire.3.len() > MAX_ENTRIES {
-            return Err(ManifestError::TooManyEntries);
-        }
-        let encoding = decode_encoding(wire.2)?;
-        let entries = wire
-            .3
-            .into_iter()
-            .map(|entry| entry.into_entry(encoding))
-            .collect::<Result<Vec<_>, _>>()?;
-        let coverage = wire.4.into_coverage(encoding)?;
-        Self::new(encoding, entries, coverage)
+        Self::from_v1_wire(wire)
     }
 
     /// Compute the domain-separated identity of this manifest.
@@ -216,9 +241,135 @@ impl Manifest {
     pub fn id(&self) -> Result<ManifestId, ManifestError> {
         let encoded = self.encode()?;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"anchor:manifest:v1\0");
+        hasher.update(match self.schema {
+            1 => b"anchor:manifest:v1\0",
+            MANIFEST_SCHEMA => b"anchor:manifest:v2\0",
+            _ => return Err(ManifestError::UnsupportedSchema(self.schema)),
+        });
         hasher.update(&encoded);
         Ok(ManifestId(*hasher.finalize().as_bytes()))
+    }
+
+    fn from_v1_wire(wire: ManifestWireV1) -> Result<Self, ManifestError> {
+        if wire.3.len() > MAX_ENTRIES {
+            return Err(ManifestError::TooManyEntries);
+        }
+        let encoding = decode_encoding(wire.2)?;
+        let entries = wire
+            .3
+            .into_iter()
+            .map(|entry| entry.into_entry(encoding))
+            .collect::<Result<Vec<_>, _>>()?;
+        let coverage = wire.4.into_coverage(encoding)?;
+        Self::from_decoded(1, encoding, entries, coverage)
+    }
+
+    fn from_v2_wire(wire: ManifestWireV2) -> Result<Self, ManifestError> {
+        if wire.3.len() > MAX_ENTRIES {
+            return Err(ManifestError::TooManyEntries);
+        }
+        let encoding = decode_encoding(wire.2)?;
+        let entries = wire
+            .3
+            .into_iter()
+            .map(|entry| entry.into_entry(encoding))
+            .collect::<Result<Vec<_>, _>>()?;
+        let coverage = wire.4.into_coverage(encoding)?;
+        Self::from_decoded(MANIFEST_SCHEMA, encoding, entries, coverage)
+    }
+
+    fn from_decoded(
+        schema: u16,
+        path_encoding: PathEncoding,
+        mut entries: Vec<ManifestEntry>,
+        coverage: Coverage,
+    ) -> Result<Self, ManifestError> {
+        if coverage.completeness != Completeness::Degraded && !coverage.omissions.is_empty() {
+            return Err(ManifestError::OmissionsRequireDegraded);
+        }
+        if entries
+            .iter()
+            .any(|entry| entry.path.encoding() != path_encoding)
+            || coverage
+                .omissions
+                .iter()
+                .any(|omission| omission.path.encoding() != path_encoding)
+        {
+            return Err(ManifestError::MixedPathEncoding);
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        validate_entry_tree(&entries)?;
+        let manifest = Self {
+            schema,
+            path_encoding,
+            entries,
+            coverage,
+        };
+        if schema == MANIFEST_SCHEMA {
+            manifest.validate_platform_metadata()?;
+        }
+        Ok(manifest)
+    }
+
+    fn validate_platform_metadata(&self) -> Result<(), ManifestError> {
+        for entry in &self.entries {
+            match (&entry.node, self.path_encoding) {
+                (
+                    ManifestNode::Regular {
+                        unix_exec_bits,
+                        windows_readonly,
+                        ..
+                    },
+                    PathEncoding::UnixBytes,
+                ) if unix_exec_bits.is_none() || windows_readonly.is_some() => {
+                    return Err(ManifestError::InvalidPlatformMetadata);
+                }
+                (
+                    ManifestNode::Regular {
+                        unix_exec_bits,
+                        windows_readonly,
+                        ..
+                    },
+                    PathEncoding::WindowsWtf16Le,
+                ) if unix_exec_bits.is_some() || windows_readonly.is_none() => {
+                    return Err(ManifestError::InvalidPlatformMetadata);
+                }
+                (
+                    ManifestNode::Symlink {
+                        windows_link_kind,
+                        windows_substitute_name,
+                        windows_reparse_flags,
+                        ..
+                    },
+                    PathEncoding::UnixBytes,
+                ) if windows_link_kind.is_some()
+                    || windows_substitute_name.is_some()
+                    || windows_reparse_flags.is_some() =>
+                {
+                    return Err(ManifestError::InvalidPlatformMetadata);
+                }
+                (
+                    ManifestNode::Symlink {
+                        target,
+                        windows_link_kind,
+                        windows_substitute_name,
+                        windows_reparse_flags,
+                    },
+                    PathEncoding::WindowsWtf16Le,
+                ) if windows_link_kind.is_none()
+                    || windows_substitute_name.is_none()
+                    || windows_reparse_flags.is_none()
+                    || target.encoding() != PathEncoding::WindowsWtf16Le
+                    || windows_substitute_name
+                        .as_ref()
+                        .is_some_and(|value| value.encoding() != PathEncoding::WindowsWtf16Le) =>
+                {
+                    return Err(ManifestError::InvalidPlatformMetadata);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -235,12 +386,23 @@ pub enum ManifestNode {
         object: ObjectId,
         raw_size: u64,
         unix_exec_bits: Option<u8>,
+        windows_readonly: Option<bool>,
     },
     Symlink {
         target: NativeString,
-        windows_link_kind: Option<u8>,
+        windows_link_kind: Option<WindowsSymlinkKind>,
+        windows_substitute_name: Option<NativeString>,
+        windows_reparse_flags: Option<u32>,
     },
     EmptyDirectory,
+}
+
+/// The target object type required by `CreateSymbolicLinkW`.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum WindowsSymlinkKind {
+    File = 1,
+    Directory = 2,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -272,13 +434,25 @@ pub enum OmissionReason {
     NestedRepository = 5,
     ReparsePoint = 6,
     ExplicitDegradedExclusion = 7,
+    AlternateDataStream = 8,
+    HardlinkTopology = 9,
+    UnsupportedReparsePoint = 10,
+    CloudPlaceholder = 11,
+    EncryptedFile = 12,
+    CaseSemanticsUnknown = 13,
 }
 
 #[derive(Serialize, Deserialize)]
-struct ManifestWire(u64, u16, u8, Vec<EntryWire>, CoverageWire);
+struct ManifestWireV1(u64, u16, u8, Vec<EntryWireV1>, CoverageWire);
 
 #[derive(Serialize, Deserialize)]
-struct EntryWire(PathWire, NodeWire, SafetyWire);
+struct ManifestWireV2(u64, u16, u8, Vec<EntryWireV2>, CoverageWire);
+
+#[derive(Serialize, Deserialize)]
+struct EntryWireV1(PathWire, NodeWireV1, SafetyWire);
+
+#[derive(Serialize, Deserialize)]
+struct EntryWireV2(PathWire, NodeWireV2, SafetyWire);
 
 #[derive(Serialize, Deserialize)]
 struct PathWire(u8, Vec<ByteBuf>);
@@ -287,13 +461,26 @@ struct PathWire(u8, Vec<ByteBuf>);
 struct NativeStringWire(u8, ByteBuf);
 
 #[derive(Serialize, Deserialize)]
-struct NodeWire(
+struct NodeWireV1(
     u8,
     Option<ObjectId>,
     Option<u64>,
     Option<u8>,
     Option<NativeStringWire>,
     Option<u8>,
+);
+
+#[derive(Serialize, Deserialize)]
+struct NodeWireV2(
+    u8,
+    Option<ObjectId>,
+    Option<u64>,
+    Option<u8>,
+    Option<bool>,
+    Option<NativeStringWire>,
+    Option<u8>,
+    Option<NativeStringWire>,
+    Option<u32>,
 );
 
 #[derive(Serialize, Deserialize)]
@@ -305,14 +492,15 @@ struct CoverageWire(u8, Vec<OmissionWire>);
 #[derive(Serialize, Deserialize)]
 struct OmissionWire(PathWire, u16);
 
-impl From<&ManifestEntry> for EntryWire {
+impl From<&ManifestEntry> for EntryWireV1 {
     fn from(entry: &ManifestEntry) -> Self {
         let node = match &entry.node {
             ManifestNode::Regular {
                 object,
                 raw_size,
                 unix_exec_bits,
-            } => NodeWire(
+                ..
+            } => NodeWireV1(
                 1,
                 Some(*object),
                 Some(*raw_size),
@@ -323,7 +511,8 @@ impl From<&ManifestEntry> for EntryWire {
             ManifestNode::Symlink {
                 target,
                 windows_link_kind,
-            } => NodeWire(
+                ..
+            } => NodeWireV1(
                 2,
                 None,
                 None,
@@ -332,9 +521,9 @@ impl From<&ManifestEntry> for EntryWire {
                     encoding_tag(target.encoding()),
                     ByteBuf::from(target.bytes().to_vec()),
                 )),
-                *windows_link_kind,
+                windows_link_kind.map(|kind| kind as u8),
             ),
-            ManifestNode::EmptyDirectory => NodeWire(3, None, None, None, None, None),
+            ManifestNode::EmptyDirectory => NodeWireV1(3, None, None, None, None, None),
         };
         Self(
             PathWire::from(&entry.path),
@@ -348,14 +537,73 @@ impl From<&ManifestEntry> for EntryWire {
     }
 }
 
-impl EntryWire {
+impl From<&ManifestEntry> for EntryWireV2 {
+    fn from(entry: &ManifestEntry) -> Self {
+        let node = match &entry.node {
+            ManifestNode::Regular {
+                object,
+                raw_size,
+                unix_exec_bits,
+                windows_readonly,
+            } => NodeWireV2(
+                1,
+                Some(*object),
+                Some(*raw_size),
+                *unix_exec_bits,
+                *windows_readonly,
+                None,
+                None,
+                None,
+                None,
+            ),
+            ManifestNode::Symlink {
+                target,
+                windows_link_kind,
+                windows_substitute_name,
+                windows_reparse_flags,
+            } => NodeWireV2(
+                2,
+                None,
+                None,
+                None,
+                None,
+                Some(NativeStringWire(
+                    encoding_tag(target.encoding()),
+                    ByteBuf::from(target.bytes().to_vec()),
+                )),
+                windows_link_kind.map(|kind| kind as u8),
+                windows_substitute_name.as_ref().map(|value| {
+                    NativeStringWire(
+                        encoding_tag(value.encoding()),
+                        ByteBuf::from(value.bytes().to_vec()),
+                    )
+                }),
+                *windows_reparse_flags,
+            ),
+            ManifestNode::EmptyDirectory => {
+                NodeWireV2(3, None, None, None, None, None, None, None, None)
+            }
+        };
+        Self(
+            PathWire::from(&entry.path),
+            node,
+            SafetyWire(
+                entry.safety.hardlink_group,
+                entry.safety.link_count,
+                entry.safety.extended_metadata_present,
+            ),
+        )
+    }
+}
+
+impl EntryWireV1 {
     fn into_entry(self, manifest_encoding: PathEncoding) -> Result<ManifestEntry, ManifestError> {
         let path = self.0.into_path()?;
         if path.encoding() != manifest_encoding {
             return Err(ManifestError::MixedPathEncoding);
         }
         let node = match self.1 {
-            NodeWire(1, Some(object), Some(raw_size), unix_exec_bits, None, None) => {
+            NodeWireV1(1, Some(object), Some(raw_size), unix_exec_bits, None, None) => {
                 if unix_exec_bits.is_some_and(|bits| bits > 0b111) {
                     return Err(ManifestError::InvalidExecuteBits);
                 }
@@ -363,19 +611,24 @@ impl EntryWire {
                     object,
                     raw_size,
                     unix_exec_bits,
+                    windows_readonly: None,
                 }
             }
-            NodeWire(2, None, None, None, Some(target), windows_link_kind) => {
+            NodeWireV1(2, None, None, None, Some(target), windows_link_kind) => {
                 let target = target.into_native_string()?;
                 if target.encoding() != manifest_encoding {
                     return Err(ManifestError::MixedPathEncoding);
                 }
                 ManifestNode::Symlink {
                     target,
-                    windows_link_kind,
+                    windows_link_kind: windows_link_kind
+                        .map(decode_windows_link_kind)
+                        .transpose()?,
+                    windows_substitute_name: None,
+                    windows_reparse_flags: None,
                 }
             }
-            NodeWire(3, None, None, None, None, None) => ManifestNode::EmptyDirectory,
+            NodeWireV1(3, None, None, None, None, None) => ManifestNode::EmptyDirectory,
             _ => return Err(ManifestError::InvalidNode),
         };
         Ok(ManifestEntry {
@@ -387,6 +640,96 @@ impl EntryWire {
                 extended_metadata_present: self.2.2,
             },
         })
+    }
+}
+
+impl EntryWireV2 {
+    fn into_entry(self, manifest_encoding: PathEncoding) -> Result<ManifestEntry, ManifestError> {
+        let path = self.0.into_path()?;
+        if path.encoding() != manifest_encoding {
+            return Err(ManifestError::MixedPathEncoding);
+        }
+        let node = match self.1 {
+            NodeWireV2(
+                1,
+                Some(object),
+                Some(raw_size),
+                unix_exec_bits,
+                windows_readonly,
+                None,
+                None,
+                None,
+                None,
+            ) => {
+                if unix_exec_bits.is_some_and(|bits| bits > 0b111) {
+                    return Err(ManifestError::InvalidExecuteBits);
+                }
+                ManifestNode::Regular {
+                    object,
+                    raw_size,
+                    unix_exec_bits,
+                    windows_readonly,
+                }
+            }
+            NodeWireV2(
+                2,
+                None,
+                None,
+                None,
+                None,
+                Some(target),
+                Some(windows_link_kind),
+                Some(windows_substitute_name),
+                Some(windows_reparse_flags),
+            ) => {
+                let target = target.into_native_string()?;
+                let windows_substitute_name = windows_substitute_name.into_native_string()?;
+                if target.encoding() != manifest_encoding
+                    || windows_substitute_name.encoding() != manifest_encoding
+                {
+                    return Err(ManifestError::MixedPathEncoding);
+                }
+                ManifestNode::Symlink {
+                    target,
+                    windows_link_kind: Some(decode_windows_link_kind(windows_link_kind)?),
+                    windows_substitute_name: Some(windows_substitute_name),
+                    windows_reparse_flags: Some(windows_reparse_flags),
+                }
+            }
+            NodeWireV2(2, None, None, None, None, Some(target), None, None, None) => {
+                let target = target.into_native_string()?;
+                if target.encoding() != manifest_encoding {
+                    return Err(ManifestError::MixedPathEncoding);
+                }
+                ManifestNode::Symlink {
+                    target,
+                    windows_link_kind: None,
+                    windows_substitute_name: None,
+                    windows_reparse_flags: None,
+                }
+            }
+            NodeWireV2(3, None, None, None, None, None, None, None, None) => {
+                ManifestNode::EmptyDirectory
+            }
+            _ => return Err(ManifestError::InvalidNode),
+        };
+        Ok(ManifestEntry {
+            path,
+            node,
+            safety: SafetyObservations {
+                hardlink_group: self.2.0,
+                link_count: self.2.1,
+                extended_metadata_present: self.2.2,
+            },
+        })
+    }
+}
+
+fn decode_windows_link_kind(value: u8) -> Result<WindowsSymlinkKind, ManifestError> {
+    match value {
+        1 => Ok(WindowsSymlinkKind::File),
+        2 => Ok(WindowsSymlinkKind::Directory),
+        _ => Err(ManifestError::InvalidWindowsLinkKind(value)),
     }
 }
 
@@ -463,6 +806,12 @@ impl CoverageWire {
                     5 => OmissionReason::NestedRepository,
                     6 => OmissionReason::ReparsePoint,
                     7 => OmissionReason::ExplicitDegradedExclusion,
+                    8 => OmissionReason::AlternateDataStream,
+                    9 => OmissionReason::HardlinkTopology,
+                    10 => OmissionReason::UnsupportedReparsePoint,
+                    11 => OmissionReason::CloudPlaceholder,
+                    12 => OmissionReason::EncryptedFile,
+                    13 => OmissionReason::CaseSemanticsUnknown,
                     value => return Err(ManifestError::UnknownOmissionReason(value)),
                 };
                 Ok(Omission { path, reason })
@@ -535,6 +884,10 @@ pub enum ManifestError {
     InvalidNode,
     #[error("manifest contains invalid execute bits")]
     InvalidExecuteBits,
+    #[error("manifest contains invalid platform-specific metadata")]
+    InvalidPlatformMetadata,
+    #[error("manifest contains invalid Windows symbolic-link kind {0}")]
+    InvalidWindowsLinkKind(u8),
     #[error("manifest contains invalid completeness value {0}")]
     InvalidCompleteness(u8),
     #[error("manifest contains unknown omission reason {0}")]
@@ -592,6 +945,7 @@ mod tests {
                     object: ObjectId::from_raw(b"fn main() {}\n"),
                     raw_size: 13,
                     unix_exec_bits: Some(0),
+                    windows_readonly: None,
                 },
                 safety: SafetyObservations {
                     link_count: 1,
@@ -613,6 +967,90 @@ mod tests {
         assert_eq!(Manifest::decode(&encoded).unwrap(), manifest);
         assert_eq!(manifest.encode().unwrap(), encoded);
         assert_eq!(manifest.id().unwrap(), manifest.id().unwrap());
+    }
+
+    #[test]
+    fn legacy_manifest_keeps_its_wire_identity() {
+        let legacy = Manifest {
+            schema: 1,
+            path_encoding: PathEncoding::UnixBytes,
+            entries: vec![ManifestEntry {
+                path: path(&[b"legacy"]),
+                node: ManifestNode::Regular {
+                    object: ObjectId::from_raw(b"legacy"),
+                    raw_size: 6,
+                    unix_exec_bits: Some(0),
+                    windows_readonly: None,
+                },
+                safety: SafetyObservations::default(),
+            }],
+            coverage: Coverage {
+                completeness: Completeness::Complete,
+                omissions: Vec::new(),
+            },
+        };
+        let id = legacy.id().unwrap();
+        let decoded = Manifest::decode(&legacy.encode().unwrap()).unwrap();
+        assert_eq!(decoded.schema_version(), 1);
+        assert_eq!(decoded.id().unwrap(), id);
+        assert_eq!(decoded, legacy);
+    }
+
+    #[test]
+    fn windows_manifest_preserves_readonly_and_symlink_payload() {
+        fn windows(value: &str) -> Vec<u8> {
+            value.encode_utf16().flat_map(u16::to_le_bytes).collect()
+        }
+
+        let manifest = Manifest::new(
+            PathEncoding::WindowsWtf16Le,
+            vec![
+                ManifestEntry {
+                    path: NativeRelativePath::new(
+                        PathEncoding::WindowsWtf16Le,
+                        vec![windows("readonly.txt")],
+                    )
+                    .unwrap(),
+                    node: ManifestNode::Regular {
+                        object: ObjectId::from_raw(b"content"),
+                        raw_size: 7,
+                        unix_exec_bits: None,
+                        windows_readonly: Some(true),
+                    },
+                    safety: SafetyObservations::default(),
+                },
+                ManifestEntry {
+                    path: NativeRelativePath::new(
+                        PathEncoding::WindowsWtf16Le,
+                        vec![windows("link")],
+                    )
+                    .unwrap(),
+                    node: ManifestNode::Symlink {
+                        target: NativeString::new(
+                            PathEncoding::WindowsWtf16Le,
+                            windows(r"..\target"),
+                        )
+                        .unwrap(),
+                        windows_link_kind: Some(WindowsSymlinkKind::File),
+                        windows_substitute_name: Some(
+                            NativeString::new(PathEncoding::WindowsWtf16Le, windows(r"..\target"))
+                                .unwrap(),
+                        ),
+                        windows_reparse_flags: Some(1),
+                    },
+                    safety: SafetyObservations::default(),
+                },
+            ],
+            Coverage {
+                completeness: Completeness::Complete,
+                omissions: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let decoded = Manifest::decode(&manifest.encode().unwrap()).unwrap();
+        assert_eq!(decoded.schema_version(), 2);
+        assert_eq!(decoded, manifest);
     }
 
     #[test]

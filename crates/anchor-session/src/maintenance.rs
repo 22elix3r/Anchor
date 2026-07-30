@@ -346,6 +346,7 @@ mod tests {
                     object,
                     raw_size: 19,
                     unix_exec_bits: Some(0),
+                    windows_readonly: None,
                 },
                 safety: SafetyObservations::default(),
             }],

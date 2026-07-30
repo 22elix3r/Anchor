@@ -163,65 +163,10 @@ fn decide_present(
 ) -> RestoreOutcome {
     match (&base.node, &session.node, &current.node) {
         (
-            ManifestNode::Regular {
-                object: base_object,
-                raw_size: base_size,
-                unix_exec_bits: base_mode,
-            },
-            ManifestNode::Regular {
-                object: session_object,
-                unix_exec_bits: session_mode,
-                ..
-            },
-            ManifestNode::Regular {
-                object: current_object,
-                raw_size: current_size,
-                unix_exec_bits: current_mode,
-            },
-        ) => {
-            let desired_mode = match invert_scalar(*base_mode, *session_mode, *current_mode) {
-                ScalarDecision::Preserve(value) | ScalarDecision::Restore(value) => value,
-                ScalarDecision::Conflict => {
-                    return conflict(
-                        ConflictReason::ModeDrifted,
-                        Some(base),
-                        Some(session),
-                        Some(current),
-                    );
-                }
-            };
-            if base_object == session_object {
-                if desired_mode == *current_mode {
-                    return RestoreOutcome::NoChange(NoChangeReason::AlreadyRestored);
-                }
-                return RestoreOutcome::Write(Some(ManifestEntry {
-                    path: current.path.clone(),
-                    node: ManifestNode::Regular {
-                        object: *current_object,
-                        raw_size: *current_size,
-                        unix_exec_bits: desired_mode,
-                    },
-                    safety: current.safety.clone(),
-                }));
-            }
-            if current_object == session_object {
-                return RestoreOutcome::Write(Some(ManifestEntry {
-                    path: base.path.clone(),
-                    node: ManifestNode::Regular {
-                        object: *base_object,
-                        raw_size: *base_size,
-                        unix_exec_bits: desired_mode,
-                    },
-                    safety: base.safety.clone(),
-                }));
-            }
-            conflict(
-                ConflictReason::OpaqueContentDrifted,
-                Some(base),
-                Some(session),
-                Some(current),
-            )
-        }
+            ManifestNode::Regular { .. },
+            ManifestNode::Regular { .. },
+            ManifestNode::Regular { .. },
+        ) => decide_regular(base, session, current),
         (
             ManifestNode::Symlink { .. },
             ManifestNode::Symlink { .. },
@@ -239,6 +184,102 @@ fn decide_present(
             Some(current),
         ),
     }
+}
+
+fn decide_regular(
+    base: &ManifestEntry,
+    session: &ManifestEntry,
+    current: &ManifestEntry,
+) -> RestoreOutcome {
+    let ManifestNode::Regular {
+        object: base_object,
+        raw_size: base_size,
+        unix_exec_bits: base_unix_mode,
+        windows_readonly: base_windows_readonly,
+    } = &base.node
+    else {
+        unreachable!("caller matched regular entries");
+    };
+    let ManifestNode::Regular {
+        object: session_object,
+        unix_exec_bits: session_unix_mode,
+        windows_readonly: session_windows_readonly,
+        ..
+    } = &session.node
+    else {
+        unreachable!("caller matched regular entries");
+    };
+    let ManifestNode::Regular {
+        object: current_object,
+        raw_size: current_size,
+        unix_exec_bits: current_unix_mode,
+        windows_readonly: current_windows_readonly,
+    } = &current.node
+    else {
+        unreachable!("caller matched regular entries");
+    };
+
+    let desired_unix_mode =
+        match invert_scalar(*base_unix_mode, *session_unix_mode, *current_unix_mode) {
+            ScalarDecision::Preserve(value) | ScalarDecision::Restore(value) => value,
+            ScalarDecision::Conflict => return mode_conflict(base, session, current),
+        };
+    let desired_windows_readonly = match invert_scalar(
+        *base_windows_readonly,
+        *session_windows_readonly,
+        *current_windows_readonly,
+    ) {
+        ScalarDecision::Preserve(value) | ScalarDecision::Restore(value) => value,
+        ScalarDecision::Conflict => return mode_conflict(base, session, current),
+    };
+    if base_object == session_object {
+        if desired_unix_mode == *current_unix_mode
+            && desired_windows_readonly == *current_windows_readonly
+        {
+            return RestoreOutcome::NoChange(NoChangeReason::AlreadyRestored);
+        }
+        return RestoreOutcome::Write(Some(ManifestEntry {
+            path: current.path.clone(),
+            node: ManifestNode::Regular {
+                object: *current_object,
+                raw_size: *current_size,
+                unix_exec_bits: desired_unix_mode,
+                windows_readonly: desired_windows_readonly,
+            },
+            safety: current.safety.clone(),
+        }));
+    }
+    if current_object == session_object {
+        return RestoreOutcome::Write(Some(ManifestEntry {
+            path: base.path.clone(),
+            node: ManifestNode::Regular {
+                object: *base_object,
+                raw_size: *base_size,
+                unix_exec_bits: desired_unix_mode,
+                windows_readonly: desired_windows_readonly,
+            },
+            safety: base.safety.clone(),
+        }));
+    }
+    conflict(
+        ConflictReason::OpaqueContentDrifted,
+        Some(base),
+        Some(session),
+        Some(current),
+    )
+}
+
+fn mode_conflict(
+    base: &ManifestEntry,
+    session: &ManifestEntry,
+    current: &ManifestEntry,
+) -> RestoreOutcome {
+    conflict(
+        ConflictReason::ModeDrifted,
+        Some(base),
+        Some(session),
+        Some(current),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,6 +357,7 @@ mod tests {
                 object: ObjectId::from_raw(bytes),
                 raw_size: u64::try_from(bytes.len()).unwrap(),
                 unix_exec_bits: Some(mode),
+                windows_readonly: None,
             },
             safety: SafetyObservations::default(),
         }
@@ -489,5 +531,60 @@ mod tests {
         };
         assert_eq!(object, ObjectId::from_raw(b"later"));
         assert_eq!(unix_exec_bits, Some(0));
+    }
+
+    #[test]
+    fn inverts_windows_readonly_without_changing_content() {
+        fn windows_path() -> NativeRelativePath {
+            NativeRelativePath::new(
+                PathEncoding::WindowsWtf16Le,
+                vec!["file".encode_utf16().flat_map(u16::to_le_bytes).collect()],
+            )
+            .unwrap()
+        }
+        fn windows_file(bytes: &[u8], readonly: bool) -> ManifestEntry {
+            ManifestEntry {
+                path: windows_path(),
+                node: ManifestNode::Regular {
+                    object: ObjectId::from_raw(bytes),
+                    raw_size: u64::try_from(bytes.len()).unwrap(),
+                    unix_exec_bits: None,
+                    windows_readonly: Some(readonly),
+                },
+                safety: SafetyObservations::default(),
+            }
+        }
+        fn windows_manifest(entry: ManifestEntry) -> Manifest {
+            Manifest::new(
+                PathEncoding::WindowsWtf16Le,
+                vec![entry],
+                Coverage {
+                    completeness: Completeness::Complete,
+                    omissions: Vec::new(),
+                },
+            )
+            .unwrap()
+        }
+
+        let plan = RestorePlan::calculate(
+            &windows_manifest(windows_file(b"same", false)),
+            &windows_manifest(windows_file(b"same", true)),
+            &windows_manifest(windows_file(b"later", true)),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let RestoreOutcome::Write(Some(entry)) = &plan.outcomes[0].outcome else {
+            panic!("expected readonly-only inverse");
+        };
+        let ManifestNode::Regular {
+            object,
+            windows_readonly,
+            ..
+        } = entry.node
+        else {
+            panic!("expected regular file");
+        };
+        assert_eq!(object, ObjectId::from_raw(b"later"));
+        assert_eq!(windows_readonly, Some(false));
     }
 }

@@ -149,14 +149,20 @@ fn classify_change(before: &ManifestNode, after: &ManifestNode) -> ChangeKind {
             ManifestNode::Regular {
                 object: before_object,
                 unix_exec_bits: before_mode,
+                windows_readonly: before_readonly,
                 ..
             },
             ManifestNode::Regular {
                 object: after_object,
                 unix_exec_bits: after_mode,
+                windows_readonly: after_readonly,
                 ..
             },
-        ) if before_object == after_object && before_mode != after_mode => ChangeKind::ModeChanged,
+        ) if before_object == after_object
+            && (before_mode != after_mode || before_readonly != after_readonly) =>
+        {
+            ChangeKind::ModeChanged
+        }
         (ManifestNode::Regular { .. }, ManifestNode::Regular { .. }) => ChangeKind::Modified,
         (ManifestNode::Symlink { .. }, ManifestNode::Symlink { .. }) => {
             ChangeKind::SymlinkTargetChanged
@@ -179,8 +185,13 @@ fn change_order(kind: ChangeKind) -> u8 {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum NodeFingerprint {
-    Regular(ObjectId, Option<u8>),
-    Symlink(NativeString, Option<u8>),
+    Regular(ObjectId, Option<u8>, Option<bool>),
+    Symlink(
+        NativeString,
+        Option<crate::WindowsSymlinkKind>,
+        Option<NativeString>,
+        Option<u32>,
+    ),
     EmptyDirectory,
 }
 
@@ -190,12 +201,20 @@ impl From<&ManifestNode> for NodeFingerprint {
             ManifestNode::Regular {
                 object,
                 unix_exec_bits,
+                windows_readonly,
                 ..
-            } => Self::Regular(*object, *unix_exec_bits),
+            } => Self::Regular(*object, *unix_exec_bits, *windows_readonly),
             ManifestNode::Symlink {
                 target,
                 windows_link_kind,
-            } => Self::Symlink(target.clone(), *windows_link_kind),
+                windows_substitute_name,
+                windows_reparse_flags,
+            } => Self::Symlink(
+                target.clone(),
+                *windows_link_kind,
+                windows_substitute_name.clone(),
+                *windows_reparse_flags,
+            ),
             ManifestNode::EmptyDirectory => Self::EmptyDirectory,
         }
     }
@@ -218,6 +237,7 @@ mod tests {
                 object: ObjectId::from_raw(bytes),
                 raw_size: u64::try_from(bytes.len()).unwrap(),
                 unix_exec_bits: Some(mode),
+                windows_readonly: None,
             },
             safety: SafetyObservations::default(),
         }

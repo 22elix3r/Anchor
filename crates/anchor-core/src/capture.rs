@@ -395,6 +395,7 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
                 object,
                 raw_size,
                 unix_exec_bits: execute_bits(metadata),
+                windows_readonly: None,
             },
             safety: SafetyObservations {
                 hardlink_group,
@@ -441,6 +442,8 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
                     node: ManifestNode::Symlink {
                         target: NativeString::from_host(target.as_os_str()),
                         windows_link_kind: None,
+                        windows_substitute_name: None,
+                        windows_reparse_flags: None,
                     },
                     safety: SafetyObservations::default(),
                 });

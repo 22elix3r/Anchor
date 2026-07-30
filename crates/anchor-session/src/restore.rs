@@ -485,7 +485,7 @@ struct MergeCandidate {
 }
 
 enum MergeResolution {
-    Clean(MergeCandidate),
+    Clean(Box<MergeCandidate>),
     Conflict(ConflictReason),
 }
 
@@ -504,17 +504,20 @@ fn merge_regular_conflict(
         ManifestNode::Regular {
             object: base_object,
             raw_size: base_size,
-            unix_exec_bits: base_mode,
+            unix_exec_bits: base_unix_mode,
+            windows_readonly: base_windows_readonly,
         },
         ManifestNode::Regular {
             object: session_object,
             raw_size: session_size,
-            unix_exec_bits: session_mode,
+            unix_exec_bits: session_unix_mode,
+            windows_readonly: session_windows_readonly,
         },
         ManifestNode::Regular {
             object: current_object,
             raw_size: current_size,
-            unix_exec_bits: current_mode,
+            unix_exec_bits: current_unix_mode,
+            windows_readonly: current_windows_readonly,
         },
     ) = (&base.node, &session.node, &current.node)
     else {
@@ -522,7 +525,16 @@ fn merge_regular_conflict(
             ConflictReason::TextMergeUnsupported,
         ));
     };
-    let Some(desired_mode) = inverse_scalar(*base_mode, *session_mode, *current_mode) else {
+    let Some(desired_unix_mode) =
+        inverse_scalar(*base_unix_mode, *session_unix_mode, *current_unix_mode)
+    else {
+        return Ok(MergeResolution::Conflict(ConflictReason::ModeDrifted));
+    };
+    let Some(desired_windows_readonly) = inverse_scalar(
+        *base_windows_readonly,
+        *session_windows_readonly,
+        *current_windows_readonly,
+    ) else {
         return Ok(MergeResolution::Conflict(ConflictReason::ModeDrifted));
     };
     let limits = TextMergeLimits::default();
@@ -534,13 +546,14 @@ fn merge_regular_conflict(
             let merged_raw_size =
                 u64::try_from(bytes.len()).map_err(|_| RestoreError::MergedFileTooLarge)?;
             let merged_object = store.objects().put_bytes(&bytes)?;
-            Ok(MergeResolution::Clean(MergeCandidate {
+            Ok(MergeResolution::Clean(Box::new(MergeCandidate {
                 desired: ManifestEntry {
                     path: current.path.clone(),
                     node: ManifestNode::Regular {
                         object: merged_object,
                         raw_size: merged_raw_size,
-                        unix_exec_bits: desired_mode,
+                        unix_exec_bits: desired_unix_mode,
+                        windows_readonly: desired_windows_readonly,
                     },
                     safety: current.safety.clone(),
                 },
@@ -548,7 +561,7 @@ fn merge_regular_conflict(
                 current_raw_size: *current_size,
                 merged_object,
                 merged_raw_size,
-            }))
+            })))
         }
         TextMergeResult::Conflict(reason) => Ok(MergeResolution::Conflict(match reason {
             TextMergeConflict::OverlappingEdits => ConflictReason::TextMergeOverlaps,
@@ -1197,6 +1210,7 @@ fn stage_node(
             object,
             raw_size,
             unix_exec_bits,
+            ..
         } => {
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
@@ -1262,6 +1276,7 @@ fn verify_node(
             object,
             raw_size,
             unix_exec_bits,
+            ..
         } => {
             if !metadata.is_file() {
                 return Ok(false);
@@ -1462,7 +1477,7 @@ enum JournalNode {
     },
     Symlink {
         target: anchor_core::NativeString,
-        windows_link_kind: Option<u8>,
+        windows_link_kind: Option<anchor_core::WindowsSymlinkKind>,
     },
     EmptyDirectory,
 }
@@ -1498,6 +1513,7 @@ impl JournalNode {
                 object,
                 raw_size,
                 unix_exec_bits,
+                ..
             } => Self::Regular {
                 object: *object,
                 raw_size: *raw_size,
@@ -1506,6 +1522,7 @@ impl JournalNode {
             ManifestNode::Symlink {
                 target,
                 windows_link_kind,
+                ..
             } => Self::Symlink {
                 target: target.clone(),
                 windows_link_kind: *windows_link_kind,
@@ -1524,6 +1541,7 @@ impl JournalNode {
                 object: *object,
                 raw_size: *raw_size,
                 unix_exec_bits: *unix_exec_bits,
+                windows_readonly: None,
             },
             Self::Symlink {
                 target,
@@ -1531,6 +1549,8 @@ impl JournalNode {
             } => ManifestNode::Symlink {
                 target: target.clone(),
                 windows_link_kind: *windows_link_kind,
+                windows_substitute_name: None,
+                windows_reparse_flags: None,
             },
             Self::EmptyDirectory => ManifestNode::EmptyDirectory,
         };
