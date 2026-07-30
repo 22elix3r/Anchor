@@ -7,7 +7,9 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 #[cfg(unix)]
-use std::io::{Cursor, Write};
+use std::io::Cursor;
+#[cfg(all(test, unix))]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -25,19 +27,15 @@ use anchor_core::{
 };
 use anchor_git::{GitContext, IndexCapture};
 #[cfg(unix)]
-use atomic_write_file::AtomicWriteFile;
-#[cfg(unix)]
 use cap_std::ambient_authority;
 #[cfg(unix)]
 use cap_std::fs::{Dir, OpenOptions};
-#[cfg(unix)]
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 #[cfg(unix)]
 use uuid::Uuid;
 
 use crate::restore_plan::{
-    PlanItem, PlanOperation, PlanPresence, PlanProof, PlanSafety, RestorePlanId, RestorePlanRecord,
+    PlanItem, PlanOperation, PlanPresence, PlanProof, RestorePlanId, RestorePlanRecord,
 };
 use crate::{SessionError, SessionId, SessionStore};
 
@@ -46,13 +44,15 @@ use crate::{SessionError, SessionId, SessionStore};
 mod windows;
 
 #[cfg(unix)]
-const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
+mod journal;
+#[cfg(all(test, unix))]
+use journal::JournalNode;
 #[cfg(unix)]
-const BATCH_JOURNAL_TAG: u64 = 0x414e_4348_4f52_424a;
-#[cfg(unix)]
-const FILE_JOURNAL_SCHEMA: u16 = 5;
-#[cfg(unix)]
-const BATCH_JOURNAL_SCHEMA: u16 = 4;
+use journal::{
+    BATCH_JOURNAL_SCHEMA, BATCH_JOURNAL_TAG, BatchItemState, BatchJournalItem, BatchJournalState,
+    BatchRestoreJournal, FILE_JOURNAL_SCHEMA, IndexRestoreJournal, JournalPresence, JournalState,
+    MAX_JOURNAL_BYTES, RestoreJournal, save_batch_journal, save_index_journal, save_journal,
+};
 
 #[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1620,257 +1620,6 @@ fn private_transaction_dir(path: &Path) -> Result<(), RestoreError> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn save_journal(path: &Path, journal: &RestoreJournal) -> Result<(), RestoreError> {
-    let mut bytes = Vec::new();
-    ciborium::ser::into_writer(journal, &mut bytes)
-        .map_err(|error| RestoreError::Journal(error.to_string()))?;
-    let mut file = AtomicWriteFile::open(path)?;
-    file.write_all(&bytes)?;
-    file.commit()?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn save_index_journal(path: &Path, journal: &IndexRestoreJournal) -> Result<(), RestoreError> {
-    let mut bytes = Vec::new();
-    ciborium::ser::into_writer(journal, &mut bytes)
-        .map_err(|error| RestoreError::Journal(error.to_string()))?;
-    let mut file = AtomicWriteFile::open(path)?;
-    file.write_all(&bytes)?;
-    file.commit()?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn save_batch_journal(path: &Path, journal: &BatchRestoreJournal) -> Result<(), RestoreError> {
-    let mut bytes = Vec::new();
-    ciborium::ser::into_writer(journal, &mut bytes)
-        .map_err(|error| RestoreError::Journal(error.to_string()))?;
-    if bytes.len() > usize::try_from(MAX_JOURNAL_BYTES).unwrap_or(usize::MAX) {
-        return Err(RestoreError::JournalTooLarge(path.to_path_buf()));
-    }
-    let mut file = AtomicWriteFile::open(path)?;
-    file.write_all(&bytes)?;
-    file.commit()?;
-    Ok(())
-}
-
-#[cfg(unix)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct RestoreJournal {
-    schema: u16,
-    session_id: SessionId,
-    #[serde(default)]
-    plan_id: Option<RestorePlanId>,
-    #[serde(default)]
-    transaction_id: Option<Uuid>,
-    path: NativeRelativePath,
-    stage_name: String,
-    #[serde(default)]
-    backup_name: Option<String>,
-    #[serde(default)]
-    worktree_root: Option<anchor_core::NativeString>,
-    #[serde(default)]
-    worktree_key: Option<String>,
-    #[serde(default)]
-    expected: Option<JournalPresence>,
-    #[serde(default)]
-    desired: Option<JournalPresence>,
-    state: JournalState,
-}
-
-#[cfg(unix)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct IndexRestoreJournal {
-    schema: u16,
-    session_id: SessionId,
-    #[serde(default)]
-    plan_id: Option<RestorePlanId>,
-    #[serde(default)]
-    transaction_id: Option<Uuid>,
-    #[serde(default)]
-    backup_name: Option<String>,
-    #[serde(default)]
-    worktree_key: Option<String>,
-    #[serde(default)]
-    index_path: Option<anchor_core::NativeString>,
-    #[serde(default)]
-    expected: Option<IndexCapture>,
-    #[serde(default)]
-    desired: Option<IndexCapture>,
-    state: JournalState,
-}
-
-#[cfg(unix)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct BatchRestoreJournal {
-    tag: u64,
-    schema: u16,
-    session_id: SessionId,
-    #[serde(default)]
-    plan_id: Option<RestorePlanId>,
-    #[serde(default)]
-    transaction_id: Option<Uuid>,
-    worktree_root: anchor_core::NativeString,
-    worktree_key: String,
-    state: BatchJournalState,
-    items: Vec<BatchJournalItem>,
-}
-
-#[cfg(unix)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct BatchJournalItem {
-    path: NativeRelativePath,
-    stage_name: String,
-    backup_name: String,
-    expected: JournalPresence,
-    desired: JournalPresence,
-    state: BatchItemState,
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum BatchJournalState {
-    Prepared,
-    Evacuating,
-    Installing,
-    Verified,
-    Cleaning,
-    CleanupComplete,
-    Complete,
-    NeedsRecovery,
-    RolledBack,
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum BatchItemState {
-    Prepared,
-    Staged,
-    Evacuated,
-    Installed,
-    Verified,
-}
-
-#[cfg(unix)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum JournalNode {
-    Regular {
-        object: ObjectId,
-        raw_size: u64,
-        unix_exec_bits: Option<u8>,
-    },
-    Symlink {
-        target: anchor_core::NativeString,
-        windows_link_kind: Option<anchor_core::WindowsSymlinkKind>,
-    },
-    EmptyDirectory,
-}
-
-#[cfg(unix)]
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum JournalPresence {
-    Absent,
-    /// Legacy representation from journal schemas through file v4 / batch v2.
-    Present(JournalNode),
-    PresentV2 {
-        node: JournalNode,
-        safety: PlanSafety,
-    },
-}
-
-#[cfg(unix)]
-impl JournalPresence {
-    fn from_entry(entry: Option<&ManifestEntry>) -> Self {
-        entry.map_or(Self::Absent, |entry| Self::PresentV2 {
-            node: JournalNode::from_entry(entry),
-            safety: PlanSafety::from_observations(&entry.safety),
-        })
-    }
-
-    fn to_entry(&self, path: &NativeRelativePath) -> Option<ManifestEntry> {
-        match self {
-            Self::Absent => None,
-            Self::Present(node) => Some(node.to_entry(path)),
-            Self::PresentV2 { node, safety } => {
-                let mut entry = node.to_entry(path);
-                entry.safety = safety.to_observations();
-                Some(entry)
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-impl JournalNode {
-    fn from_entry(entry: &ManifestEntry) -> Self {
-        match &entry.node {
-            ManifestNode::Regular {
-                object,
-                raw_size,
-                unix_exec_bits,
-                ..
-            } => Self::Regular {
-                object: *object,
-                raw_size: *raw_size,
-                unix_exec_bits: *unix_exec_bits,
-            },
-            ManifestNode::Symlink {
-                target,
-                windows_link_kind,
-                ..
-            } => Self::Symlink {
-                target: target.clone(),
-                windows_link_kind: *windows_link_kind,
-            },
-            ManifestNode::EmptyDirectory => Self::EmptyDirectory,
-        }
-    }
-
-    fn to_entry(&self, path: &NativeRelativePath) -> ManifestEntry {
-        let node = match self {
-            Self::Regular {
-                object,
-                raw_size,
-                unix_exec_bits,
-            } => ManifestNode::Regular {
-                object: *object,
-                raw_size: *raw_size,
-                unix_exec_bits: *unix_exec_bits,
-                windows_readonly: None,
-            },
-            Self::Symlink {
-                target,
-                windows_link_kind,
-            } => ManifestNode::Symlink {
-                target: target.clone(),
-                windows_link_kind: *windows_link_kind,
-                windows_substitute_name: None,
-                windows_reparse_flags: None,
-            },
-            Self::EmptyDirectory => ManifestNode::EmptyDirectory,
-        };
-        ManifestEntry {
-            path: path.clone(),
-            node,
-            safety: anchor_core::SafetyObservations::default(),
-        }
-    }
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum JournalState {
-    Prepared,
-    Evacuated,
-    Installed,
-    Verified,
-    Complete,
-    NeedsRecovery,
-    RolledBack,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
