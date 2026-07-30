@@ -55,8 +55,8 @@ changes “session-window changes,” never “changes made by the agent.”
     repeated when an untrusted recovery plan is loaded.
 14. A regular file with more than one hard link is never replaced. On Linux and
     macOS, regular files and empty directories are replaced only after Anchor
-    proves that unmodeled extended metadata is absent. Query failure is a
-    refusal, not an assumed absence.
+    proves through open-descriptor xattr and ACL queries that unmodeled extended
+    metadata is absent. Query failure is a refusal, not an assumed absence.
 
 ## Restore decisions
 

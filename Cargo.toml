@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/anchor-unix",
     "crates/anchor-windows",
     "crates/anchor-core",
     "crates/anchor-git",
@@ -19,6 +20,7 @@ homepage = "https://github.com/22elix3r/Anchor"
 authors = ["Anchor contributors"]
 
 [workspace.dependencies]
+anchor-unix = { version = "0.1.0-alpha.1", path = "crates/anchor-unix" }
 anchor-windows = { version = "0.1.0-alpha.1", path = "crates/anchor-windows" }
 anchor-core = { version = "0.1.0-alpha.1", path = "crates/anchor-core" }
 anchor-git = { version = "0.1.0-alpha.1", path = "crates/anchor-git" }
@@ -36,6 +38,7 @@ crossterm = "0.28.1"
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 gix = { version = "0.86.0", default-features = false, features = ["excludes", "index", "sha1", "sha256"] }
 imara-diff = { package = "gix-imara-diff", version = "0.2.4", features = ["unified_diff"] }
+libc = "0.2.189"
 miette = { version = "7.6.0", features = ["fancy-no-backtrace"] }
 proptest = "1.11.0"
 ratatui = { version = "0.29.0", default-features = false, features = ["crossterm"] }

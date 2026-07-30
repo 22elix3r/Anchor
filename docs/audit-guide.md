@@ -147,6 +147,11 @@ For any mutation change, require evidence for all applicable items:
 - public JSON, diagnostics and safety documentation describe refusals honestly;
 - Linux and macOS tests pass; Windows code compiles without gaining a mutation claim.
 
+The `anchor-unix` crate is the only Unix native-FFI boundary. Its macOS ACL
+query operates on the same open descriptor used for content and identity
+verification; reviewers should reject a replacement that falls back to a
+worktree path lookup.
+
 ## Reporting findings
 
 Data-loss, containment, integrity and recovery findings should follow
@@ -158,4 +163,3 @@ Data-loss, containment, integrity and recovery findings should follow
 - the minimal base/session/current node states;
 - whether a direct process crash or machine-power loss occurred;
 - names and hashes of retained stage/backup nodes, if safe to disclose.
-

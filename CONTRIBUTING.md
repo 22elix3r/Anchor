@@ -18,6 +18,9 @@ an architecture discussion.
 ## Boundaries
 
 - `anchor-core` must remain independent of the CLI, terminal UI, and Git.
+- `anchor-unix` and `anchor-windows` quarantine reviewed native FFI. Their
+  public APIs must accept already-open handles where a path lookup would create
+  a race, and every unsafe block requires a local safety argument.
 - `anchor-git` is read-only. Do not add calls that mutate refs, the index,
   configuration, worktree, or Git object storage.
 - `anchor-session` owns persistence, process execution, locking, restoration,

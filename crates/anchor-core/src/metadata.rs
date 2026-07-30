@@ -4,6 +4,7 @@ use crate::MetadataObservation;
 
 const SMALL_XATTR_LIST: usize = 1024;
 const MAX_XATTR_LIST: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_PLATFORM_LABEL: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
 const SELINUX_XATTR: &str = "security.selinux";
@@ -30,16 +31,17 @@ pub fn observe_extended_metadata(file: &impl AsFd) -> MetadataObservation {
     }
     #[cfg(target_os = "macos")]
     {
+        use std::os::fd::AsFd;
+
         let Ok(names) = list_xattrs(file) else {
             return MetadataObservation::Unavailable;
         };
         if !names.is_empty() {
             return MetadataObservation::Present;
         }
-        let mut byte = [0_u8; 1];
-        match rustix::fs::fgetxattr(file, "com.apple.system.Security", &mut byte) {
-            Ok(_) | Err(rustix::io::Errno::RANGE) => MetadataObservation::Present,
-            Err(rustix::io::Errno::NOATTR) => MetadataObservation::Absent,
+        match anchor_unix::extended_acl_present(file.as_fd()) {
+            Ok(true) => MetadataObservation::Present,
+            Ok(false) => MetadataObservation::Absent,
             Err(_) => MetadataObservation::Unavailable,
         }
     }
