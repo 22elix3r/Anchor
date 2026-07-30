@@ -27,14 +27,15 @@ The primary implementation boundaries are:
 | Boundary | Code | Reviewer question |
 |---|---|---|
 | Native paths | `fence-core/src/path.rs` | Can stored bytes escape the worktree or change encoding family? |
+| Private store | `fence-core/src/store_fs.rs`, `object.rs` | Can any store component, record publication, lock, tombstone or GC operation escape the retained directory capability? |
 | Object identity | `fence-core/src/object.rs` | Are declared length, decompression output and BLAKE3 identity all bounded and checked? |
 | Manifest schema | `fence-core/src/manifest.rs` | Can corrupt CBOR create duplicate paths, prefix collisions or invalid platform metadata? |
 | Capture | `fence-core/src/capture.rs`, `capture_windows.rs` | Is every included node opened without following an attacker-controlled link and checked for stability? |
 | Frozen scope | `fence-git/src/policy.rs` | Are identical policy bytes and boundaries used at every endpoint? |
 | Pure inverse | `fence-core/src/restore.rs`, `merge.rs` | Can a third current state ever become an overwrite or deletion? |
 | Plan binding | `fence-session/src/restore_plan.rs` | Is every journaled transformation independently derivable from retained snapshots? |
-| Mutation/recovery | `fence-session/src/restore.rs`, `restore_windows.rs` | Is every rename no-clobber, verified, and recoverable at each persisted state? |
-| Index | `fence-session/src/restore.rs` | Does index drift always refuse before replacement? |
+| Mutation/recovery | `fence-session/src/restore/mod.rs`, `restore/journal.rs`, `restore/windows.rs` | Is every rename no-clobber, verified, and recoverable at each persisted state? |
+| Index | `fence-session/src/restore/mod.rs` | Does index drift always refuse before replacement? |
 | Store maintenance | `fence-session/src/maintenance.rs` | Can corrupt reachability metadata cause collection of a retained object? |
 
 `fence-git` must remain read-only. Search for all write-capable Git APIs when
@@ -99,8 +100,19 @@ cargo test -p fence-session restore::tests:: -- --test-threads=1
 cargo test -p fence-session maintenance::
 ```
 
-The subprocess crash test deliberately invokes an ignored helper test in a
-child process and kills it externally. Do not run the helper directly.
+The subprocess crash test uses three processes: the parent creates synthetic
+expected state, a restore helper is killed externally, and an independent
+recovery helper rediscovers Git and reopens the store before recovery. Do not
+run either ignored helper directly.
+
+The isolated fuzz workspace exercises manifest/native-path/session/policy/plan/
+journal/object-envelope parsing plus pure restore-plan calculation and unified
+diff rendering:
+
+```console
+cargo check --manifest-path fuzz/Cargo.toml --bins
+cargo fuzz run journal_decode -- -max_total_time=30
+```
 
 ## Known mutation refusals
 

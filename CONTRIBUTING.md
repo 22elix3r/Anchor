@@ -41,6 +41,12 @@ commits and receive review from someone other than the author before release.
 Pure code movement must be separate from behavior changes so reviewers can
 confirm that mutation semantics did not move at the same time.
 
+Pull requests that change capture scope, stored schemas, path containment,
+restoration, journals, recovery, index handling, private-store publication, or
+garbage collection must complete the safety section of the pull-request
+template. `CODEOWNERS` review is required for these paths; authors should not
+self-approve a safety claim.
+
 Runtime code must not invoke the `git` executable or require network access.
 Tests may eventually use Git as a parity oracle but must also retain executable-
 free fixtures.

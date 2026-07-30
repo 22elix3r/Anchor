@@ -10,3 +10,8 @@ Do not include real secrets or proprietary snapshot objects in a report.
 Fence stores exact local file contents. Before sharing a reproduction, build a
 minimal synthetic repository and remove the local store under `.git/fence` from
 archives.
+
+For data-loss or recovery reports, preserve the affected store and worktree,
+stop further Fence mutation, and report the Fence version, operating system,
+filesystem, session ID, terminal journal state, and a synthetic
+`base/session/current` reproduction. Do not retry recovery on the only copy.

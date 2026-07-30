@@ -11,6 +11,10 @@ is not supported on Windows.
 
 ### Included
 
+- Public project, binary, packages, environment variables, ignore file, and
+  release artifacts renamed from Anchor to Fence.
+- Capability-rooted private-store access, an explicit Fence store marker, and
+  hard refusal when a legacy Anchor store creates migration ambiguity.
 - Raw-byte, content-addressed before and session-end worktree snapshots.
 - Complete frozen inclusion policy across session endpoints.
 - Structured session-end, current, and drift diffs.
@@ -32,5 +36,8 @@ is not supported on Windows.
   may continue to write afterward.
 - Recovery is tested for abrupt process death. Machine-power-loss durability is
   not claimed.
+- The rename is a hard pre-alpha break: no `anchor` command alias,
+  `.anchorignore` behavior, `ANCHOR_*` environment fallback, or automatic old
+  store import is provided.
 
 See `docs/safety.md` for the complete guarantee and refusal model.

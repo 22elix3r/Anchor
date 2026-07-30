@@ -162,6 +162,14 @@ and attempts the after-snapshot. Terminal-generated signals may already reach
 both processes through their shared foreground process group; signal delivery
 is therefore not an authorship or containment mechanism.
 
+The after snapshot begins when the direct child exits. Fence does not wait for
+an entire descendant process tree and offers no grace-period heuristic.
+Background descendants may therefore write after the session endpoint; those
+writes appear as later current-state drift. If such activity overlaps capture,
+the normal bounded stability checks fail visibly. The inherited lock can delay
+a later session when descendants retain it, but it is not used as an
+authorship or reliable process-lifetime oracle.
+
 When the wrapper disappears before a terminal session state is persisted, the
 record remains nonterminal. A later `fence recover` or new run first proves the
 inherited worktree lock is free, then marks such records `Abandoned` without
@@ -231,9 +239,10 @@ as untrusted:
 - restore targets are rejected if they address Git metadata, Fence storage,
   submodules, or nested repositories, even if a corrupt manifest contains such
   a path;
-- Unix store directories reject symlink/non-directory components and foreign
-  ownership, transaction directories are no-clobber, and immutable record
-  reads use `O_NOFOLLOW`;
+- production store operations retain a capability rooted at the discovered Git
+  common directory; Unix components reject symlinks, foreign ownership, and
+  weak permissions, transaction directories are no-clobber, and record reads
+  verify opened identity;
 - garbage collection aborts if retained metadata cannot be decoded and all
   reachable objects cannot be verified.
 

@@ -50,9 +50,9 @@ Fence is pre-release software. The implemented safety-first subset is:
 - refusal when current bytes, type, symlink target, mode, HEAD, or repository
   operation state is ambiguous;
 - storage integrity checking and reachability-based garbage collection.
-- experimental native Windows support with handle-relative no-follow capture,
-  protected per-user storage, kill-on-close child containment, and
-  crash-recoverable no-replace restoration.
+- experimental native Windows capture/review with handle-relative no-follow
+  traversal, protected per-user storage, and kill-on-close child containment;
+  the internal mutation backend remains publicly refused.
 
 Not yet implemented: combining index restoration into the worktree batch,
 and hunk-level restore. Those cases are refused rather than approximated.
@@ -67,6 +67,15 @@ cargo build --release -p fence-cli
 ```
 
 The runtime has no network dependency and does not require the `git` executable.
+
+The Fence rename is a deliberate pre-alpha compatibility break. The `fence`
+binary does not provide an `anchor` alias, read `ANCHOR_*` environment
+variables, interpret `.anchorignore`, auto-discover old Anchor stores, or
+migrate them. If a legacy Anchor store is present for the same repository,
+`fence doctor` reports it and mutation/session start refuses; the old data is
+left untouched. Opaque pre-alpha wire-domain strings and object magic remain
+unchanged where changing them would add no safety and would complicate
+forensics.
 
 ## Usage
 

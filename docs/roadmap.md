@@ -56,7 +56,7 @@ Acceptance:
 - property tests cover arbitrary small path-state batches;
 - no test invokes the `git` executable.
 
-Likely files: `crates/fence-session/src/restore.rs`,
+Likely files: `crates/fence-session/src/restore/mod.rs`,
 `crates/fence-session/tests/restore_faults.rs`, and a small test-only fault
 module.
 
@@ -231,7 +231,7 @@ restoration remain explicit non-goals.
 
 ## Immediate next task
 
-Refactor `fence-session/src/restore.rs` into audit-oriented internal modules
+Continue refactoring `fence-session/src/restore/mod.rs` into audit-oriented internal modules
 without changing behavior. Move public service/outcome types first, then journal
 schemas and validation, Unix mutation, batch state transitions, and recovery in
 separate commits. The existing unit, formal matrix, and subprocess-crash suites

@@ -4,6 +4,7 @@ On Unix, Fence stores data beneath the resolved Git common directory:
 
 ```text
 $GIT_COMMON_DIR/fence/users/<principal>/v1/
+├── fence-store
 ├── objects/b3/<prefix>/<suffix>.zst
 ├── manifests/b3/<prefix>/<suffix>.cbor
 ├── policies/b3/<prefix>/<suffix>.cbor
@@ -25,19 +26,22 @@ linked-worktree keys derive from volume serial plus the 128-bit filesystem file
 ID, so path spelling and repository renames do not change identity. Every
 created store directory has a protected current-user/SYSTEM DACL.
 
-On Unix every Fence-controlled directory is checked with `symlink_metadata`
-before permissions are changed or content is used. A symlink, non-directory, or
-effective-UID ownership mismatch is a hard refusal; owner-controlled weak mode
-bits are repaired to `0700` and verified. Worktree namespace keys accept only a
-bounded ASCII identifier and cannot introduce separators or traversal.
-Transaction directories are created with an exclusive single-directory create,
-so a hostile pre-existing name is never reused. Immutable object and metadata
-record reads use `O_NOFOLLOW`; session metadata reads additionally compare the
-opened inode with the final path after the bounded read.
+Production store initialization opens the resolved Git common directory once
+as a trusted boundary. Every component below it is created and opened
+separately. Unix directory opens use `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`;
+existing components must be directories owned by the effective uid with no
+group/other mode bits. Weak or foreign pre-existing components are refused,
+not repaired. The retained `cap-std` directory capability roots object,
+manifest, policy, restore-plan, session, lock, tombstone, and garbage-
+collection operations. Record reads compare the opened identity with the
+capability-relative directory entry. Transaction directories use an exclusive
+capability-relative create; journal semantics still provide the independent
+content/path validation described below.
 
-These checks harden Fence-controlled final components. They are not yet a
-claim that every ancestor of the common Git directory is capability-rooted; the
-audit roadmap retains that as a focused `cap-std`/`openat2` design spike.
+The `fence-store` file contains the exact product/layout marker
+`FENCE_STORE\n1\n`. A nonempty root without that marker, or with different
+bytes, is refused. This prevents an arbitrary development store from being
+silently claimed as Fence data.
 
 Bare repositories are refused. Non-Git directories are not supported in the
 current release.
@@ -162,6 +166,21 @@ evidence. An older binary may refuse a newer schema. Operators should retain
 the store and use a newer recovery binary rather than downgrade or manually
 delete transaction data. Immutable raw-byte object identity is not versioned by
 the enclosing manifest or session schema.
+
+### Anchor-to-Fence boundary
+
+The rename is a hard pre-alpha boundary. Fence uses a new store root and does
+not scan, import, rewrite, or garbage-collect the former
+`$GIT_COMMON_DIR/anchor/...` (or Windows Local AppData `Anchor`) root. Its
+presence is reported by `doctor` and blocks session start and restoration to
+avoid presenting two stores as one history. There is no migration command in
+the alpha.
+
+Opaque internal identifiers retain their already-reviewed bytes:
+`ANCHOBJ1`, the `anchor:*` manifest/path/restore-plan hash domains, and existing
+numeric record tags. They are wire identifiers, not user-visible product
+names. Changing them would break object/schema identity without improving
+containment. New public names and any new schema domains use Fence.
 
 ## Restore journals
 

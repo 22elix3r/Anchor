@@ -11,6 +11,8 @@ preparation notes.
   `CHANGELOG.md`.
 - [ ] The changelog describes safety boundaries, refusals, schema changes, and
   operator actions; it does not claim process authorship or Windows mutation.
+- [ ] The repository contains only SHA-pinned third-party Actions and
+  Dependabot has no ignored action-pin update.
 - [ ] New writers emit only documented schema versions. Fixtures prove that
   supported old records load into conservative in-memory states.
 - [ ] Unsupported future schemas, sessions without complete frozen policy, and
@@ -33,8 +35,8 @@ cargo deny check advisories bans licenses sources
 
 - [ ] Stable tests pass on Linux, macOS, and Windows CI.
 - [ ] MSRV Rust 1.85 passes.
-- [ ] Scheduled parser fuzz smoke is green, or both parser targets were run
-  manually for at least 30 seconds.
+- [ ] Scheduled fuzz smoke is green for every target in `fuzz/Cargo.toml`, or
+  every target was run manually for at least 30 seconds.
 - [ ] The real-process crash matrix passes on Linux and macOS.
 - [ ] The formal restoration matrix has no unclassified row.
 - [ ] No unresolved recovery journal remains after the end-to-end smoke tests.
@@ -56,6 +58,8 @@ cargo deny check advisories bans licenses sources
   experimental and Windows mutation is unsupported.
 - [ ] No crate is published to crates.io until package metadata and the
   multi-crate publication order have received a separate review.
+- [ ] The annotated tag points to a commit on protected `main`, the same commit
+  has a successful `CI` push run, and version/tag/changelog checks agree.
 
 ## Bad-release response
 
