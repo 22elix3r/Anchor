@@ -6,7 +6,8 @@ use std::str::FromStr;
 use anchor_core::{ChangeKind, ManifestDiff, NativeRelativePath, NativeString, PathEncoding};
 use anchor_git::GitContext;
 use anchor_session::{
-    RestoreApplyResult, RestoreService, RunRequest, Session, SessionId, SessionRunner, SessionStore,
+    MaintenanceService, RestoreApplyResult, RestoreService, RunRequest, Session, SessionId,
+    SessionRunner, SessionStore,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
@@ -59,6 +60,18 @@ enum Commands {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Verify retained sessions, manifests, objects, and repository drift.
+    Doctor {
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
+    },
+    /// Remove immutable data unreachable from retained sessions.
+    Gc {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -78,6 +91,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
         Commands::Run { command } => {
@@ -178,10 +192,78 @@ fn execute(cli: Cli) -> Result<i32> {
                 }
             }
         }
+        Commands::Doctor { format } => {
+            let (context, store) = current_context_and_store()?;
+            let report = MaintenanceService::doctor(&store, &context)
+                .into_diagnostic()
+                .wrap_err("integrity verification failed")?;
+            if format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "sessions": report.sessions,
+                        "incomplete_sessions": report.incomplete_sessions,
+                        "manifests_verified": report.manifests_verified,
+                        "objects_verified": report.objects_verified,
+                        "repository_drift_from_latest": report.repository_drift_from_latest,
+                        "store_private": report.store_private,
+                    }))
+                    .into_diagnostic()?
+                );
+            } else {
+                println!("sessions: {}", report.sessions);
+                println!("incomplete sessions: {}", report.incomplete_sessions);
+                println!("manifests verified: {}", report.manifests_verified);
+                println!("objects verified: {}", report.objects_verified);
+                println!(
+                    "repository drift from latest: {}",
+                    report.repository_drift_from_latest
+                );
+                println!("store private: {}", report.store_private);
+            }
+            Ok(i32::from(
+                report.incomplete_sessions > 0
+                    || report.repository_drift_from_latest
+                    || !report.store_private,
+            ))
+        }
+        Commands::Gc { dry_run, format } => {
+            let store = current_store()?;
+            let report = MaintenanceService::gc(&store, dry_run)
+                .into_diagnostic()
+                .wrap_err("garbage collection failed")?;
+            if format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "dry_run": report.dry_run,
+                        "manifests_removed": report.manifests_removed,
+                        "objects_removed": report.objects_removed,
+                        "bytes_reclaimed": report.bytes_reclaimed,
+                    }))
+                    .into_diagnostic()?
+                );
+            } else {
+                let verb = if report.dry_run {
+                    "would reclaim"
+                } else {
+                    "reclaimed"
+                };
+                println!(
+                    "{verb} {} bytes ({} manifests, {} objects)",
+                    report.bytes_reclaimed, report.manifests_removed, report.objects_removed
+                );
+            }
+            Ok(0)
+        }
     }
 }
 
 fn current_store() -> Result<SessionStore> {
+    current_context_and_store().map(|(_, store)| store)
+}
+
+fn current_context_and_store() -> Result<(GitContext, SessionStore)> {
     let current = std::env::current_dir()
         .into_diagnostic()
         .wrap_err("cannot read current directory")?;
@@ -189,9 +271,10 @@ fn current_store() -> Result<SessionStore> {
         .into_diagnostic()
         .wrap_err("cannot discover a Git worktree")?;
     let location = context.store_location();
-    SessionStore::open(location.root, location.worktree_key)
+    let store = SessionStore::open(location.root, location.worktree_key)
         .into_diagnostic()
-        .wrap_err("cannot open Anchor storage")
+        .wrap_err("cannot open Anchor storage")?;
+    Ok((context, store))
 }
 
 fn load_session(store: &SessionStore, value: &str) -> Result<Session> {

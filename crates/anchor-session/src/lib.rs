@@ -1,5 +1,6 @@
 //! Durable session lifecycle and interactive command execution.
 
+mod maintenance;
 mod restore;
 
 use std::ffi::OsString;
@@ -23,6 +24,9 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub use maintenance::{
+    DoctorReport, GarbageCollectionReport, MaintenanceError, MaintenanceService,
+};
 pub use restore::{RestoreApplyResult, RestoreError, RestoreService};
 
 const SESSION_TAG: u64 = 0x4153_4553;
@@ -380,12 +384,18 @@ impl SessionStore {
             .open(&path)?;
         fs4::FileExt::try_lock(&file)
             .map_err(|error| SessionError::ActiveSession(error.to_string()))?;
-        Ok(ActiveLock { _file: file })
+        Ok(ActiveLock { file })
     }
 }
 
 pub(crate) struct ActiveLock {
-    _file: File,
+    file: File,
+}
+
+impl Drop for ActiveLock {
+    fn drop(&mut self) {
+        let _result = fs4::FileExt::unlock(&self.file);
+    }
 }
 
 /// Execute commands while holding one worktree session lock.
