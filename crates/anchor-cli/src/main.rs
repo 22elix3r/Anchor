@@ -112,6 +112,16 @@ enum Commands {
         #[arg(long, requires_all = ["all", "yes"])]
         expect_current: Option<String>,
     },
+    /// Preview or restore all unambiguous included worktree paths for a session.
+    Rollback {
+        session: String,
+        /// Confirm the batch using the manifest ID returned by a fresh preview.
+        #[arg(long)]
+        yes: bool,
+        /// Require the current worktree to match this preview manifest.
+        #[arg(long, requires = "yes")]
+        expect_current: Option<String>,
+    },
     /// Restore exact raw index bytes if no post-session index drift exists.
     RestoreIndex {
         session: String,
@@ -444,63 +454,13 @@ fn execute(cli: Cli) -> Result<i32> {
             expect_merged,
             expect_current,
         } => {
+            if all {
+                return execute_whole_restore(&session, yes, expect_current.as_deref());
+            }
             let store = current_store()?;
             let id = SessionId::from_str(&session)
                 .into_diagnostic()
                 .wrap_err("session ID is not a UUID")?;
-            if all {
-                let mode = if yes {
-                    let expected =
-                        ManifestId::from_hex(expect_current.as_deref().ok_or_else(|| {
-                            miette::miette!(
-                                "whole restoration requires --expect-current from a fresh preview"
-                            )
-                        })?)
-                        .into_diagnostic()
-                        .wrap_err("--expect-current is not a BLAKE3 manifest ID")?;
-                    WholeRestoreMode::Apply {
-                        expected_current: expected,
-                    }
-                } else {
-                    WholeRestoreMode::Preview
-                };
-                let result = RestoreService::restore_all(&store, id, mode)
-                    .into_diagnostic()
-                    .wrap_err("whole restore was refused")?;
-                return match result {
-                    WholeRestoreResult::Preview {
-                        current_manifest,
-                        writes,
-                        no_changes,
-                    } => {
-                        println!(
-                            "whole restore preview: {writes} path(s) would change; \
-                             {no_changes} already safe/no-op"
-                        );
-                        eprintln!(
-                            "no change made; apply this exact preview with \
-                             `anchor restore {session} --all --yes --expect-current \
-                             {current_manifest}`"
-                        );
-                        Ok(3)
-                    }
-                    WholeRestoreResult::Applied { paths } => {
-                        println!("restored {paths} included path(s) as a verified batch");
-                        Ok(0)
-                    }
-                    WholeRestoreResult::Conflicts { conflicts } => {
-                        for conflict in conflicts {
-                            eprintln!(
-                                "conflict {}: {:?}",
-                                display_path(&conflict.path),
-                                conflict.reason
-                            );
-                        }
-                        eprintln!("no paths changed because the batch contains conflicts");
-                        Ok(4)
-                    }
-                };
-            }
             if !merge && !yes {
                 eprintln!(
                     "no change made; review `anchor diff {session}` and rerun this command with --yes"
@@ -568,6 +528,11 @@ fn execute(cli: Cli) -> Result<i32> {
                 report_restore_result(result)
             }
         }
+        Commands::Rollback {
+            session,
+            yes,
+            expect_current,
+        } => execute_whole_restore(&session, yes, expect_current.as_deref()),
         Commands::RestoreIndex { session, yes } => {
             if !yes {
                 miette::bail!("index restoration requires --yes");
@@ -846,6 +811,60 @@ fn print_sessions(sessions: &[Session], format: OutputFormat) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn execute_whole_restore(session: &str, yes: bool, expect_current: Option<&str>) -> Result<i32> {
+    let store = current_store()?;
+    let id = SessionId::from_str(session)
+        .into_diagnostic()
+        .wrap_err("session ID is not a UUID")?;
+    let mode = if yes {
+        let expected = ManifestId::from_hex(expect_current.ok_or_else(|| {
+            miette::miette!("whole restoration requires --expect-current from a fresh preview")
+        })?)
+        .into_diagnostic()
+        .wrap_err("--expect-current is not a BLAKE3 manifest ID")?;
+        WholeRestoreMode::Apply {
+            expected_current: expected,
+        }
+    } else {
+        WholeRestoreMode::Preview
+    };
+    match RestoreService::restore_all(&store, id, mode)
+        .into_diagnostic()
+        .wrap_err("whole restore was refused")?
+    {
+        WholeRestoreResult::Preview {
+            current_manifest,
+            writes,
+            no_changes,
+        } => {
+            println!(
+                "whole restore preview: {writes} path(s) would change; \
+                 {no_changes} already safe/no-op"
+            );
+            eprintln!(
+                "no change made; apply this exact preview with \
+                 `anchor rollback {session} --yes --expect-current {current_manifest}`"
+            );
+            Ok(3)
+        }
+        WholeRestoreResult::Applied { paths } => {
+            println!("restored {paths} included path(s) as a verified batch");
+            Ok(0)
+        }
+        WholeRestoreResult::Conflicts { conflicts } => {
+            for conflict in conflicts {
+                eprintln!(
+                    "conflict {}: {:?}",
+                    display_path(&conflict.path),
+                    conflict.reason
+                );
+            }
+            eprintln!("no paths changed because the batch contains conflicts");
+            Ok(4)
+        }
+    }
 }
 
 fn report_restore_result(result: RestoreApplyResult) -> Result<i32> {

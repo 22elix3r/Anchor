@@ -1,3 +1,5 @@
+#[cfg(all(test, unix))]
+use std::cell::Cell;
 use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::ffi::{OsStr, OsString};
@@ -35,6 +37,35 @@ use crate::{SessionError, SessionId, SessionStore};
 const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(unix)]
 const BATCH_JOURNAL_TAG: u64 = 0x414e_4348_4f52_424a;
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchFaultPoint {
+    Prepared,
+    Staged,
+    Evacuated,
+    Installed,
+    Verified,
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static BATCH_FAULT_POINT: Cell<Option<BatchFaultPoint>> = const { Cell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn inject_batch_fault(point: BatchFaultPoint) {
+    BATCH_FAULT_POINT.set(Some(point));
+}
+
+#[cfg(all(test, unix))]
+fn maybe_inject_batch_fault(point: BatchFaultPoint) -> Result<(), RestoreError> {
+    if BATCH_FAULT_POINT.get() == Some(point) {
+        BATCH_FAULT_POINT.set(None);
+        return Err(RestoreError::InjectedBatchCrash);
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RestoreApplyResult {
@@ -629,7 +660,13 @@ fn apply_batch(
             .collect(),
     };
     save_batch_journal(&journal_path, &journal)?;
+    #[cfg(test)]
+    maybe_inject_batch_fault(BatchFaultPoint::Prepared)?;
     if let Err(error) = apply_batch_inner(store, worktree, writes, &mut journal, &journal_path) {
+        #[cfg(test)]
+        if matches!(error, RestoreError::InjectedBatchCrash) {
+            return Err(error);
+        }
         if journal.state == BatchJournalState::Verified {
             // Verified is the transaction commit point. Some backups may already be gone, so
             // recovery must finish cleanup rather than attempting to reconstruct the old tree.
@@ -678,6 +715,8 @@ fn apply_batch_inner(
         journal.items[index].state = BatchItemState::Staged;
         save_batch_journal(journal_path, journal)?;
     }
+    #[cfg(test)]
+    maybe_inject_batch_fault(BatchFaultPoint::Staged)?;
 
     journal.state = BatchJournalState::Evacuating;
     save_batch_journal(journal_path, journal)?;
@@ -710,6 +749,8 @@ fn apply_batch_inner(
         journal.items[index].state = BatchItemState::Evacuated;
         save_batch_journal(journal_path, journal)?;
     }
+    #[cfg(test)]
+    maybe_inject_batch_fault(BatchFaultPoint::Evacuated)?;
 
     journal.state = BatchJournalState::Installing;
     save_batch_journal(journal_path, journal)?;
@@ -722,6 +763,8 @@ fn apply_batch_inner(
         journal.items[index].state = BatchItemState::Installed;
         save_batch_journal(journal_path, journal)?;
     }
+    #[cfg(test)]
+    maybe_inject_batch_fault(BatchFaultPoint::Installed)?;
 
     for (index, write) in writes.iter().enumerate() {
         let (parent, name) = open_batch_parent(worktree, &write.path)?;
@@ -733,6 +776,8 @@ fn apply_batch_inner(
     }
     journal.state = BatchJournalState::Verified;
     save_batch_journal(journal_path, journal)?;
+    #[cfg(test)]
+    maybe_inject_batch_fault(BatchFaultPoint::Verified)?;
     finish_batch(store, worktree, journal, journal_path)
 }
 
@@ -2054,6 +2099,9 @@ pub enum RestoreError {
     BatchRollbackFailed { apply: String, rollback: String },
     #[error("batch restore journal contains the same path more than once")]
     BatchJournalDuplicatePath,
+    #[cfg(test)]
+    #[error("injected batch crash")]
+    InjectedBatchCrash,
     #[error("restore journal encoding failed: {0}")]
     Journal(String),
     #[error("restore journal exceeds its size limit: {0}")]
@@ -2300,6 +2348,71 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(root.path().join("old")).unwrap(), b"bytes");
         assert!(!root.path().join("new").exists());
+    }
+
+    #[test]
+    fn batch_recovery_survives_every_persisted_transaction_boundary() {
+        for point in [
+            BatchFaultPoint::Prepared,
+            BatchFaultPoint::Staged,
+            BatchFaultPoint::Evacuated,
+            BatchFaultPoint::Installed,
+            BatchFaultPoint::Verified,
+        ] {
+            let root = repository();
+            fs::write(root.path().join("alpha"), b"alpha-base").unwrap();
+            fs::write(root.path().join("beta"), b"beta-base").unwrap();
+            let (store, session) = run_change(
+                root.path(),
+                "printf alpha-session > alpha; printf beta-session > beta",
+            );
+            let WholeRestoreResult::Preview {
+                current_manifest, ..
+            } = RestoreService::restore_all(&store, session, WholeRestoreMode::Preview).unwrap()
+            else {
+                panic!("expected a whole-restore preview");
+            };
+
+            inject_batch_fault(point);
+            let error = RestoreService::restore_all(
+                &store,
+                session,
+                WholeRestoreMode::Apply {
+                    expected_current: current_manifest,
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, RestoreError::InjectedBatchCrash));
+            let unresolved = scan_transactions(store.root()).unwrap();
+            assert_eq!(unresolved.total, 1);
+            assert_eq!(unresolved.complete, 0);
+            assert_eq!(unresolved.unfinished, 1);
+
+            let report = TransactionRecoveryService::recover(&store).unwrap();
+            if point == BatchFaultPoint::Verified {
+                assert_eq!(report.completed.len(), 1);
+                assert!(report.rolled_back.is_empty());
+                assert_eq!(fs::read(root.path().join("alpha")).unwrap(), b"alpha-base");
+                assert_eq!(fs::read(root.path().join("beta")).unwrap(), b"beta-base");
+            } else {
+                assert_eq!(report.rolled_back.len(), 1);
+                assert!(report.completed.is_empty());
+                assert_eq!(
+                    fs::read(root.path().join("alpha")).unwrap(),
+                    b"alpha-session"
+                );
+                assert_eq!(fs::read(root.path().join("beta")).unwrap(), b"beta-session");
+            }
+            let terminal = scan_transactions(store.root()).unwrap();
+            assert_eq!(terminal.total, terminal.complete);
+            assert!(
+                fs::read_dir(root.path()).unwrap().all(|entry| {
+                    let name = entry.unwrap().file_name();
+                    !name.to_string_lossy().starts_with(".anchor-")
+                }),
+                "recovery left a sibling temporary node after {point:?}"
+            );
+        }
     }
 
     #[test]

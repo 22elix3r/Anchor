@@ -95,6 +95,9 @@ anchor restore <session-id> --file src/main.rs --merge --yes \
 anchor restore <session-id> --all
 anchor restore <session-id> --all --yes \
   --expect-current <previewed-manifest-id>
+anchor rollback <session-id>
+anchor rollback <session-id> --yes \
+  --expect-current <previewed-manifest-id>
 anchor restore-index <session-id> --yes
 ```
 
@@ -106,7 +109,8 @@ the worktree and prints its object ID. `--merge --yes --expect-merged <id>`
 recalculates and applies only that exact result. Overlapping edits,
 binary/opaque input, and oversized text remain conflicts.
 
-`--all` first performs a nonmutating preview. It applies only when every changed
+`rollback` is the clearer alias for `restore --all`; both first perform a
+nonmutating preview. They apply only when every changed
 path is unambiguous and `--expect-current` matches a freshly recaptured whole
 worktree manifest. All outputs are staged before any target is evacuated. A
 persistent batch journal retains every backup until all targets verify. Anchor
@@ -166,6 +170,8 @@ degraded-behavior switches can be configured or overridden explicitly; see
 
 See [Safety and threat model](docs/safety.md) and
 [Storage format](docs/storage.md) before using Anchor on sensitive worktrees.
+Implemented and remaining work is tracked in the
+[implementation roadmap](docs/roadmap.md).
 
 ## Platform support
 
