@@ -29,6 +29,7 @@ blake3 = { version = "1.8.5", default-features = false, features = ["pure"] }
 cap-std = "4.0.2"
 ciborium = "0.2.2"
 clap = { version = "4.6.4", features = ["derive"] }
+command-fds = "0.3.3"
 crossterm = "0.28.1"
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 gix = { version = "0.86.0", default-features = false, features = ["excludes", "index", "sha1", "sha256"] }

@@ -392,9 +392,20 @@ pub(crate) struct ActiveLock {
     file: File,
 }
 
-impl Drop for ActiveLock {
-    fn drop(&mut self) {
-        let _result = fs4::FileExt::unlock(&self.file);
+impl ActiveLock {
+    #[cfg(unix)]
+    fn preserve_for_child(&self, command: &mut Command) -> Result<(), SessionError> {
+        use command_fds::CommandFdExt as _;
+        use std::os::fd::AsFd as _;
+
+        let descriptor = self.file.as_fd().try_clone_to_owned()?;
+        command.preserved_fds(vec![descriptor]);
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn preserve_for_child(&self, _command: &mut Command) -> Result<(), SessionError> {
+        Ok(())
     }
 }
 
@@ -424,7 +435,7 @@ impl SessionRunner {
             reject_unsupported_repository(&before_context.repository_state()?)?;
             let location = before_context.store_location();
             let store = SessionStore::open(&location.root, location.worktree_key)?;
-            let _active_lock = store.acquire_active_lock()?;
+            let active_lock = store.acquire_active_lock()?;
 
             let before = capture_live_endpoint(&before_context, &store, request.capture_options)?;
             let before_manifest = store.load_manifest(before.manifest)?;
@@ -464,7 +475,10 @@ impl SessionRunner {
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
-            let mut child = match command.spawn() {
+            active_lock.preserve_for_child(&mut command)?;
+            let spawn_result = command.spawn();
+            drop(command);
+            let mut child = match spawn_result {
                 Ok(child) => child,
                 Err(error) => {
                     session.state = SessionState::LaunchFailed;
@@ -873,5 +887,25 @@ mod tests {
         };
         store.save_session(&session).unwrap();
         assert_eq!(store.load_session(session.id).unwrap(), session);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn child_inherits_worktree_lock_after_parent_handle_closes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(root.path(), "worktree").unwrap();
+        let lock = store.acquire_active_lock().unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 0.2"]);
+        lock.preserve_for_child(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        drop(lock);
+        assert!(matches!(
+            store.acquire_active_lock(),
+            Err(SessionError::ActiveSession(_))
+        ));
+        child.wait().unwrap();
+        assert!(store.acquire_active_lock().is_ok());
     }
 }

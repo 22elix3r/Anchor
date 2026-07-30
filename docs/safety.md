@@ -77,6 +77,12 @@ is retried twice if the namespace changed. Persistent instability aborts.
 Repository state and raw index bytes are sampled around the filesystem capture;
 endpoint drift also triggers a bounded retry and then failure.
 
+On Unix the active-session lock's open file description is inherited by the
+wrapped child. If the wrapper crashes but the child keeps running, a second
+session remains blocked until the child (and any descendant that retained the
+descriptor) exits. A deliberately adversarial command can close inherited file
+descriptors; Anchor does not claim containment of the wrapped command.
+
 ## Repository drift
 
 Anchor records HEAD attachment/target, recognized operation state, object hash
