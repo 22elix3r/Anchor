@@ -217,13 +217,13 @@ impl RestoreService {
             frozen_scope,
         )?;
         let current = store.load_manifest(current_endpoint.manifest)?;
-        if let WholeRestoreMode::Apply { expected_current } = mode
-            && current_endpoint.manifest != expected_current
-        {
-            return Err(RestoreError::WholePreviewChanged {
-                expected: expected_current,
-                actual: current_endpoint.manifest,
-            });
+        if let WholeRestoreMode::Apply { expected_current } = mode {
+            if current_endpoint.manifest != expected_current {
+                return Err(RestoreError::WholePreviewChanged {
+                    expected: expected_current,
+                    actual: current_endpoint.manifest,
+                });
+            }
         }
         let plan = RestorePlan::calculate(&base, &endpoint, &current, &BTreeSet::new())?;
         let conflicts = plan
@@ -366,13 +366,13 @@ impl RestoreService {
                                     merged_raw_size: candidate.merged_raw_size,
                                 });
                             }
-                            if let TextMergeMode::Apply { expected_object } = merge_mode
-                                && candidate.merged_object != expected_object
-                            {
-                                return Err(RestoreError::MergePreviewChanged {
-                                    expected: expected_object,
-                                    actual: candidate.merged_object,
-                                });
+                            if let TextMergeMode::Apply { expected_object } = merge_mode {
+                                if candidate.merged_object != expected_object {
+                                    return Err(RestoreError::MergePreviewChanged {
+                                        expected: expected_object,
+                                        actual: candidate.merged_object,
+                                    });
+                                }
                             }
                             let current_entry = current
                                 .entries()

@@ -1435,10 +1435,9 @@ mod tests {
             }
         ));
 
-        let restore = Cli::try_parse_from([
-            "anchor", "restore", "session", "--all", "--format", "json",
-        ])
-        .unwrap();
+        let restore =
+            Cli::try_parse_from(["anchor", "restore", "session", "--all", "--format", "json"])
+                .unwrap();
         assert!(matches!(
             restore.command,
             Commands::Restore {
@@ -1454,10 +1453,8 @@ mod tests {
     fn restore_requires_exactly_one_scope() {
         assert!(Cli::try_parse_from(["anchor", "restore", "session"]).is_err());
         assert!(
-            Cli::try_parse_from([
-                "anchor", "restore", "session", "--all", "--file", "path"
-            ])
-            .is_err()
+            Cli::try_parse_from(["anchor", "restore", "session", "--all", "--file", "path"])
+                .is_err()
         );
     }
 }
