@@ -301,6 +301,7 @@ pub enum RestorePlanError {
 #[cfg(test)]
 mod tests {
     use crate::{Coverage, ObjectId, PathEncoding, SafetyObservations};
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -337,6 +338,14 @@ mod tests {
         session: Option<ManifestEntry>,
         current: Option<ManifestEntry>,
     ) -> RestoreOutcome {
+        planned_outcome(base, session, current).expect("test path must have a session delta")
+    }
+
+    fn planned_outcome(
+        base: Option<ManifestEntry>,
+        session: Option<ManifestEntry>,
+        current: Option<ManifestEntry>,
+    ) -> Option<RestoreOutcome> {
         RestorePlan::calculate(
             &manifest(base),
             &manifest(session),
@@ -347,8 +356,77 @@ mod tests {
         .outcomes
         .into_iter()
         .next()
-        .unwrap()
-        .outcome
+        .map(|path| path.outcome)
+    }
+
+    fn generated_file(value: Option<(u8, u8)>) -> Option<ManifestEntry> {
+        value.map(|(byte, mode)| file(&[byte], mode & 0b111))
+    }
+
+    proptest! {
+        #[test]
+        fn exact_session_state_always_inverts_to_base(
+            base in prop::option::of((any::<u8>(), 0_u8..8)),
+            session in prop::option::of((any::<u8>(), 0_u8..8)),
+        ) {
+            let base = generated_file(base);
+            let session = generated_file(session);
+            prop_assume!(base.is_some() || session.is_some());
+            let result = planned_outcome(base.clone(), session.clone(), session.clone());
+            if base == session {
+                prop_assert!(result.is_none());
+            } else {
+                prop_assert_eq!(result, Some(RestoreOutcome::Write(base)));
+            }
+        }
+
+        #[test]
+        fn pre_session_state_is_never_rewritten(
+            base in prop::option::of((any::<u8>(), 0_u8..8)),
+            session in prop::option::of((any::<u8>(), 0_u8..8)),
+        ) {
+            let base = generated_file(base);
+            let session = generated_file(session);
+            prop_assume!(base.is_some() || session.is_some());
+            let result = planned_outcome(base.clone(), session.clone(), base.clone());
+            if base == session {
+                prop_assert!(result.is_none());
+            } else {
+                prop_assert!(matches!(result, Some(RestoreOutcome::NoChange(_))));
+            }
+        }
+
+        #[test]
+        fn opaque_third_content_never_produces_a_content_write(
+            base_byte in any::<u8>(),
+            session_byte in any::<u8>(),
+            current_byte in any::<u8>(),
+            base_mode in 0_u8..8,
+            session_mode in 0_u8..8,
+            current_mode in 0_u8..8,
+        ) {
+            prop_assume!(current_byte != base_byte);
+            prop_assume!(current_byte != session_byte);
+            let result = planned_outcome(
+                Some(file(&[base_byte], base_mode)),
+                Some(file(&[session_byte], session_mode)),
+                Some(file(&[current_byte], current_mode)),
+            );
+            match result {
+                Some(RestoreOutcome::Write(Some(entry))) => {
+                    let ManifestNode::Regular { object, .. } = entry.node else {
+                        prop_assert!(false, "regular inputs produced a non-regular write");
+                        return Ok(());
+                    };
+                    // A safe mode-only inverse may write metadata while retaining current bytes.
+                    prop_assert_eq!(object, ObjectId::from_raw(&[current_byte]));
+                }
+                Some(RestoreOutcome::Conflict(_) | RestoreOutcome::NoChange(_)) | None => {}
+                Some(RestoreOutcome::Write(None)) => {
+                    prop_assert!(false, "third-party content was scheduled for deletion");
+                }
+            }
+        }
     }
 
     #[test]
