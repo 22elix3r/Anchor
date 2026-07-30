@@ -1,0 +1,87 @@
+#![cfg(unix)]
+
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output};
+
+#[test]
+fn capture_diff_restore_doctor_and_gc_need_no_git_executable() {
+    let root = repository();
+    fs::write(root.path().join("file"), b"base").unwrap();
+
+    let run = anchor(
+        root.path(),
+        &["run", "--", "/bin/sh", "-c", "printf session > file"],
+    );
+    assert_success("run", &run);
+    let stderr = String::from_utf8(run.stderr).unwrap();
+    let session = stderr
+        .split_whitespace()
+        .nth(2)
+        .and_then(|value| value.strip_suffix(':'))
+        .expect("run output did not contain a session ID");
+
+    let diff = anchor(root.path(), &["diff", session, "--format", "json"]);
+    assert_eq!(
+        diff.status.code(),
+        Some(1),
+        "diff returned an unexpected status\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&diff.stdout),
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    let diff_json: serde_json::Value = serde_json::from_slice(&diff.stdout).unwrap();
+    assert_eq!(diff_json["changes"][0]["status"], "modified");
+
+    let restore = anchor(
+        root.path(),
+        &[
+            "restore", session, "--file", "file", "--yes", "--format", "json",
+        ],
+    );
+    assert_success("restore", &restore);
+    assert_eq!(fs::read(root.path().join("file")).unwrap(), b"base");
+
+    let doctor = anchor(root.path(), &["doctor", "--format", "json"]);
+    assert_success("doctor", &doctor);
+    let doctor_json: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor_json["unfinished_transactions"], 0);
+
+    let gc = anchor(root.path(), &["gc", "--dry-run", "--format", "json"]);
+    assert_success("gc", &gc);
+}
+
+fn anchor(root: &Path, arguments: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_anchor"))
+        .args(arguments)
+        .current_dir(root)
+        .env("PATH", "/anchor-test-path-without-git")
+        .env(
+            "ANCHOR_CONFIG_FILE",
+            root.join("deliberately-absent-config.toml"),
+        )
+        .output()
+        .unwrap()
+}
+
+fn assert_success(operation: &str, output: &Output) {
+    assert!(
+        output.status.success(),
+        "{operation} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn repository() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    let git = root.path().join(".git");
+    fs::create_dir_all(git.join("objects")).unwrap();
+    fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+    fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::write(
+        git.join("config"),
+        b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+    )
+    .unwrap();
+    root
+}

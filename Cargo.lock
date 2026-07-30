@@ -16,7 +16,7 @@ checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
 
 [[package]]
 name = "anchor-cli"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anchor-core",
  "anchor-git",
@@ -27,11 +27,12 @@ dependencies = [
  "miette",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
 name = "anchor-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anchor-windows",
  "blake3",
@@ -49,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "anchor-git"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anchor-core",
  "anchor-windows",
@@ -64,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "anchor-session"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anchor-core",
  "anchor-git",
@@ -87,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "anchor-tui"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anchor-core",
  "crossterm",
@@ -97,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "anchor-windows"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "tempfile",
  "thiserror",

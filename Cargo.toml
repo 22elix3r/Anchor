@@ -10,7 +10,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -19,11 +19,11 @@ homepage = "https://github.com/22elix3r/Anchor"
 authors = ["Anchor contributors"]
 
 [workspace.dependencies]
-anchor-windows = { version = "0.1.0", path = "crates/anchor-windows" }
-anchor-core = { version = "0.1.0", path = "crates/anchor-core" }
-anchor-git = { version = "0.1.0", path = "crates/anchor-git" }
-anchor-session = { version = "0.1.0", path = "crates/anchor-session" }
-anchor-tui = { version = "0.1.0", path = "crates/anchor-tui" }
+anchor-windows = { version = "0.1.0-alpha.1", path = "crates/anchor-windows" }
+anchor-core = { version = "0.1.0-alpha.1", path = "crates/anchor-core" }
+anchor-git = { version = "0.1.0-alpha.1", path = "crates/anchor-git" }
+anchor-session = { version = "0.1.0-alpha.1", path = "crates/anchor-session" }
+anchor-tui = { version = "0.1.0-alpha.1", path = "crates/anchor-tui" }
 
 base64 = "0.23.0"
 atomic-write-file = "0.3.0"

@@ -188,6 +188,26 @@ Independent reviewers can start with the
 [audit guide](docs/audit-guide.md). Implemented and remaining work is tracked
 in the [implementation roadmap](docs/roadmap.md).
 
+Tagged Unix alpha releases provide `.tar.gz` archives for Linux x86-64 and
+macOS x86-64/arm64. Verify the adjacent SHA-256 file before installing:
+
+```console
+sha256sum --check anchor-0.1.0-alpha.1-<target>.tar.gz.sha256
+tar -xzf anchor-0.1.0-alpha.1-<target>.tar.gz
+install anchor-0.1.0-alpha.1-<target>/anchor ~/.local/bin/anchor
+```
+
+On macOS, use `shasum -a 256 -c` in place of `sha256sum --check`. GitHub build
+provenance can additionally be checked with:
+
+```console
+gh attestation verify anchor-0.1.0-alpha.1-<target>.tar.gz \
+  -R 22elix3r/Anchor
+```
+
+Release owners follow the [Unix alpha release
+checklist](docs/release-checklist.md).
+
 ## Platform support
 
 | Platform | Capture/review | Filesystem restore |

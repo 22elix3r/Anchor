@@ -154,6 +154,15 @@ Schema migrations are append-only: readers dispatch on the record tag and
 version, validate the old DTO, and convert it into current in-memory types.
 Writers emit only the newest schema. Unsupported future schemas are refused.
 
+During the `0.1.0-alpha.N` line, compatibility is subordinate to restoration
+safety. A newer reader may classify an old record as review-only when the old
+schema lacks evidence required for mutation. It must still report a bounded,
+valid old record and its refusal reason; it must not strengthen missing
+evidence. An older binary may refuse a newer schema. Operators should retain
+the store and use a newer recovery binary rather than downgrade or manually
+delete transaction data. Immutable raw-byte object identity is not versioned by
+the enclosing manifest or session schema.
+
 ## Restore journals
 
 Restore transaction directories contain an atomically replaced `journal.cbor`.
