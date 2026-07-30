@@ -192,9 +192,9 @@ impl RootHandle {
 /// A pinned ordinary directory used as a no-follow namespace boundary.
 #[derive(Debug)]
 pub struct DirectoryHandle {
-    handle: OwnedHandle,
-    path: VerbatimPath,
-    metadata: NodeMetadata,
+    pub(crate) handle: OwnedHandle,
+    pub(crate) path: VerbatimPath,
+    pub(crate) metadata: NodeMetadata,
 }
 
 impl DirectoryHandle {
@@ -248,6 +248,20 @@ impl DirectoryHandle {
             path,
             metadata,
         })
+    }
+
+    /// Open an exact currently enumerated child without following a reparse point.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IdentityChanged` when the name is absent or changes before it is opened.
+    pub fn open_named_child(&self, name: &OsStr) -> Result<NodeHandle, WindowsError> {
+        let entry = self
+            .entries()?
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .ok_or(WindowsError::IdentityChanged)?;
+        self.open_child(&entry)
     }
 }
 
@@ -392,7 +406,7 @@ pub(crate) fn open_raw(
     Ok(unsafe { OwnedHandle::from_raw_handle(handle.cast()) })
 }
 
-fn raw_handle(handle: &OwnedHandle) -> HANDLE {
+pub(crate) fn raw_handle(handle: &OwnedHandle) -> HANDLE {
     handle.as_raw_handle().cast()
 }
 
@@ -427,6 +441,10 @@ fn final_path(handle_value: &OwnedHandle) -> Result<VerbatimPath, WindowsError> 
     }
     buffer.truncate(usize::try_from(written).expect("validated above"));
     VerbatimPath::from_final_units(buffer).map_err(WindowsError::from)
+}
+
+pub(crate) fn final_path_for_mutation(handle: &OwnedHandle) -> Result<VerbatimPath, WindowsError> {
+    final_path(handle)
 }
 
 fn metadata(handle: &OwnedHandle) -> Result<NodeMetadata, WindowsError> {

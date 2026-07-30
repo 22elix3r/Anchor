@@ -33,6 +33,10 @@ use uuid::Uuid;
 
 use crate::{SessionError, SessionId, SessionStore};
 
+#[cfg(windows)]
+#[path = "restore_windows.rs"]
+mod windows;
+
 #[cfg(unix)]
 const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(unix)]
@@ -633,11 +637,10 @@ fn node_kind(node: &ManifestNode) -> ObservedKind {
 }
 
 #[derive(Clone)]
-#[cfg_attr(windows, allow(dead_code))]
 struct BatchWrite {
-    path: NativeRelativePath,
-    expected: Option<ManifestEntry>,
-    desired: Option<ManifestEntry>,
+    pub(super) path: NativeRelativePath,
+    pub(super) expected: Option<ManifestEntry>,
+    pub(super) desired: Option<ManifestEntry>,
 }
 
 #[cfg(unix)]
@@ -707,12 +710,12 @@ fn apply_batch(
 
 #[cfg(not(unix))]
 fn apply_batch(
-    _store: &SessionStore,
-    _session_id: SessionId,
-    _worktree: &Path,
-    _writes: &[BatchWrite],
+    store: &SessionStore,
+    session_id: SessionId,
+    worktree: &Path,
+    writes: &[BatchWrite],
 ) -> Result<(), RestoreError> {
-    Err(RestoreError::PlatformMutationUnsupported)
+    windows::apply_batch(store, session_id, worktree, writes)
 }
 
 #[cfg(unix)]
@@ -1132,13 +1135,13 @@ fn apply_index(
 
 #[cfg(not(unix))]
 fn apply_index(
-    _store: &SessionStore,
-    _session_id: SessionId,
-    _index_path: &Path,
-    _expected: &IndexCapture,
-    _desired: &IndexCapture,
+    store: &SessionStore,
+    session_id: SessionId,
+    index_path: &Path,
+    expected: &IndexCapture,
+    desired: &IndexCapture,
 ) -> Result<(), RestoreError> {
-    Err(RestoreError::PlatformMutationUnsupported)
+    windows::apply_index(store, session_id, index_path, expected, desired)
 }
 
 #[cfg(unix)]
@@ -1173,14 +1176,14 @@ fn verify_index(
 
 #[cfg(not(unix))]
 fn apply_one(
-    _store: &SessionStore,
-    _session_id: SessionId,
-    _worktree: &Path,
-    _path: &NativeRelativePath,
-    _expected: Option<&ManifestEntry>,
-    _desired: Option<&ManifestEntry>,
+    store: &SessionStore,
+    session_id: SessionId,
+    worktree: &Path,
+    path: &NativeRelativePath,
+    expected: Option<&ManifestEntry>,
+    desired: Option<&ManifestEntry>,
 ) -> Result<(), RestoreError> {
-    Err(RestoreError::PlatformMutationUnsupported)
+    windows::apply_one(store, session_id, worktree, path, expected, desired)
 }
 
 #[cfg(unix)]
@@ -1788,8 +1791,8 @@ fn recover_batch_journal(
 }
 
 #[cfg(not(unix))]
-fn recover_transactions(_store: &SessionStore) -> Result<TransactionRecoveryReport, RestoreError> {
-    Err(RestoreError::PlatformMutationUnsupported)
+fn recover_transactions(store: &SessionStore) -> Result<TransactionRecoveryReport, RestoreError> {
+    windows::recover_transactions(store)
 }
 
 #[cfg(unix)]
@@ -2072,9 +2075,8 @@ fn validate_journal_temp_name(value: &str, prefix: &str) -> Result<OsString, Res
 }
 
 #[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn scan_transactions(_root: &Path) -> Result<TransactionSummary, RestoreError> {
-    Ok(TransactionSummary::default())
+pub(crate) fn scan_transactions(root: &Path) -> Result<TransactionSummary, RestoreError> {
+    windows::scan_transactions(root)
 }
 
 pub(crate) fn ensure_no_unresolved_transactions(root: &Path) -> Result<(), RestoreError> {
@@ -2175,6 +2177,9 @@ pub enum RestoreError {
     },
     #[error("automatic filesystem mutation is not yet supported on this platform")]
     PlatformMutationUnsupported,
+    #[cfg(windows)]
+    #[error(transparent)]
+    Windows(#[from] anchor_windows::WindowsError),
     #[error(transparent)]
     Session(#[from] SessionError),
     #[error(transparent)]
@@ -2185,6 +2190,8 @@ pub enum RestoreError {
     Plan(#[from] anchor_core::RestorePlanError),
     #[error(transparent)]
     Path(#[from] anchor_core::PlatformMismatch),
+    #[error(transparent)]
+    UnsafePath(#[from] anchor_core::PathError),
     #[error(transparent)]
     Store(#[from] anchor_core::StoreError),
     #[error(transparent)]
@@ -2912,6 +2919,131 @@ mod tests {
                 unfinished: 1
             }
         ));
+    }
+
+    fn empty_v2_index() -> Vec<u8> {
+        let mut bytes = b"DIRC\0\0\0\x02\0\0\0\0".to_vec();
+        bytes.extend_from_slice(&[
+            0x39, 0xd8, 0x90, 0x13, 0x9e, 0xe5, 0x35, 0x6c, 0x7e, 0xf5, 0x72, 0x21, 0x6c, 0xeb,
+            0xcd, 0x27, 0xaa, 0x41, 0xf9, 0xdf,
+        ]);
+        bytes
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::ffi::OsString;
+    use std::fs;
+
+    use anchor_core::NativeRelativePath;
+
+    use super::*;
+    use crate::{CapturePolicy, RunRequest, SessionRunner};
+
+    fn repository() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let git = root.path().join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+        fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git.join("config"),
+            b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+        root
+    }
+
+    fn session_store(root: &Path) -> (SessionStore, PathBuf) {
+        let context = GitContext::discover(root).unwrap();
+        let location = context.store_location();
+        (
+            SessionStore::open(&location.root, location.worktree_key).unwrap(),
+            location.root,
+        )
+    }
+
+    #[test]
+    fn restores_exact_session_bytes_through_native_transaction() {
+        let root = repository();
+        fs::write(root.path().join("file.txt"), b"before").unwrap();
+        let result = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: vec![
+                OsString::from("cmd.exe"),
+                OsString::from("/C"),
+                OsString::from("> file.txt (echo session)"),
+            ],
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap();
+        let (store, store_root) = session_store(root.path());
+        let path = NativeRelativePath::from_host_path(Path::new("file.txt")).unwrap();
+        assert!(matches!(
+            RestoreService::restore_file(&store, result.session_id, path),
+            Ok(RestoreApplyResult::Applied { .. })
+        ));
+        assert_eq!(fs::read(root.path().join("file.txt")).unwrap(), b"before");
+        drop(store);
+        fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_overwrite_post_session_windows_bytes() {
+        let root = repository();
+        fs::write(root.path().join("file.txt"), b"before").unwrap();
+        let result = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: vec![
+                OsString::from("cmd.exe"),
+                OsString::from("/C"),
+                OsString::from("> file.txt (echo session)"),
+            ],
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap();
+        fs::write(root.path().join("file.txt"), b"post-session").unwrap();
+        let (store, store_root) = session_store(root.path());
+        let path = NativeRelativePath::from_host_path(Path::new("file.txt")).unwrap();
+        assert!(matches!(
+            RestoreService::restore_file(&store, result.session_id, path),
+            Ok(RestoreApplyResult::Conflict { .. })
+        ));
+        assert_eq!(
+            fs::read(root.path().join("file.txt")).unwrap(),
+            b"post-session"
+        );
+        drop(store);
+        fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
+    fn restores_raw_windows_index_only_after_exact_endpoint_match() {
+        let root = repository();
+        let index = empty_v2_index();
+        fs::write(root.path().join(".git").join("index"), &index).unwrap();
+        let result = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: vec![
+                OsString::from("cmd.exe"),
+                OsString::from("/C"),
+                OsString::from("del /Q .git\\index"),
+            ],
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap();
+        let (store, store_root) = session_store(root.path());
+        assert_eq!(
+            RestoreService::restore_index(&store, result.session_id).unwrap(),
+            IndexRestoreResult::Applied
+        );
+        assert_eq!(
+            fs::read(root.path().join(".git").join("index")).unwrap(),
+            index
+        );
+        drop(store);
+        fs::remove_dir_all(store_root).unwrap();
     }
 
     fn empty_v2_index() -> Vec<u8> {

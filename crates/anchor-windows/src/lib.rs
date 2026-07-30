@@ -6,6 +6,7 @@
 #![cfg(windows)]
 
 mod filesystem;
+mod mutation;
 mod path;
 mod system;
 
@@ -13,6 +14,7 @@ pub use filesystem::{
     DirectoryEntry, DirectoryHandle, FileIdentity, NodeHandle, NodeKind, NodeMetadata, ReparseKind,
     RootHandle, StreamInfo, SymbolicLinkData,
 };
+pub use mutation::MutationRoot;
 pub use path::{VerbatimPath, VerbatimPathError};
 pub use system::{KillOnCloseJob, harden_private_directory, local_app_data};
 
@@ -45,6 +47,12 @@ pub enum WindowsError {
     /// A Windows API returned a failing HRESULT/NT-style status.
     #[error("{operation} failed with status 0x{status:08x}")]
     NativeStatus {
+        operation: &'static str,
+        status: i32,
+    },
+    /// An ntdll handle-relative operation returned a failing NTSTATUS.
+    #[error("{operation} failed with NTSTATUS 0x{status:08x}")]
+    NtStatus {
         operation: &'static str,
         status: i32,
     },
