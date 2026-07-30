@@ -78,6 +78,11 @@ discovery, then rolls an interrupted file or index operation back to its
 pre-restore state. Live, staged, or backup byte drift is a hard conflict.
 Incomplete schema-v1/v2 journals are reported but not guessed at.
 
+Deleting a session is recoverable until explicit purge. Tombstoned sessions
+remain garbage-collection roots, so `anchor delete` cannot silently make their
+objects collectible. `anchor purge --yes` removes the recovery record and is
+the deliberate retention boundary.
+
 ## Capture consistency
 
 Anchor does not claim a globally atomic filesystem snapshot. For each regular

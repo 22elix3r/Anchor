@@ -63,6 +63,11 @@ enum Commands {
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
     },
+    /// List recoverably deleted sessions for this worktree.
+    DeletedSessions {
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
+    },
     /// Show one session's metadata.
     Show {
         session: String,
@@ -125,6 +130,20 @@ enum Commands {
         yes: bool,
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
+    },
+    /// Move a terminal session into recoverable local tombstone storage.
+    Delete {
+        session: String,
+        #[arg(long, required = true)]
+        yes: bool,
+    },
+    /// Restore a recoverably deleted session.
+    Undelete { session: String },
+    /// Permanently delete a tombstoned session record.
+    Purge {
+        session: String,
+        #[arg(long, required = true)]
+        yes: bool,
     },
 }
 
@@ -222,6 +241,19 @@ fn execute(cli: Cli) -> Result<i32> {
                 .list_sessions()
                 .into_diagnostic()
                 .wrap_err("cannot list sessions")?;
+            print_sessions(&sessions, format)?;
+            Ok(0)
+        }
+        Commands::DeletedSessions { format } => {
+            let store = current_store()?;
+            let _lease = store
+                .acquire_store_read_lease()
+                .into_diagnostic()
+                .wrap_err("Anchor storage is busy")?;
+            let sessions = store
+                .list_deleted_sessions()
+                .into_diagnostic()
+                .wrap_err("cannot list deleted sessions")?;
             print_sessions(&sessions, format)?;
             Ok(0)
         }
@@ -472,6 +504,7 @@ fn execute(cli: Cli) -> Result<i32> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "sessions": report.sessions,
+                        "deleted_sessions": report.deleted_sessions,
                         "incomplete_sessions": report.incomplete_sessions,
                         "manifests_verified": report.manifests_verified,
                         "objects_verified": report.objects_verified,
@@ -485,6 +518,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 );
             } else {
                 println!("sessions: {}", report.sessions);
+                println!("deleted sessions: {}", report.deleted_sessions);
                 println!("incomplete sessions: {}", report.incomplete_sessions);
                 println!("manifests verified: {}", report.manifests_verified);
                 println!("objects verified: {}", report.objects_verified);
@@ -596,6 +630,50 @@ fn execute(cli: Cli) -> Result<i32> {
                     );
                 }
             }
+            Ok(0)
+        }
+        Commands::Delete { session, yes } => {
+            if !yes {
+                miette::bail!("session deletion requires --yes");
+            }
+            let store = current_store()?;
+            let id = SessionId::from_str(&session)
+                .into_diagnostic()
+                .wrap_err("session ID is not a UUID")?;
+            store
+                .delete_session(id)
+                .into_diagnostic()
+                .wrap_err("cannot delete session")?;
+            println!("deleted {id} recoverably; use `anchor undelete {id}` to restore it");
+            Ok(0)
+        }
+        Commands::Undelete { session } => {
+            let store = current_store()?;
+            let id = SessionId::from_str(&session)
+                .into_diagnostic()
+                .wrap_err("session ID is not a UUID")?;
+            store
+                .undelete_session(id)
+                .into_diagnostic()
+                .wrap_err("cannot undelete session")?;
+            println!("restored session {id}");
+            Ok(0)
+        }
+        Commands::Purge { session, yes } => {
+            if !yes {
+                miette::bail!("permanent session purge requires --yes");
+            }
+            let store = current_store()?;
+            let id = SessionId::from_str(&session)
+                .into_diagnostic()
+                .wrap_err("session ID is not a UUID")?;
+            store
+                .purge_deleted_session(id)
+                .into_diagnostic()
+                .wrap_err("cannot purge deleted session")?;
+            println!(
+                "permanently removed session record {id}; unreachable data is reclaimed by `anchor gc`"
+            );
             Ok(0)
         }
     }

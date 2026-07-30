@@ -7,6 +7,7 @@ $GIT_COMMON_DIR/anchor/users/<principal>/v1/
 ├── objects/b3/<prefix>/<suffix>.zst
 ├── manifests/b3/<prefix>/<suffix>.cbor
 ├── sessions/<worktree-key>/<session-id>.cbor
+├── deleted-sessions/<worktree-key>/<session-id>.cbor
 ├── locks/<worktree-key>.active.lock
 ├── locks/store.activity.lock
 └── transactions/<transaction-id>/
@@ -103,3 +104,14 @@ worktree with `gix`, verifies that the common-store identity and index path
 match, then validates live/staged/backup bytes before a no-replace rollback.
 Legacy incomplete journals do not contain enough information for this and are
 refused.
+
+## Session retention
+
+`anchor delete` moves a terminal session record into `deleted-sessions` using a
+no-clobber same-filesystem hard link followed by source removal. A crash can
+leave duplicate links but cannot leave no record. Tombstoned sessions remain GC
+roots and can be restored with `anchor undelete`.
+
+`anchor purge --yes` permanently removes a tombstoned record. It does not
+directly delete immutable data; the next GC verifies all remaining active and
+tombstoned sessions before reclaiming anything newly unreachable.

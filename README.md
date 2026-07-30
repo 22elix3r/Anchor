@@ -100,6 +100,9 @@ anchor gc --dry-run
 anchor gc
 anchor recover
 anchor recover-transactions --yes
+anchor delete <session-id> --yes
+anchor deleted-sessions
+anchor undelete <session-id>
 ```
 
 `anchor diff` returns `1` when differences exist. Restore conflicts return `4`.
@@ -113,6 +116,11 @@ acquire the worktree lock, it marks stale nonterminal records `Abandoned`.
 `anchor recover-transactions --yes` is separate: it byte-verifies and rolls
 back interrupted schema-v3 restore transactions. Legacy incomplete journals
 remain visible but require manual recovery because they lack sufficient state.
+
+Session deletion is recoverable by default. Tombstoned sessions continue to
+protect their manifests and objects from garbage collection. `anchor purge
+<id> --yes` permanently removes only the tombstoned record; a later `anchor gc`
+can then reclaim newly unreachable immutable data.
 
 ## Inclusion and limits
 

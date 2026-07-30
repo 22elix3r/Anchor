@@ -242,6 +242,7 @@ impl SessionStore {
         let objects = ObjectStore::open(&root)?;
         private_directory(&root.join("manifests").join("b3"))?;
         private_directory(&root.join("sessions").join(&worktree_key))?;
+        private_directory(&root.join("deleted-sessions").join(&worktree_key))?;
         private_directory(&root.join("locks"))?;
         Ok(Self {
             root,
@@ -357,6 +358,60 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    /// List recoverably deleted sessions in this worktree namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] if any tombstoned record is corrupt.
+    pub fn list_deleted_sessions(&self) -> Result<Vec<Session>, SessionError> {
+        let directory = self.root.join("deleted-sessions").join(&self.worktree_key);
+        let mut sessions = Self::list_sessions_in(&directory, &self.worktree_key)?;
+        sessions.sort_by_key(|session| session.started_at.seconds);
+        sessions.reverse();
+        Ok(sessions)
+    }
+
+    /// Move a terminal session into the recoverable tombstone namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] for active sessions, existing tombstones, locks, or I/O failure.
+    pub fn delete_session(&self, id: SessionId) -> Result<(), SessionError> {
+        let _lease = self.acquire_store_read_lease()?;
+        let _active = self.acquire_active_lock()?;
+        let session = self.load_session(id)?;
+        if !session.state.is_terminal() {
+            return Err(SessionError::NonterminalDeletion);
+        }
+        move_session_noclobber(&self.session_path(id), &self.deleted_session_path(id))
+    }
+
+    /// Restore a recoverably deleted session to the active namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] for missing tombstones, namespace collisions, locks, or I/O
+    /// failure.
+    pub fn undelete_session(&self, id: SessionId) -> Result<(), SessionError> {
+        let _lease = self.acquire_store_read_lease()?;
+        let _active = self.acquire_active_lock()?;
+        move_session_noclobber(&self.deleted_session_path(id), &self.session_path(id))
+    }
+
+    /// Permanently remove a tombstoned session record.
+    ///
+    /// Immutable manifests and objects remain until a later garbage collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] for lock or I/O failure.
+    pub fn purge_deleted_session(&self, id: SessionId) -> Result<(), SessionError> {
+        let _lease = self.acquire_store_read_lease()?;
+        let _active = self.acquire_active_lock()?;
+        fs::remove_file(self.deleted_session_path(id))?;
+        Ok(())
+    }
+
     /// Hold a shared lease while reading or publishing data in the common store.
     ///
     /// Garbage collection takes the exclusive side of this lease, so callers that perform a
@@ -372,19 +427,23 @@ impl SessionStore {
         Ok(StoreLease { file })
     }
 
-    pub(crate) fn list_all_sessions(&self) -> Result<Vec<Session>, SessionError> {
-        let root = self.root.join("sessions");
+    pub(crate) fn list_all_retained_sessions(&self) -> Result<Vec<Session>, SessionError> {
         let mut sessions = Vec::new();
-        for namespace in fs::read_dir(root)? {
-            let namespace = namespace?;
-            if !namespace.file_type()?.is_dir() {
-                continue;
+        for root in [
+            self.root.join("sessions"),
+            self.root.join("deleted-sessions"),
+        ] {
+            for namespace in fs::read_dir(root)? {
+                let namespace = namespace?;
+                if !namespace.file_type()?.is_dir() {
+                    continue;
+                }
+                let key = namespace
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| SessionError::InvalidWorktreeNamespace)?;
+                sessions.extend(Self::list_sessions_in(&namespace.path(), &key)?);
             }
-            let key = namespace
-                .file_name()
-                .into_string()
-                .map_err(|_| SessionError::InvalidWorktreeNamespace)?;
-            sessions.extend(Self::list_sessions_in(&namespace.path(), &key)?);
         }
         Ok(sessions)
     }
@@ -425,6 +484,13 @@ impl SessionStore {
     fn session_path(&self, id: SessionId) -> PathBuf {
         self.root
             .join("sessions")
+            .join(&self.worktree_key)
+            .join(format!("{id}.cbor"))
+    }
+
+    fn deleted_session_path(&self, id: SessionId) -> PathBuf {
+        self.root
+            .join("deleted-sessions")
             .join(&self.worktree_key)
             .join(format!("{id}.cbor"))
     }
@@ -571,6 +637,10 @@ impl ActiveLock {
     fn retain_for_spawned_child(&mut self) {
         self.unlock_on_drop = false;
     }
+
+    fn child_has_exited(&mut self) {
+        self.unlock_on_drop = true;
+    }
 }
 
 impl Drop for ActiveLock {
@@ -699,6 +769,7 @@ impl SessionRunner {
                     Err(error) => return Err(SessionError::ChildWait(error)),
                 }
             };
+            active_lock.child_has_exited();
             signal_forwarder.clear_child();
             let exit = ExitRecord::from_status(status);
             session.exit = Some(exit);
@@ -932,6 +1003,24 @@ fn private_directory(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
+fn move_session_noclobber(source: &Path, destination: &Path) -> Result<(), SessionError> {
+    fs::hard_link(source, destination)?;
+    if let Err(error) = fs::remove_file(source) {
+        let _rollback = fs::remove_file(destination);
+        return Err(error.into());
+    }
+    #[cfg(unix)]
+    {
+        if let Some(parent) = source.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        if let Some(parent) = destination.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 struct SessionWireV1(
     u64,
@@ -1129,6 +1218,8 @@ pub enum SessionError {
     InvalidWorktreeNamespace,
     #[error("session belongs to a different worktree namespace")]
     WrongWorktreeNamespace,
+    #[error("nonterminal sessions cannot be deleted")]
+    NonterminalDeletion,
     #[error("session record exceeds its encoded size limit")]
     SessionTooLarge,
     #[error("session or manifest changed while it was read: {0}")]
@@ -1409,5 +1500,38 @@ mod tests {
         let drift = anchor_core::ManifestDiff::between(&after, &current.manifest);
         assert_eq!(drift.changes.len(), 1);
         assert_eq!(drift.changes[0].kind, anchor_core::ChangeKind::Modified);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn deleted_sessions_remain_recoverable() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"before").unwrap();
+        let result = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from("printf after > file"),
+            ],
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let session = store.load_session(result.session_id).unwrap();
+        let before = session.before.manifest;
+
+        store.delete_session(session.id).unwrap();
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert_eq!(store.list_deleted_sessions().unwrap().len(), 1);
+        let gc = MaintenanceService::gc(&store, false).unwrap();
+        assert_eq!(gc.manifests_removed, 0);
+        assert!(store.load_manifest(before).is_ok());
+
+        store.undelete_session(session.id).unwrap();
+        assert_eq!(store.load_session(session.id).unwrap(), session);
+        assert!(store.list_deleted_sessions().unwrap().is_empty());
     }
 }

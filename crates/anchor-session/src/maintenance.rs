@@ -12,6 +12,7 @@ use crate::{SessionError, SessionState, SessionStore};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoctorReport {
     pub sessions: u64,
+    pub deleted_sessions: u64,
     pub incomplete_sessions: u64,
     pub manifests_verified: u64,
     pub objects_verified: u64,
@@ -45,7 +46,8 @@ impl MaintenanceService {
     ) -> Result<DoctorReport, MaintenanceError> {
         let _lease = store.acquire_store_read_lease()?;
         let current_sessions = store.list_sessions()?;
-        let sessions = store.list_all_sessions()?;
+        let deleted_sessions = store.list_deleted_sessions()?;
+        let sessions = store.list_all_retained_sessions()?;
         let transactions = scan_transactions(store.root())?;
         let mut manifests = BTreeSet::new();
         let mut objects = BTreeSet::new();
@@ -80,6 +82,7 @@ impl MaintenanceService {
         });
         Ok(DoctorReport {
             sessions: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
+            deleted_sessions: u64::try_from(deleted_sessions.len()).unwrap_or(u64::MAX),
             incomplete_sessions: incomplete,
             manifests_verified: u64::try_from(manifests.len()).unwrap_or(u64::MAX),
             objects_verified: u64::try_from(objects.len()).unwrap_or(u64::MAX),
@@ -110,7 +113,7 @@ impl MaintenanceService {
                 unfinished: transactions.unfinished,
             });
         }
-        let sessions = store.list_all_sessions()?;
+        let sessions = store.list_all_retained_sessions()?;
         let mut reachable_manifests = BTreeSet::new();
         let mut reachable_objects = BTreeSet::new();
         for session in &sessions {
