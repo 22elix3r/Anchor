@@ -58,7 +58,7 @@ impl MutationRoot {
             FILE_FLAG_BACKUP_SEMANTICS,
         )?;
         let final_path = crate::filesystem::final_path_for_mutation(&followed)?;
-        drop(followed);
+        let followed_metadata = metadata_for_system(&followed)?;
         let handle = open_raw(
             &final_path,
             MUTATION_DIRECTORY_ACCESS,
@@ -68,6 +68,9 @@ impl MutationRoot {
         let metadata = metadata_for_system(&handle)?;
         if metadata.kind != NodeKind::Directory {
             return Err(WindowsError::NotDirectory);
+        }
+        if metadata.identity != followed_metadata.identity {
+            return Err(WindowsError::IdentityChanged);
         }
         Ok(Self {
             directory: DirectoryHandle {

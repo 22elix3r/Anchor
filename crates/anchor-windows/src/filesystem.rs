@@ -161,7 +161,7 @@ impl RootHandle {
             FILE_FLAG_BACKUP_SEMANTICS,
         )?;
         let final_path = final_path(&followed)?;
-        drop(followed);
+        let followed_metadata = metadata(&followed)?;
         let handle = open_raw(
             &final_path,
             FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
@@ -171,6 +171,9 @@ impl RootHandle {
         let metadata = metadata(&handle)?;
         if metadata.kind != NodeKind::Directory {
             return Err(WindowsError::NotDirectory);
+        }
+        if metadata.identity != followed_metadata.identity {
+            return Err(WindowsError::IdentityChanged);
         }
         Ok(Self {
             directory: DirectoryHandle {
