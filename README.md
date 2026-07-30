@@ -98,6 +98,8 @@ anchor restore <session-id> --all --yes \
 anchor rollback <session-id>
 anchor rollback <session-id> --yes \
   --expect-current <previewed-manifest-id>
+anchor rollback <session-id> --format json
+anchor restore <session-id> --file src/main.rs --yes --format json
 anchor restore-index <session-id> --yes
 ```
 

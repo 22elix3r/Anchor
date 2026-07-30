@@ -42,9 +42,13 @@ const BATCH_JOURNAL_TAG: u64 = 0x414e_4348_4f52_424a;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BatchFaultPoint {
     Prepared,
+    FirstStaged,
     Staged,
+    FirstEvacuated,
     Evacuated,
+    FirstInstalled,
     Installed,
+    FirstVerified,
     Verified,
 }
 
@@ -714,6 +718,10 @@ fn apply_batch_inner(
         }
         journal.items[index].state = BatchItemState::Staged;
         save_batch_journal(journal_path, journal)?;
+        #[cfg(test)]
+        if index == 0 {
+            maybe_inject_batch_fault(BatchFaultPoint::FirstStaged)?;
+        }
     }
     #[cfg(test)]
     maybe_inject_batch_fault(BatchFaultPoint::Staged)?;
@@ -748,6 +756,10 @@ fn apply_batch_inner(
         }
         journal.items[index].state = BatchItemState::Evacuated;
         save_batch_journal(journal_path, journal)?;
+        #[cfg(test)]
+        if index == 0 {
+            maybe_inject_batch_fault(BatchFaultPoint::FirstEvacuated)?;
+        }
     }
     #[cfg(test)]
     maybe_inject_batch_fault(BatchFaultPoint::Evacuated)?;
@@ -762,6 +774,10 @@ fn apply_batch_inner(
         }
         journal.items[index].state = BatchItemState::Installed;
         save_batch_journal(journal_path, journal)?;
+        #[cfg(test)]
+        if index == 0 {
+            maybe_inject_batch_fault(BatchFaultPoint::FirstInstalled)?;
+        }
     }
     #[cfg(test)]
     maybe_inject_batch_fault(BatchFaultPoint::Installed)?;
@@ -773,6 +789,10 @@ fn apply_batch_inner(
         }
         journal.items[index].state = BatchItemState::Verified;
         save_batch_journal(journal_path, journal)?;
+        #[cfg(test)]
+        if index == 0 {
+            maybe_inject_batch_fault(BatchFaultPoint::FirstVerified)?;
+        }
     }
     journal.state = BatchJournalState::Verified;
     save_batch_journal(journal_path, journal)?;
@@ -2354,9 +2374,13 @@ mod tests {
     fn batch_recovery_survives_every_persisted_transaction_boundary() {
         for point in [
             BatchFaultPoint::Prepared,
+            BatchFaultPoint::FirstStaged,
             BatchFaultPoint::Staged,
+            BatchFaultPoint::FirstEvacuated,
             BatchFaultPoint::Evacuated,
+            BatchFaultPoint::FirstInstalled,
             BatchFaultPoint::Installed,
+            BatchFaultPoint::FirstVerified,
             BatchFaultPoint::Verified,
         ] {
             let root = repository();
@@ -2413,6 +2437,89 @@ mod tests {
                 "recovery left a sibling temporary node after {point:?}"
             );
         }
+    }
+
+    #[test]
+    fn batch_recovery_refuses_a_duplicate_path_in_an_untrusted_journal() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"base").unwrap();
+        let (store, session_id) = run_change(root.path(), "printf session > file");
+        let session = store.load_session(session_id).unwrap();
+        let base = store.load_manifest(session.before.manifest).unwrap();
+        let after = store
+            .load_manifest(session.after.as_ref().unwrap().manifest)
+            .unwrap();
+        let desired = JournalPresence::from_entry(base.entries().first());
+        let expected = JournalPresence::from_entry(after.entries().first());
+        let transaction_id = Uuid::now_v7();
+        let transaction_path = store
+            .root()
+            .join("transactions")
+            .join(format!("batch-{transaction_id}"));
+        private_transaction_dir(&transaction_path).unwrap();
+        let item = |suffix: usize| BatchJournalItem {
+            path: selected(b"file"),
+            stage_name: format!(".anchor-stage-{transaction_id}-{suffix}"),
+            backup_name: format!(".anchor-backup-{transaction_id}-{suffix}"),
+            expected: expected.clone(),
+            desired: desired.clone(),
+            state: BatchItemState::Prepared,
+        };
+        save_batch_journal(
+            &transaction_path.join("journal.cbor"),
+            &BatchRestoreJournal {
+                tag: BATCH_JOURNAL_TAG,
+                schema: 1,
+                session_id,
+                worktree_root: anchor_core::NativeString::from_host(root.path().as_os_str()),
+                worktree_key: store.worktree_key.clone(),
+                state: BatchJournalState::Prepared,
+                items: vec![item(0), item(1)],
+            },
+        )
+        .unwrap();
+
+        let error = TransactionRecoveryService::recover(&store).unwrap_err();
+        assert!(matches!(error, RestoreError::BatchJournalDuplicatePath));
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"session");
+        let unresolved = scan_transactions(store.root()).unwrap();
+        assert_eq!(unresolved.unfinished, 1);
+    }
+
+    #[test]
+    fn batch_recovery_preserves_a_concurrent_creator() {
+        let root = repository();
+        fs::write(root.path().join("alpha"), b"alpha-base").unwrap();
+        fs::write(root.path().join("beta"), b"beta-base").unwrap();
+        let (store, session) = run_change(
+            root.path(),
+            "printf alpha-session > alpha; printf beta-session > beta",
+        );
+        let WholeRestoreResult::Preview {
+            current_manifest, ..
+        } = RestoreService::restore_all(&store, session, WholeRestoreMode::Preview).unwrap()
+        else {
+            panic!("expected a whole-restore preview");
+        };
+        inject_batch_fault(BatchFaultPoint::FirstEvacuated);
+        let error = RestoreService::restore_all(
+            &store,
+            session,
+            WholeRestoreMode::Apply {
+                expected_current: current_manifest,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, RestoreError::InjectedBatchCrash));
+        assert!(!root.path().join("alpha").exists());
+        fs::write(root.path().join("alpha"), b"concurrent").unwrap();
+
+        let error = TransactionRecoveryService::recover(&store).unwrap_err();
+        assert!(matches!(error, RestoreError::RecoveryCurrentChanged));
+        assert_eq!(fs::read(root.path().join("alpha")).unwrap(), b"concurrent");
+        assert_eq!(fs::read(root.path().join("beta")).unwrap(), b"beta-session");
+        let unresolved = scan_transactions(store.root()).unwrap();
+        assert_eq!(unresolved.unfinished, 1);
     }
 
     #[test]

@@ -111,6 +111,8 @@ enum Commands {
         /// Require the current worktree to match this whole-restore preview manifest.
         #[arg(long, requires_all = ["all", "yes"])]
         expect_current: Option<String>,
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
     },
     /// Preview or restore all unambiguous included worktree paths for a session.
     Rollback {
@@ -121,12 +123,16 @@ enum Commands {
         /// Require the current worktree to match this preview manifest.
         #[arg(long, requires = "yes")]
         expect_current: Option<String>,
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
     },
     /// Restore exact raw index bytes if no post-session index drift exists.
     RestoreIndex {
         session: String,
         #[arg(long, required = true)]
         yes: bool,
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
     },
     /// Verify retained sessions, manifests, objects, and repository drift.
     Doctor {
@@ -443,7 +449,7 @@ fn execute(cli: Cli) -> Result<i32> {
             let result = RestoreService::restore_file(&store, session.id, change.path.clone())
                 .into_diagnostic()
                 .wrap_err("restore was refused")?;
-            report_restore_result(result)
+            report_restore_result(result, OutputFormat::Human)
         }
         Commands::Restore {
             session,
@@ -453,18 +459,28 @@ fn execute(cli: Cli) -> Result<i32> {
             yes,
             expect_merged,
             expect_current,
+            format,
         } => {
             if all {
-                return execute_whole_restore(&session, yes, expect_current.as_deref());
+                return execute_whole_restore(&session, yes, expect_current.as_deref(), format);
             }
             let store = current_store()?;
             let id = SessionId::from_str(&session)
                 .into_diagnostic()
                 .wrap_err("session ID is not a UUID")?;
             if !merge && !yes {
-                eprintln!(
-                    "no change made; review `anchor diff {session}` and rerun this command with --yes"
-                );
+                if format == OutputFormat::Json {
+                    print_json(&serde_json::json!({
+                        "schema": 1,
+                        "operation": "restore-file",
+                        "status": "confirmation-required",
+                        "session": session,
+                    }))?;
+                } else {
+                    eprintln!(
+                        "no change made; review `anchor diff {session}` and rerun this command with --yes"
+                    );
+                }
                 return Ok(3);
             }
             if merge && yes && expect_merged.is_none() {
@@ -504,6 +520,19 @@ fn execute(cli: Cli) -> Result<i32> {
                 ..
             } = result
             {
+                if format == OutputFormat::Json {
+                    print_json(&serde_json::json!({
+                        "schema": 1,
+                        "operation": "restore-file",
+                        "status": "merge-preview",
+                        "path": PathJson::from(&path),
+                        "current_object": current_object.to_string(),
+                        "current_raw_size": current_raw_size,
+                        "merged_object": merged_object.to_string(),
+                        "merged_raw_size": merged_raw_size,
+                    }))?;
+                    return Ok(3);
+                }
                 let current = store
                     .objects()
                     .get(current_object, current_raw_size)
@@ -525,15 +554,20 @@ fn execute(cli: Cli) -> Result<i32> {
                 );
                 Ok(3)
             } else {
-                report_restore_result(result)
+                report_restore_result(result, format)
             }
         }
         Commands::Rollback {
             session,
             yes,
             expect_current,
-        } => execute_whole_restore(&session, yes, expect_current.as_deref()),
-        Commands::RestoreIndex { session, yes } => {
+            format,
+        } => execute_whole_restore(&session, yes, expect_current.as_deref(), format),
+        Commands::RestoreIndex {
+            session,
+            yes,
+            format,
+        } => {
             if !yes {
                 miette::bail!("index restoration requires --yes");
             }
@@ -546,15 +580,19 @@ fn execute(cli: Cli) -> Result<i32> {
                 .wrap_err("index restore was refused")?
             {
                 IndexRestoreResult::Applied => {
-                    println!("restored exact pre-session index bytes");
+                    report_index_restore("applied", format)?;
                     Ok(0)
                 }
                 IndexRestoreResult::NoChange => {
-                    println!("index already matches the safe target");
+                    report_index_restore("no-change", format)?;
                     Ok(0)
                 }
                 IndexRestoreResult::Conflict => {
-                    eprintln!("index conflict: post-session index drift was preserved");
+                    if format == OutputFormat::Json {
+                        report_index_restore("conflict", format)?;
+                    } else {
+                        eprintln!("index conflict: post-session index drift was preserved");
+                    }
                     Ok(4)
                 }
             }
@@ -813,7 +851,12 @@ fn print_sessions(sessions: &[Session], format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn execute_whole_restore(session: &str, yes: bool, expect_current: Option<&str>) -> Result<i32> {
+fn execute_whole_restore(
+    session: &str,
+    yes: bool,
+    expect_current: Option<&str>,
+    format: OutputFormat,
+) -> Result<i32> {
     let store = current_store()?;
     let id = SessionId::from_str(session)
         .into_diagnostic()
@@ -839,52 +882,152 @@ fn execute_whole_restore(session: &str, yes: bool, expect_current: Option<&str>)
             writes,
             no_changes,
         } => {
-            println!(
-                "whole restore preview: {writes} path(s) would change; \
-                 {no_changes} already safe/no-op"
-            );
-            eprintln!(
-                "no change made; apply this exact preview with \
-                 `anchor rollback {session} --yes --expect-current {current_manifest}`"
-            );
+            if format == OutputFormat::Json {
+                print_json(&serde_json::json!({
+                    "schema": 1,
+                    "operation": "rollback",
+                    "status": "preview",
+                    "session": session,
+                    "current_manifest": current_manifest.to_string(),
+                    "writes": writes,
+                    "no_changes": no_changes,
+                }))?;
+            } else {
+                println!(
+                    "whole restore preview: {writes} path(s) would change; \
+                     {no_changes} already safe/no-op"
+                );
+                eprintln!(
+                    "no change made; apply this exact preview with \
+                     `anchor rollback {session} --yes --expect-current {current_manifest}`"
+                );
+            }
             Ok(3)
         }
         WholeRestoreResult::Applied { paths } => {
-            println!("restored {paths} included path(s) as a verified batch");
+            if format == OutputFormat::Json {
+                print_json(&serde_json::json!({
+                    "schema": 1,
+                    "operation": "rollback",
+                    "status": "applied",
+                    "session": session,
+                    "paths": paths,
+                }))?;
+            } else {
+                println!("restored {paths} included path(s) as a verified batch");
+            }
             Ok(0)
         }
         WholeRestoreResult::Conflicts { conflicts } => {
-            for conflict in conflicts {
-                eprintln!(
-                    "conflict {}: {:?}",
-                    display_path(&conflict.path),
-                    conflict.reason
-                );
+            if format == OutputFormat::Json {
+                let conflicts = conflicts
+                    .iter()
+                    .map(|conflict| {
+                        serde_json::json!({
+                            "path": PathJson::from(&conflict.path),
+                            "reason": format!("{:?}", conflict.reason),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                print_json(&serde_json::json!({
+                    "schema": 1,
+                    "operation": "rollback",
+                    "status": "conflict",
+                    "session": session,
+                    "conflicts": conflicts,
+                }))?;
+            } else {
+                for conflict in conflicts {
+                    eprintln!(
+                        "conflict {}: {:?}",
+                        display_path(&conflict.path),
+                        conflict.reason
+                    );
+                }
+                eprintln!("no paths changed because the batch contains conflicts");
             }
-            eprintln!("no paths changed because the batch contains conflicts");
             Ok(4)
         }
     }
 }
 
-fn report_restore_result(result: RestoreApplyResult) -> Result<i32> {
+fn report_restore_result(result: RestoreApplyResult, format: OutputFormat) -> Result<i32> {
     match result {
-        RestoreApplyResult::Applied { path, .. } => {
-            println!("restored {}", display_path(&path));
+        RestoreApplyResult::Applied {
+            session_id,
+            path,
+            merged,
+        } => {
+            if format == OutputFormat::Json {
+                print_json(&serde_json::json!({
+                    "schema": 1,
+                    "operation": "restore-file",
+                    "status": "applied",
+                    "session": session_id.to_string(),
+                    "path": PathJson::from(&path),
+                    "merged": merged,
+                }))?;
+            } else {
+                println!("restored {}", display_path(&path));
+            }
             Ok(0)
         }
         RestoreApplyResult::NoChange { reason } => {
-            println!("no change: {reason:?}");
+            if format == OutputFormat::Json {
+                print_json(&serde_json::json!({
+                    "schema": 1,
+                    "operation": "restore-file",
+                    "status": "no-change",
+                    "reason": format!("{reason:?}"),
+                }))?;
+            } else {
+                println!("no change: {reason:?}");
+            }
             Ok(0)
         }
         RestoreApplyResult::Conflict { reason } => {
-            eprintln!("conflict: {reason:?}; no filesystem change was made");
+            if format == OutputFormat::Json {
+                print_json(&serde_json::json!({
+                    "schema": 1,
+                    "operation": "restore-file",
+                    "status": "conflict",
+                    "reason": format!("{reason:?}"),
+                }))?;
+            } else {
+                eprintln!("conflict: {reason:?}; no filesystem change was made");
+            }
             Ok(4)
         }
         RestoreApplyResult::TextMergeAvailable { .. } => {
             miette::bail!("internal error: merge preview was not rendered")
         }
     }
+}
+
+fn report_index_restore(status: &'static str, format: OutputFormat) -> Result<()> {
+    if format == OutputFormat::Json {
+        return print_json(&serde_json::json!({
+            "schema": 1,
+            "operation": "restore-index",
+            "status": status,
+        }));
+    }
+    match status {
+        "applied" => println!("restored exact pre-session index bytes"),
+        "no-change" => println!("index already matches the safe target"),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value)
+            .into_diagnostic()
+            .wrap_err("cannot encode JSON output")?
+    );
+    Ok(())
 }
 
 fn print_diff(
@@ -1273,4 +1416,48 @@ fn hex(bytes: &[u8]) -> String {
             output
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_and_restore_all_accept_machine_readable_preview() {
+        let rollback =
+            Cli::try_parse_from(["anchor", "rollback", "session", "--format", "json"]).unwrap();
+        assert!(matches!(
+            rollback.command,
+            Commands::Rollback {
+                format: OutputFormat::Json,
+                yes: false,
+                ..
+            }
+        ));
+
+        let restore = Cli::try_parse_from([
+            "anchor", "restore", "session", "--all", "--format", "json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            restore.command,
+            Commands::Restore {
+                all: true,
+                file: None,
+                format: OutputFormat::Json,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn restore_requires_exactly_one_scope() {
+        assert!(Cli::try_parse_from(["anchor", "restore", "session"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "anchor", "restore", "session", "--all", "--file", "path"
+            ])
+            .is_err()
+        );
+    }
 }
