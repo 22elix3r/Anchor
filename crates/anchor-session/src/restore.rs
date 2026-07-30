@@ -16,13 +16,13 @@ use std::path::{Path, PathBuf};
 use anchor_core::ObjectStore;
 use anchor_core::{
     CaptureEngine, ConflictReason, Manifest, ManifestEntry, ManifestId, ManifestNode,
-    MetadataObservation, NativeRelativePath, NoChangeReason, ObjectId, ObservedKind,
-    RestoreConflict, RestoreOutcome, RestorePlan, ScopeClassifier, ScopeDecision, ScopeError,
-    TextMergeConflict, TextMergeLimits, TextMergeResult, inverse_three_way_text_merge,
+    NativeRelativePath, NoChangeReason, ObjectId, ObservedKind, RestoreConflict, RestoreOutcome,
+    RestorePlan, ScopeClassifier, ScopeDecision, ScopeError, TextMergeConflict, TextMergeLimits,
+    TextMergeResult, inverse_three_way_text_merge,
 };
 #[cfg(unix)]
 use anchor_core::{
-    observe_directory_extended_metadata, observe_extended_metadata,
+    MetadataObservation, observe_directory_extended_metadata, observe_extended_metadata,
     platform_managed_directory_metadata_equal, platform_managed_metadata_equal,
 };
 use anchor_git::{GitContext, IndexCapture};

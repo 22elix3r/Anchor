@@ -1,5 +1,7 @@
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 
@@ -618,11 +620,14 @@ fn hex_nibble(value: u8) -> Result<u8, SessionError> {
     }
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn sync_parent(path: &std::path::Path) -> Result<(), SessionError> {
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
