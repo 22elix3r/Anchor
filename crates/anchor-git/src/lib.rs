@@ -10,6 +10,7 @@ use anchor_core::{
     Manifest, ManifestNode, NativeRelativePath, NativeString, ObjectId, ObjectStore, ObservedKind,
     OmissionReason, ScopeClassifier, ScopeDecision, ScopeError, StoreError,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const MAX_INDEX_BYTES: u64 = 512 * 1024 * 1024;
@@ -559,13 +560,20 @@ impl ScopeClassifier for FrozenGitScope {
     }
 }
 
+impl FrozenGitScope {
+    /// Add paths tracked at a later endpoint without changing the frozen ignore policy.
+    pub fn include_tracked(&mut self, paths: impl IntoIterator<Item = NativeRelativePath>) {
+        self.tracked.extend(paths);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreLocation {
     pub root: PathBuf,
     pub worktree_key: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct RepositoryState {
     pub head: HeadState,
@@ -577,14 +585,14 @@ pub struct RepositoryState {
     pub split_index: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum HeadState {
     Unborn { referent: Vec<u8> },
     Attached { referent: Vec<u8>, target: String },
     Detached { target: String },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum OperationState {
     None,
     ApplyMailbox,
@@ -599,7 +607,7 @@ pub enum OperationState {
     RevertSequence,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IndexCapture {
     Absent,
     Present {
@@ -609,7 +617,7 @@ pub enum IndexCapture {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct IndexSummary {
     pub version: u32,

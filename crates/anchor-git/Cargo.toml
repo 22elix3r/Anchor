@@ -13,6 +13,7 @@ authors.workspace = true
 anchor-core.workspace = true
 blake3.workspace = true
 gix.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]

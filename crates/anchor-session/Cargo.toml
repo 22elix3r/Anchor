@@ -12,8 +12,15 @@ authors.workspace = true
 [dependencies]
 anchor-core.workspace = true
 anchor-git.workspace = true
+atomic-write-file.workspace = true
+ciborium.workspace = true
+fs4.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+signal-hook.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true
-

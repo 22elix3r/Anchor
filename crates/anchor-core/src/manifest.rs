@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::Cursor;
 
 use serde::{Deserialize, Serialize};
@@ -16,8 +17,45 @@ pub struct ManifestId([u8; 32]);
 
 impl ManifestId {
     #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+impl fmt::Display for ManifestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for ManifestId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ManifestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = ByteBuf::deserialize(deserializer)?;
+        let bytes: [u8; 32] = bytes
+            .as_ref()
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("manifest ID must contain exactly 32 bytes"))?;
+        Ok(Self(bytes))
     }
 }
 
