@@ -13,13 +13,14 @@ use cap_std::fs::{Dir, OpenOptions};
 #[cfg(unix)]
 use fence_core::ObjectStore;
 use fence_core::{
-    CaptureEngine, ConflictReason, ManifestEntry, ManifestId, ManifestNode, NativeRelativePath,
-    ObjectId, RestoreOutcome, RestorePlan,
+    CaptureEngine, ConflictReason, ManifestEntry, ManifestId, NativeRelativePath, ObjectId,
+    RestoreOutcome, RestorePlan,
 };
 #[cfg(unix)]
 use fence_core::{
-    MetadataObservation, observe_directory_extended_metadata, observe_extended_metadata,
-    platform_managed_directory_metadata_equal, platform_managed_metadata_equal,
+    ManifestNode, MetadataObservation, observe_directory_extended_metadata,
+    observe_extended_metadata, platform_managed_directory_metadata_equal,
+    platform_managed_metadata_equal,
 };
 use fence_git::{GitContext, IndexCapture};
 use thiserror::Error;

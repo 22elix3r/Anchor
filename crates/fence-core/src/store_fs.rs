@@ -324,6 +324,12 @@ pub struct StoreTempFile {
 }
 
 impl StoreTempFile {
+    /// Return the private temporary entry name relative to its retained directory.
+    #[must_use]
+    pub fn name(&self) -> &OsStr {
+        OsStr::new(&self.name)
+    }
+
     /// Borrow the still-live temporary file.
     ///
     /// # Panics
@@ -514,6 +520,7 @@ fn validate_owner(metadata: &cap_std::fs::Metadata, path: &Path) -> Result<(), S
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn validate_owner(_metadata: &cap_std::fs::Metadata, _path: &Path) -> Result<(), StoreFsError> {
     Ok(())
 }
@@ -532,6 +539,7 @@ fn validate_private_permissions(
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn validate_private_permissions(
     _metadata: &cap_std::fs::Metadata,
     _path: &Path,
@@ -592,11 +600,10 @@ pub enum StoreFsError {
     Io(#[from] io::Error),
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn refuses_an_intermediate_symlink_below_the_trusted_parent() {
         let trusted = tempfile::tempdir().unwrap();
@@ -607,7 +614,6 @@ mod tests {
         assert!(!outside.path().join("users").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn refuses_weak_existing_store_permissions() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -623,7 +629,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn refuses_a_symlinked_lock_record() {
         let trusted = tempfile::tempdir().unwrap();

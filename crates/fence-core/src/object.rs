@@ -350,10 +350,23 @@ fn ensure_store_marker(filesystem: &StoreFs) -> Result<(), StoreError> {
         Err(StoreFsError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    if filesystem.open_dir("")?.entries()?.next().is_some() {
+    // Keep a private temporary entry live while checking for pre-existing content. On Windows,
+    // enumerating an already-open empty directory can be denied by the standard library after its
+    // DACL is hardened; the live entry also makes the store-claim decision crash-conservative.
+    let mut temporary = filesystem.temporary_file("")?;
+    let mut entries = filesystem.open_dir("")?.entries()?;
+    let mut saw_temporary = false;
+    for entry in &mut entries {
+        let entry = entry?;
+        if entry.file_name() == temporary.name() && !saw_temporary {
+            saw_temporary = true;
+        } else {
+            return Err(StoreError::UnrecognizedStore);
+        }
+    }
+    if !saw_temporary {
         return Err(StoreError::UnrecognizedStore);
     }
-    let mut temporary = filesystem.temporary_file("")?;
     temporary.write_all(STORE_MARKER_BYTES)?;
     match temporary.persist_noclobber(STORE_MARKER_NAME) {
         Ok(()) => Ok(()),
@@ -587,6 +600,7 @@ mod tests {
             ObjectStore::open(root.path()),
             Err(StoreError::UnrecognizedStore)
         ));
+        assert!(!root.path().join(STORE_MARKER_NAME).exists());
     }
 
     #[test]
