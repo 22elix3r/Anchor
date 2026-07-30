@@ -3642,7 +3642,7 @@ mod windows_tests {
     }
 
     #[test]
-    fn restores_exact_session_bytes_through_native_transaction() {
+    fn refuses_windows_mutation_without_extended_metadata_proof() {
         let root = repository();
         fs::write(root.path().join("file.txt"), b"before").unwrap();
         let result = SessionRunner::run(&RunRequest {
@@ -3657,12 +3657,21 @@ mod windows_tests {
         .unwrap();
         let (store, store_root) = session_store(root.path());
         let path = NativeRelativePath::from_host_path(Path::new("file.txt")).unwrap();
+        let session_bytes = fs::read(root.path().join("file.txt")).unwrap();
         let restored = RestoreService::restore_file(&store, result.session_id, path);
         assert!(
-            matches!(restored, Ok(RestoreApplyResult::Applied { .. })),
+            matches!(
+                restored,
+                Ok(RestoreApplyResult::Conflict {
+                    reason: ConflictReason::MetadataObservationUnavailable
+                })
+            ),
             "{restored:?}"
         );
-        assert_eq!(fs::read(root.path().join("file.txt")).unwrap(), b"before");
+        assert_eq!(
+            fs::read(root.path().join("file.txt")).unwrap(),
+            session_bytes
+        );
         drop(store);
         fs::remove_dir_all(store_root).unwrap();
     }
