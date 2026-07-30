@@ -280,9 +280,9 @@ fn user_config_path() -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
-        return std::env::var_os("APPDATA")
+        std::env::var_os("APPDATA")
             .map(PathBuf::from)
-            .map(|root| root.join("Anchor").join("config.toml"));
+            .map(|root| root.join("Anchor").join("config.toml"))
     }
     #[cfg(not(windows))]
     {

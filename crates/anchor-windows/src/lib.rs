@@ -7,12 +7,14 @@
 
 mod filesystem;
 mod path;
+mod system;
 
 pub use filesystem::{
     DirectoryEntry, DirectoryHandle, FileIdentity, NodeHandle, NodeKind, NodeMetadata, ReparseKind,
     RootHandle, StreamInfo, SymbolicLinkData,
 };
 pub use path::{VerbatimPath, VerbatimPathError};
+pub use system::{KillOnCloseJob, harden_private_directory, local_app_data};
 
 use std::io;
 
@@ -40,9 +42,18 @@ pub enum WindowsError {
     /// A bounded native query exceeded Anchor's safety limit.
     #[error("{0} exceeds Anchor's bounded query limit")]
     TooLarge(&'static str),
+    /// A Windows API returned a failing HRESULT/NT-style status.
+    #[error("{operation} failed with status 0x{status:08x}")]
+    NativeStatus {
+        operation: &'static str,
+        status: i32,
+    },
     /// An operation requires an ordinary directory.
     #[error("the opened node is not an ordinary directory")]
     NotDirectory,
+    /// A supposedly private storage directory is a reparse point.
+    #[error("private storage directory is a reparse point or is not a directory")]
+    PrivateDirectoryReparse,
 }
 
 fn io_error(operation: &'static str) -> WindowsError {

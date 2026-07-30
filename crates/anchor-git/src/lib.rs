@@ -6,8 +6,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(windows))]
+use anchor_core::NativeString;
 use anchor_core::{
-    Manifest, ManifestNode, NativeRelativePath, NativeString, ObjectId, ObjectStore, ObservedKind,
+    Manifest, ManifestNode, NativeRelativePath, ObjectId, ObjectStore, ObservedKind,
     OmissionReason, ScopeClassifier, ScopeDecision, ScopeError, StoreError,
 };
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,7 @@ pub struct GitContext {
     git_dir: PathBuf,
     common_dir: PathBuf,
     index_path: PathBuf,
+    store_location: StoreLocation,
     tracked: BTreeSet<NativeRelativePath>,
     submodules: BTreeSet<NativeRelativePath>,
 }
@@ -62,6 +65,7 @@ impl GitContext {
         let git_dir = repository.git_dir().to_path_buf();
         let common_dir = repository.common_dir().to_path_buf();
         let index_path = repository.index_path();
+        let store_location = default_store_location(&git_dir, &common_dir)?;
 
         let index = repository
             .index_or_empty()
@@ -82,6 +86,7 @@ impl GitContext {
             git_dir,
             common_dir,
             index_path,
+            store_location,
             tracked,
             submodules,
         })
@@ -115,19 +120,7 @@ impl GitContext {
     /// Construct the default per-user shared store location and per-worktree namespace.
     #[must_use]
     pub fn store_location(&self) -> StoreLocation {
-        let root = self
-            .common_dir
-            .join("anchor")
-            .join("users")
-            .join(principal_key())
-            .join("v1");
-        let worktree_key = if self.git_dir == self.common_dir {
-            "main".to_owned()
-        } else {
-            let native = NativeString::from_host(self.git_dir.as_os_str());
-            format!("wt-{}", short_hash(native.bytes()))
-        };
-        StoreLocation { root, worktree_key }
+        self.store_location.clone()
     }
 
     /// Build a live Git-compatible inclusion classifier.
@@ -742,11 +735,48 @@ fn principal_key() -> String {
     format!("u{}", rustix::process::geteuid().as_raw())
 }
 
-#[cfg(not(unix))]
-fn principal_key() -> String {
-    let principal = std::env::var_os("USERNAME").unwrap_or_else(|| "unknown".into());
-    let native = NativeString::from_host(principal.as_os_str());
-    format!("p-{}", short_hash(native.bytes()))
+#[cfg(not(windows))]
+#[allow(clippy::unnecessary_wraps)]
+fn default_store_location(git_dir: &Path, common_dir: &Path) -> Result<StoreLocation, GitError> {
+    let root = common_dir
+        .join("anchor")
+        .join("users")
+        .join(principal_key())
+        .join("v1");
+    let worktree_key = if git_dir == common_dir {
+        "main".to_owned()
+    } else {
+        let native = NativeString::from_host(git_dir.as_os_str());
+        format!("wt-{}", short_hash(native.bytes()))
+    };
+    Ok(StoreLocation { root, worktree_key })
+}
+
+#[cfg(windows)]
+fn default_store_location(git_dir: &Path, common_dir: &Path) -> Result<StoreLocation, GitError> {
+    let common_identity = anchor_windows::RootHandle::open(common_dir)?
+        .directory()
+        .metadata()
+        .identity;
+    let mut repository_identity = common_identity.volume_serial.to_le_bytes().to_vec();
+    repository_identity.extend_from_slice(&common_identity.file_id);
+    let root = anchor_windows::local_app_data()?
+        .join("Anchor")
+        .join("stores")
+        .join("v1")
+        .join(format!("repo-{}", short_hash(&repository_identity)));
+    let worktree_key = if git_dir == common_dir {
+        "main".to_owned()
+    } else {
+        let identity = anchor_windows::RootHandle::open(git_dir)?
+            .directory()
+            .metadata()
+            .identity;
+        let mut bytes = identity.volume_serial.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&identity.file_id);
+        format!("wt-{}", short_hash(&bytes))
+    };
+    Ok(StoreLocation { root, worktree_key })
 }
 
 fn short_hash(bytes: &[u8]) -> String {
@@ -798,6 +828,9 @@ pub enum GitError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[cfg(windows)]
+    #[error(transparent)]
+    Windows(#[from] anchor_windows::WindowsError),
 }
 
 #[cfg(test)]

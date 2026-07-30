@@ -633,6 +633,7 @@ fn node_kind(node: &ManifestNode) -> ObservedKind {
 }
 
 #[derive(Clone)]
+#[cfg_attr(windows, allow(dead_code))]
 struct BatchWrite {
     path: NativeRelativePath,
     expected: Option<ManifestEntry>,
@@ -2071,6 +2072,7 @@ fn validate_journal_temp_name(value: &str, prefix: &str) -> Result<OsString, Res
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn scan_transactions(_root: &Path) -> Result<TransactionSummary, RestoreError> {
     Ok(TransactionSummary::default())
 }

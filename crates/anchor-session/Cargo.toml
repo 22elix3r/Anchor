@@ -28,5 +28,8 @@ uuid.workspace = true
 command-fds.workspace = true
 rustix.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+anchor-windows.workspace = true
+
 [lints]
 workspace = true

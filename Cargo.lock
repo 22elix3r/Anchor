@@ -51,6 +51,7 @@ name = "anchor-git"
 version = "0.1.0"
 dependencies = [
  "anchor-core",
+ "anchor-windows",
  "blake3",
  "gix",
  "rustix 1.1.4",
@@ -65,6 +66,7 @@ version = "0.1.0"
 dependencies = [
  "anchor-core",
  "anchor-git",
+ "anchor-windows",
  "atomic-write-file",
  "cap-std",
  "ciborium",

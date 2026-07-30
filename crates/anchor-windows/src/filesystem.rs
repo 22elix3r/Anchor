@@ -365,7 +365,7 @@ impl NodeHandle {
     }
 }
 
-fn open_raw(
+pub(crate) fn open_raw(
     path: &VerbatimPath,
     access: u32,
     share: u32,
@@ -458,6 +458,10 @@ fn metadata(handle: &OwnedHandle) -> Result<NodeMetadata, WindowsError> {
         last_write_time: basic.LastWriteTime,
         change_time: basic.ChangeTime,
     })
+}
+
+pub(crate) fn metadata_for_system(handle: &OwnedHandle) -> Result<NodeMetadata, WindowsError> {
+    metadata(handle)
 }
 
 fn query_fixed<T: Default>(

@@ -630,11 +630,7 @@ impl ActiveLock {
         Ok(())
     }
 
-    #[cfg(not(unix))]
-    fn preserve_for_child(&self, _command: &mut Command) -> Result<(), SessionError> {
-        Ok(())
-    }
-
+    #[cfg(unix)]
     fn retain_for_spawned_child(&mut self) {
         self.unlock_on_drop = false;
     }
@@ -669,142 +665,177 @@ impl SessionRunner {
         if request.command.is_empty() {
             return Err(SessionError::EmptyCommand);
         }
-        #[cfg(windows)]
-        return Err(SessionError::PlatformCaptureUnsupported);
+        let before_context = GitContext::discover(&request.invocation_directory)?;
+        reject_unsupported_repository(&before_context.repository_state()?)?;
+        let location = before_context.store_location();
+        let store = SessionStore::open(&location.root, location.worktree_key)?;
+        let _store_lease = store.acquire_store_read_lease()?;
+        let mut active_lock = store.acquire_active_lock()?;
+        restore::ensure_no_unresolved_transactions(store.root())
+            .map_err(|error| SessionError::TransactionState(error.to_string()))?;
+        mark_abandoned_locked(&store)?;
 
-        #[cfg(not(windows))]
-        {
-            let before_context = GitContext::discover(&request.invocation_directory)?;
-            reject_unsupported_repository(&before_context.repository_state()?)?;
-            let location = before_context.store_location();
-            let store = SessionStore::open(&location.root, location.worktree_key)?;
-            let _store_lease = store.acquire_store_read_lease()?;
-            let mut active_lock = store.acquire_active_lock()?;
-            restore::ensure_no_unresolved_transactions(store.root())
-                .map_err(|error| SessionError::TransactionState(error.to_string()))?;
-            mark_abandoned_locked(&store)?;
-
-            let capture_policy = request.capture_policy.validate()?;
-            let capture_options = capture_policy.capture_options();
-            let before = capture_live_endpoint(&before_context, &store, capture_options)?;
-            let before_manifest = store.load_manifest(before.manifest)?;
-            let frozen_scope = before_context.frozen_scope(
-                &before_manifest,
-                store.objects(),
-                before_context.tracked_paths(),
-            )?;
-            let id = SessionId::new();
-            let command = request
-                .command
-                .iter()
-                .take(
-                    if capture_policy.command_recording == CommandRecording::FullArguments {
-                        usize::MAX
-                    } else {
-                        1
-                    },
-                )
-                .map(|value| NativeString::from_host(value))
-                .collect();
-            let mut session = Session {
-                id,
-                command,
-                redacted_argument_count: if capture_policy.command_recording
-                    == CommandRecording::ProgramOnly
-                {
-                    u64::try_from(request.command.len().saturating_sub(1)).unwrap_or(u64::MAX)
+        let capture_policy = request.capture_policy.validate()?;
+        let capture_options = capture_policy.capture_options();
+        let before = capture_live_endpoint(&before_context, &store, capture_options)?;
+        let before_manifest = store.load_manifest(before.manifest)?;
+        let frozen_scope = before_context.frozen_scope(
+            &before_manifest,
+            store.objects(),
+            before_context.tracked_paths(),
+        )?;
+        let id = SessionId::new();
+        let command = request
+            .command
+            .iter()
+            .take(
+                if capture_policy.command_recording == CommandRecording::FullArguments {
+                    usize::MAX
                 } else {
-                    0
+                    1
                 },
-                capture_policy,
-                invocation_directory: NativeString::from_host(
-                    request.invocation_directory.as_os_str(),
-                ),
-                worktree_root: NativeString::from_host(before_context.worktree_root().as_os_str()),
-                worktree_key: store.worktree_key.clone(),
-                before,
-                after: None,
-                started_at: Timestamp::now()?,
-                finished_at: None,
-                exit: None,
-                state: SessionState::BeforeSnapshotComplete,
-                failure: None,
-            };
-            store.save_session(&session)?;
+            )
+            .map(|value| NativeString::from_host(value))
+            .collect();
+        let mut session = Session {
+            id,
+            command,
+            redacted_argument_count: if capture_policy.command_recording
+                == CommandRecording::ProgramOnly
+            {
+                u64::try_from(request.command.len().saturating_sub(1)).unwrap_or(u64::MAX)
+            } else {
+                0
+            },
+            capture_policy,
+            invocation_directory: NativeString::from_host(request.invocation_directory.as_os_str()),
+            worktree_root: NativeString::from_host(before_context.worktree_root().as_os_str()),
+            worktree_key: store.worktree_key.clone(),
+            before,
+            after: None,
+            started_at: Timestamp::now()?,
+            finished_at: None,
+            exit: None,
+            state: SessionState::BeforeSnapshotComplete,
+            failure: None,
+        };
+        store.save_session(&session)?;
 
-            let signal_forwarder = SignalForwarder::install()?;
-            let mut command = Command::new(&request.command[0]);
-            command
-                .args(&request.command[1..])
-                .current_dir(&request.invocation_directory)
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
-            active_lock.preserve_for_child(&mut command)?;
-            let spawn_result = command.spawn();
-            drop(command);
-            let mut child = match spawn_result {
-                Ok(child) => {
-                    active_lock.retain_for_spawned_child();
-                    child
-                }
-                Err(error) => {
-                    session.state = SessionState::LaunchFailed;
-                    session.failure = Some(error.to_string());
-                    session.finished_at = Some(Timestamp::now()?);
+        let signal_forwarder = SignalForwarder::install()?;
+        #[cfg(windows)]
+        let containment = anchor_windows::KillOnCloseJob::new()?;
+        let mut command = Command::new(&request.command[0]);
+        command
+            .args(&request.command[1..])
+            .current_dir(&request.invocation_directory)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        #[cfg(unix)]
+        active_lock.preserve_for_child(&mut command)?;
+        let spawn_result = command.spawn();
+        drop(command);
+        let mut child = match spawn_result {
+            Ok(child) => {
+                #[cfg(windows)]
+                let mut child = child;
+                #[cfg(windows)]
+                if let Err(source) = containment.assign(&child) {
+                    let _killed = child.kill();
+                    let status = child.wait().ok().map(ExitRecord::from_status);
+                    session.exit = status;
+                    session.state = SessionState::CapturingAfter;
+                    session.failure = Some(source.to_string());
                     store.save_session(&session)?;
-                    return Err(SessionError::ChildSpawn {
+                    let after_result = (|| {
+                        let after_context = GitContext::discover(&request.invocation_directory)?;
+                        capture_frozen_endpoint(
+                            &after_context,
+                            &store,
+                            capture_options,
+                            frozen_scope,
+                        )
+                    })();
+                    session.finished_at = Some(Timestamp::now()?);
+                    match after_result {
+                        Ok(after) => {
+                            session.after = Some(after);
+                            session.state = SessionState::Interrupted;
+                        }
+                        Err(after_error) => {
+                            session.state = SessionState::AfterSnapshotFailed;
+                            session.failure =
+                                Some(format!("{source}; after-capture failed: {after_error}"));
+                        }
+                    }
+                    store.save_session(&session)?;
+                    return Err(SessionError::ChildContainment {
                         session_id: id,
-                        source: error,
+                        source,
                     });
                 }
-            };
-            signal_forwarder.set_child(child.id());
-            session.state = SessionState::ChildRunning;
-            store.save_session(&session)?;
-
-            let status = loop {
-                match child.wait() {
-                    Ok(status) => break status,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(error) => return Err(SessionError::ChildWait(error)),
-                }
-            };
-            active_lock.child_has_exited();
-            signal_forwarder.clear_child();
-            let exit = ExitRecord::from_status(status);
-            session.exit = Some(exit);
-            session.state = SessionState::CapturingAfter;
-            store.save_session(&session)?;
-
-            let after_result = (|| {
-                let after_context = GitContext::discover(&request.invocation_directory)?;
-                capture_frozen_endpoint(&after_context, &store, capture_options, frozen_scope)
-            })();
-            session.finished_at = Some(Timestamp::now()?);
-            match after_result {
-                Ok(after) => {
-                    session.after = Some(after);
-                    session.state = if signal_forwarder.was_interrupted() {
-                        SessionState::Interrupted
-                    } else {
-                        SessionState::Completed
-                    };
-                    session.failure = None;
-                }
-                Err(error) => {
-                    session.state = SessionState::AfterSnapshotFailed;
-                    session.failure = Some(error.to_string());
-                }
+                #[cfg(unix)]
+                active_lock.retain_for_spawned_child();
+                child
             }
-            store.save_session(&session)?;
-            Ok(RunResult {
-                session_id: id,
-                exit,
-                state: session.state,
-                after_failure: session.failure,
-            })
+            Err(error) => {
+                session.state = SessionState::LaunchFailed;
+                session.failure = Some(error.to_string());
+                session.finished_at = Some(Timestamp::now()?);
+                store.save_session(&session)?;
+                return Err(SessionError::ChildSpawn {
+                    session_id: id,
+                    source: error,
+                });
+            }
+        };
+        #[cfg(unix)]
+        signal_forwarder.set_child(child.id());
+        session.state = SessionState::ChildRunning;
+        store.save_session(&session)?;
+
+        let status = loop {
+            match child.wait() {
+                Ok(status) => break status,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(SessionError::ChildWait(error)),
+            }
+        };
+        active_lock.child_has_exited();
+        #[cfg(unix)]
+        signal_forwarder.clear_child();
+        let exit = ExitRecord::from_status(status);
+        session.exit = Some(exit);
+        session.state = SessionState::CapturingAfter;
+        store.save_session(&session)?;
+
+        let after_result = (|| {
+            let after_context = GitContext::discover(&request.invocation_directory)?;
+            capture_frozen_endpoint(&after_context, &store, capture_options, frozen_scope)
+        })();
+        session.finished_at = Some(Timestamp::now()?);
+        match after_result {
+            Ok(after) => {
+                session.after = Some(after);
+                session.state = if signal_forwarder.was_interrupted() {
+                    SessionState::Interrupted
+                } else {
+                    SessionState::Completed
+                };
+                session.failure = None;
+            }
+            Err(error) => {
+                session.state = SessionState::AfterSnapshotFailed;
+                session.failure = Some(error.to_string());
+            }
         }
+        store.save_session(&session)?;
+        Ok(RunResult {
+            session_id: id,
+            exit,
+            state: session.state,
+            after_failure: session.failure,
+        })
     }
 }
 
@@ -972,10 +1003,6 @@ impl SignalForwarder {
         Ok(Self { interrupted })
     }
 
-    fn set_child(&self, _pid: u32) {}
-
-    fn clear_child(&self) {}
-
     fn was_interrupted(&self) -> bool {
         self.interrupted.load(Ordering::SeqCst)
     }
@@ -1001,6 +1028,8 @@ fn private_directory(path: &Path) -> Result<(), SessionError> {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(windows)]
+    anchor_windows::harden_private_directory(path)?;
     Ok(())
 }
 
@@ -1207,10 +1236,12 @@ pub enum SessionError {
     SparseRepositoryUnsupported,
     #[error("split indexes are refused until shared-index dependencies are captured")]
     SplitIndexUnsupported,
-    #[error(
-        "Windows capture is refused until reparse-point containment and ACL handling are proven"
-    )]
-    PlatformCaptureUnsupported,
+    #[cfg(windows)]
+    #[error("session {session_id} child could not be contained in a kill-on-close job: {source}")]
+    ChildContainment {
+        session_id: SessionId,
+        source: anchor_windows::WindowsError,
+    },
     #[error("system clock is before the Unix epoch")]
     ClockBeforeEpoch,
     #[error("invalid storage layout")]
@@ -1249,6 +1280,9 @@ pub enum SessionError {
     Manifest(#[from] ManifestError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[cfg(windows)]
+    #[error(transparent)]
+    Windows(#[from] anchor_windows::WindowsError),
     #[error(transparent)]
     Path(#[from] anchor_core::PathError),
     #[error(transparent)]

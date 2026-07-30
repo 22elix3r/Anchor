@@ -231,6 +231,7 @@ fn store_is_private(root: &Path) -> Result<bool, MaintenanceError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn store_is_private(_root: &Path) -> Result<bool, MaintenanceError> {
     Ok(false)
 }
@@ -259,12 +260,14 @@ mod tests {
     #[cfg(not(windows))]
     use std::ffi::OsString;
 
+    #[cfg(not(windows))]
     use anchor_core::{
         Completeness, Coverage, Manifest, ManifestEntry, ManifestNode, NativeRelativePath,
         PathEncoding, SafetyObservations,
     };
 
     use super::*;
+    #[cfg(not(windows))]
     use crate::{CapturePolicy, RunRequest, SessionRunner};
 
     fn repository() -> tempfile::TempDir {

@@ -363,6 +363,8 @@ fn create_private_dir(path: &Path) -> Result<(), StoreError> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(windows)]
+    anchor_windows::harden_private_directory(path)?;
     Ok(())
 }
 
@@ -383,6 +385,9 @@ fn sync_directory(path: &Path) -> Result<(), StoreError> {
 pub enum StoreError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[cfg(windows)]
+    #[error(transparent)]
+    Windows(#[from] anchor_windows::WindowsError),
     #[error("invalid object ID")]
     InvalidObjectId,
     #[error("object exceeds the supported length")]
