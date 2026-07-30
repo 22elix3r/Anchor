@@ -409,7 +409,7 @@ impl StoreTempFile {
             )
             .map_err(io::Error::other)?;
             directory
-                .replace_child(&self.name, destination.as_ref())
+                .replace_child(OsStr::new(&self.name), destination.as_ref())
                 .map_err(io::Error::other)?;
             sync_directory(&self.directory)
         }
