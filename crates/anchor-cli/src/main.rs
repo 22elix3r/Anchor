@@ -11,7 +11,7 @@ use anchor_git::GitContext;
 use anchor_session::{
     CapturePolicy, ConfigLoader, IndexRestoreResult, MaintenanceService, PolicyOverrides,
     RecoveryService, RestoreApplyResult, RestoreService, RunRequest, Session, SessionId,
-    SessionInspection, SessionRunner, SessionStore, TextMergeMode,
+    SessionInspection, SessionRunner, SessionStore, TextMergeMode, TransactionRecoveryService,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
@@ -115,6 +115,14 @@ enum Commands {
     },
     /// Mark stale nonterminal sessions abandoned after proving their child lock is free.
     Recover {
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
+    },
+    /// Roll back interrupted schema-v3 restore transactions after byte verification.
+    RecoverTransactions {
+        /// Confirm filesystem or index recovery mutation.
+        #[arg(long, required = true)]
+        yes: bool,
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
     },
@@ -553,6 +561,39 @@ fn execute(cli: Cli) -> Result<i32> {
             } else {
                 for session in &abandoned {
                     println!("marked {session} abandoned");
+                }
+            }
+            Ok(0)
+        }
+        Commands::RecoverTransactions { yes, format } => {
+            if !yes {
+                miette::bail!("transaction recovery requires --yes");
+            }
+            let store = current_store()?;
+            let report = TransactionRecoveryService::recover(&store)
+                .into_diagnostic()
+                .wrap_err("restore transaction recovery was refused")?;
+            if format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "rolled_back": report.rolled_back,
+                        "skipped_other_worktrees": report.skipped_other_worktrees,
+                    }))
+                    .into_diagnostic()?
+                );
+            } else {
+                for transaction in &report.rolled_back {
+                    println!("rolled back transaction {transaction}");
+                }
+                if report.rolled_back.is_empty() {
+                    println!("No recoverable transactions for this worktree.");
+                }
+                if report.skipped_other_worktrees > 0 {
+                    println!(
+                        "skipped {} transaction(s) owned by linked worktrees",
+                        report.skipped_other_worktrees
+                    );
                 }
             }
             Ok(0)

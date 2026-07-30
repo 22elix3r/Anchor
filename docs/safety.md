@@ -71,6 +71,13 @@ Confirmation also supplies the previewed BLAKE3 object ID; Anchor recalculates
 under the worktree lock and refuses if the result changed. Anchor returns a
 structured conflict instead of writing conflict markers.
 
+Schema-v3 restore journals retain the verified pre-restore node, intended node,
+worktree identity, and sibling staging names. `anchor recover-transactions
+--yes` validates those paths against the retained session and fresh repository
+discovery, then rolls an interrupted file or index operation back to its
+pre-restore state. Live, staged, or backup byte drift is a hard conflict.
+Incomplete schema-v1/v2 journals are reported but not guessed at.
+
 ## Capture consistency
 
 Anchor does not claim a globally atomic filesystem snapshot. For each regular
@@ -163,6 +170,6 @@ Manifests and sessions are treated as untrusted:
 - no Windows session capture or mutation yet;
 - `SIGKILL`, power loss, or machine failure can leave an incomplete session
   that must be marked abandoned after its child lock is free;
-- crash-journal automatic recovery is not yet exposed as a command.
+- interrupted multi-file rollback is not yet supported.
 
 These cases must remain visible limitations, not silent fallbacks.

@@ -87,3 +87,19 @@ eligible for collection once no active session holds the lock.
 Schema migrations are append-only: readers dispatch on the record tag and
 version, validate the old DTO, and convert it into current in-memory types.
 Writers emit only the newest schema. Unsupported future schemas are refused.
+
+## Restore journals
+
+Restore transaction directories contain an atomically replaced `journal.cbor`.
+Schema v3 records the owning session/worktree, validated target path, sibling
+stage and backup names, exact expected node, desired node, and progress state.
+Index journals additionally record the freshly validated index path and raw
+before/after captures.
+
+Completed and safely rolled-back journals are terminal. Any other state blocks
+new sessions, restoration, and garbage collection. Recovery never trusts a
+stored absolute path alone: it loads the owning session, rediscovers the Git
+worktree with `gix`, verifies that the common-store identity and index path
+match, then validates live/staged/backup bytes before a no-replace rollback.
+Legacy incomplete journals do not contain enough information for this and are
+refused.

@@ -40,13 +40,14 @@ Anchor is pre-release software. The implemented safety-first subset is:
 - single-path regular-file and symlink restore on Unix when safety is proven;
 - exact raw-index restore on Unix when the current index still equals the
   session-end index (split indexes are refused);
+- byte-verified rollback of interrupted schema-v3 file and index transactions;
 - refusal when current bytes, type, symlink target, mode, HEAD, or repository
   operation state is ambiguous;
 - storage integrity checking and reachability-based garbage collection.
 
-Not yet implemented: whole-session transactional rollback, crash-journal
-recovery commands, empty-directory mutation, TUI-triggered restore actions, and
-Windows filesystem mutation. Those cases are refused rather than approximated.
+Not yet implemented: whole-session transactional rollback, empty-directory
+mutation, TUI-triggered restore actions, and Windows filesystem mutation. Those
+cases are refused rather than approximated.
 
 ## Build
 
@@ -98,6 +99,7 @@ anchor doctor
 anchor gc --dry-run
 anchor gc
 anchor recover
+anchor recover-transactions --yes
 ```
 
 `anchor diff` returns `1` when differences exist. Restore conflicts return `4`.
@@ -108,6 +110,9 @@ The default diff is `before → session end`. `--current` is `before → current
 `--drift` is `session end → current` and separately reports repository and raw
 index drift. `anchor recover` never guesses a missing session end: after it can
 acquire the worktree lock, it marks stale nonterminal records `Abandoned`.
+`anchor recover-transactions --yes` is separate: it byte-verifies and rolls
+back interrupted schema-v3 restore transactions. Legacy incomplete journals
+remain visible but require manual recovery because they lack sufficient state.
 
 ## Inclusion and limits
 

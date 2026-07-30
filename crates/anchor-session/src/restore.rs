@@ -74,6 +74,32 @@ pub enum TextMergeMode {
     },
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TransactionRecoveryReport {
+    pub rolled_back: Vec<String>,
+    pub skipped_other_worktrees: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct TransactionRecoveryService;
+
+impl TransactionRecoveryService {
+    /// Roll back interrupted schema-v3 restore transactions for this worktree.
+    ///
+    /// Recovery verifies stored paths against the retained session and fresh Git discovery,
+    /// verifies every live/staged/backup node by bytes and type, and refuses any ambiguity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RestoreError`] without overwriting a mismatched live path, legacy incomplete
+    /// journal, or transaction belonging to an unverifiable worktree.
+    pub fn recover(store: &SessionStore) -> Result<TransactionRecoveryReport, RestoreError> {
+        let _store_lease = store.acquire_store_read_lease()?;
+        let _lock = store.acquire_active_lock()?;
+        recover_transactions(store)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RestoreService;
 
@@ -430,6 +456,7 @@ fn node_kind(node: &ManifestNode) -> ObservedKind {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_lines)]
 fn apply_one(
     store: &SessionStore,
     session_id: SessionId,
@@ -463,11 +490,15 @@ fn apply_one(
     let backup_name = OsString::from(&backup_name_text);
     let journal_path = transaction_path.join("journal.cbor");
     let mut journal = RestoreJournal {
-        schema: 2,
+        schema: 3,
         session_id,
         path: path.clone(),
         stage_name: stage_name_text,
         backup_name: Some(backup_name_text),
+        worktree_root: Some(anchor_core::NativeString::from_host(worktree.as_os_str())),
+        worktree_key: Some(store.worktree_key.clone()),
+        expected: Some(JournalPresence::from_entry(expected)),
+        desired: Some(JournalPresence::from_entry(desired)),
         state: JournalState::Prepared,
     };
     save_journal(&journal_path, &journal)?;
@@ -544,6 +575,7 @@ fn apply_one(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_lines)]
 fn apply_index(
     store: &SessionStore,
     session_id: SessionId,
@@ -589,9 +621,13 @@ fn apply_index(
     let backup_name = OsString::from(&backup_name_text);
     let journal_path = transaction_path.join("journal.cbor");
     let mut journal = IndexRestoreJournal {
-        schema: 2,
+        schema: 3,
         session_id,
         backup_name: Some(backup_name_text),
+        worktree_key: Some(store.worktree_key.clone()),
+        index_path: Some(anchor_core::NativeString::from_host(index_path.as_os_str())),
+        expected: Some(expected.clone()),
+        desired: Some(desired.clone()),
         state: JournalState::Prepared,
     };
     save_index_journal(&journal_path, &journal)?;
@@ -893,6 +929,14 @@ struct RestoreJournal {
     stage_name: String,
     #[serde(default)]
     backup_name: Option<String>,
+    #[serde(default)]
+    worktree_root: Option<anchor_core::NativeString>,
+    #[serde(default)]
+    worktree_key: Option<String>,
+    #[serde(default)]
+    expected: Option<JournalPresence>,
+    #[serde(default)]
+    desired: Option<JournalPresence>,
     state: JournalState,
 }
 
@@ -903,7 +947,105 @@ struct IndexRestoreJournal {
     session_id: SessionId,
     #[serde(default)]
     backup_name: Option<String>,
+    #[serde(default)]
+    worktree_key: Option<String>,
+    #[serde(default)]
+    index_path: Option<anchor_core::NativeString>,
+    #[serde(default)]
+    expected: Option<IndexCapture>,
+    #[serde(default)]
+    desired: Option<IndexCapture>,
     state: JournalState,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum JournalNode {
+    Regular {
+        object: ObjectId,
+        raw_size: u64,
+        unix_exec_bits: Option<u8>,
+    },
+    Symlink {
+        target: anchor_core::NativeString,
+        windows_link_kind: Option<u8>,
+    },
+    EmptyDirectory,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum JournalPresence {
+    Absent,
+    Present(JournalNode),
+}
+
+#[cfg(unix)]
+impl JournalPresence {
+    fn from_entry(entry: Option<&ManifestEntry>) -> Self {
+        entry.map_or(Self::Absent, |entry| {
+            Self::Present(JournalNode::from_entry(entry))
+        })
+    }
+
+    fn to_entry(&self, path: &NativeRelativePath) -> Option<ManifestEntry> {
+        match self {
+            Self::Absent => None,
+            Self::Present(node) => Some(node.to_entry(path)),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl JournalNode {
+    fn from_entry(entry: &ManifestEntry) -> Self {
+        match &entry.node {
+            ManifestNode::Regular {
+                object,
+                raw_size,
+                unix_exec_bits,
+            } => Self::Regular {
+                object: *object,
+                raw_size: *raw_size,
+                unix_exec_bits: *unix_exec_bits,
+            },
+            ManifestNode::Symlink {
+                target,
+                windows_link_kind,
+            } => Self::Symlink {
+                target: target.clone(),
+                windows_link_kind: *windows_link_kind,
+            },
+            ManifestNode::EmptyDirectory => Self::EmptyDirectory,
+        }
+    }
+
+    fn to_entry(&self, path: &NativeRelativePath) -> ManifestEntry {
+        let node = match self {
+            Self::Regular {
+                object,
+                raw_size,
+                unix_exec_bits,
+            } => ManifestNode::Regular {
+                object: *object,
+                raw_size: *raw_size,
+                unix_exec_bits: *unix_exec_bits,
+            },
+            Self::Symlink {
+                target,
+                windows_link_kind,
+            } => ManifestNode::Symlink {
+                target: target.clone(),
+                windows_link_kind: *windows_link_kind,
+            },
+            Self::EmptyDirectory => ManifestNode::EmptyDirectory,
+        };
+        ManifestEntry {
+            path: path.clone(),
+            node,
+            safety: anchor_core::SafetyObservations::default(),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -915,6 +1057,7 @@ enum JournalState {
     Verified,
     Complete,
     NeedsRecovery,
+    RolledBack,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -959,7 +1102,9 @@ pub(crate) fn scan_transactions(root: &Path) -> Result<TransactionSummary, Resto
             })
             .map_err(|error| RestoreError::Journal(error.to_string()))?;
         match state {
-            JournalState::Complete => summary.complete = summary.complete.saturating_add(1),
+            JournalState::Complete | JournalState::RolledBack => {
+                summary.complete = summary.complete.saturating_add(1);
+            }
             JournalState::NeedsRecovery => {
                 summary.needs_recovery = summary.needs_recovery.saturating_add(1);
             }
@@ -972,6 +1117,361 @@ pub(crate) fn scan_transactions(root: &Path) -> Result<TransactionSummary, Resto
         }
     }
     Ok(summary)
+}
+
+#[cfg(unix)]
+fn recover_transactions(store: &SessionStore) -> Result<TransactionRecoveryReport, RestoreError> {
+    let transactions = store.root().join("transactions");
+    if !transactions.exists() {
+        return Ok(TransactionRecoveryReport::default());
+    }
+    let mut report = TransactionRecoveryReport::default();
+    for entry in fs::read_dir(transactions)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let id = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| RestoreError::UnsafeJournalName)?;
+        let journal_path = entry.path().join("journal.cbor");
+        let bytes = read_journal(&journal_path)?;
+        if let Ok(mut journal) = ciborium::de::from_reader::<RestoreJournal, _>(Cursor::new(&bytes))
+        {
+            if matches!(
+                journal.state,
+                JournalState::Complete | JournalState::RolledBack
+            ) {
+                continue;
+            }
+            let Some(worktree_key) = journal.worktree_key.as_deref() else {
+                return Err(RestoreError::LegacyRecoveryUnsupported(id));
+            };
+            if worktree_key != store.worktree_key {
+                report.skipped_other_worktrees = report.skipped_other_worktrees.saturating_add(1);
+                continue;
+            }
+            recover_file_journal(store, &mut journal, &journal_path)?;
+            report.rolled_back.push(id);
+            continue;
+        }
+        if let Ok(mut journal) =
+            ciborium::de::from_reader::<IndexRestoreJournal, _>(Cursor::new(&bytes))
+        {
+            if matches!(
+                journal.state,
+                JournalState::Complete | JournalState::RolledBack
+            ) {
+                continue;
+            }
+            let Some(worktree_key) = journal.worktree_key.as_deref() else {
+                return Err(RestoreError::LegacyRecoveryUnsupported(id));
+            };
+            if worktree_key != store.worktree_key {
+                report.skipped_other_worktrees = report.skipped_other_worktrees.saturating_add(1);
+                continue;
+            }
+            recover_index_journal(store, &mut journal, &journal_path)?;
+            report.rolled_back.push(id);
+            continue;
+        }
+        return Err(RestoreError::Journal(format!(
+            "transaction {id} has an unknown journal record"
+        )));
+    }
+    Ok(report)
+}
+
+#[cfg(not(unix))]
+fn recover_transactions(_store: &SessionStore) -> Result<TransactionRecoveryReport, RestoreError> {
+    Err(RestoreError::PlatformMutationUnsupported)
+}
+
+#[cfg(unix)]
+fn read_journal(path: &Path) -> Result<Vec<u8>, RestoreError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(RestoreError::UnsafeJournalFile(path.to_path_buf()));
+    }
+    if metadata.len() > MAX_JOURNAL_BYTES {
+        return Err(RestoreError::JournalTooLarge(path.to_path_buf()));
+    }
+    Ok(fs::read(path)?)
+}
+
+#[cfg(unix)]
+fn recover_file_journal(
+    store: &SessionStore,
+    journal: &mut RestoreJournal,
+    journal_path: &Path,
+) -> Result<(), RestoreError> {
+    if journal.schema != 3 {
+        return Err(RestoreError::LegacyRecoveryUnsupported(
+            journal_path.display().to_string(),
+        ));
+    }
+    let worktree = validated_journal_worktree(
+        store,
+        journal.session_id,
+        journal
+            .worktree_root
+            .as_ref()
+            .ok_or(RestoreError::IncompleteRecoveryJournal)?,
+    )?;
+    let expected = journal
+        .expected
+        .as_ref()
+        .ok_or(RestoreError::IncompleteRecoveryJournal)?
+        .to_entry(&journal.path);
+    let desired = journal
+        .desired
+        .as_ref()
+        .ok_or(RestoreError::IncompleteRecoveryJournal)?
+        .to_entry(&journal.path);
+    if expected
+        .as_ref()
+        .or(desired.as_ref())
+        .is_some_and(|entry| matches!(entry.node, ManifestNode::EmptyDirectory))
+    {
+        return Err(RestoreError::DirectoryUnsupported);
+    }
+    let host = journal.path.to_host_path()?;
+    let name = host.file_name().ok_or(RestoreError::UnsafeRootPath)?;
+    let parent_path = host.parent().unwrap_or_else(|| Path::new(""));
+    let root = Dir::open_ambient_dir(&worktree, ambient_authority())?;
+    let parent = if parent_path.as_os_str().is_empty() {
+        root.try_clone()?
+    } else {
+        root.open_dir(parent_path)?
+    };
+    let stage = validate_journal_temp_name(&journal.stage_name, ".anchor-stage-")?;
+    let backup = validate_journal_temp_name(
+        journal
+            .backup_name
+            .as_deref()
+            .ok_or(RestoreError::IncompleteRecoveryJournal)?,
+        ".anchor-backup-",
+    )?;
+    rollback_node(
+        &parent,
+        name,
+        &stage,
+        &backup,
+        expected.as_ref(),
+        desired.as_ref(),
+        store.objects(),
+    )?;
+    journal.state = JournalState::RolledBack;
+    save_journal(journal_path, journal)
+}
+
+#[cfg(unix)]
+fn rollback_node(
+    parent: &Dir,
+    name: &OsStr,
+    stage: &OsStr,
+    backup: &OsStr,
+    expected: Option<&ManifestEntry>,
+    desired: Option<&ManifestEntry>,
+    objects: &ObjectStore,
+) -> Result<(), RestoreError> {
+    let backup_exists = parent.symlink_metadata(backup).is_ok();
+    if backup_exists {
+        if expected.is_none() || !verify_node(parent, backup, expected, objects)? {
+            return Err(RestoreError::RecoveryBackupMismatch);
+        }
+        if parent.symlink_metadata(name).is_ok() {
+            if verify_node(parent, name, expected, objects)? {
+                remove_node(parent, backup, expected)?;
+            } else if desired.is_some() && verify_node(parent, name, desired, objects)? {
+                remove_node(parent, name, desired)?;
+                rename_noreplace(parent, backup, parent, name)?;
+            } else {
+                return Err(RestoreError::RecoveryCurrentChanged);
+            }
+        } else {
+            rename_noreplace(parent, backup, parent, name)?;
+        }
+    } else if verify_node(parent, name, expected, objects)? {
+        // The transaction never evacuated the original, or a previous recovery restored it.
+    } else if expected.is_none()
+        && desired.is_some()
+        && verify_node(parent, name, desired, objects)?
+    {
+        remove_node(parent, name, desired)?;
+    } else {
+        return Err(RestoreError::RecoveryBackupMissing);
+    }
+
+    if parent.symlink_metadata(stage).is_ok() {
+        if desired.is_some() && verify_node(parent, stage, desired, objects)? {
+            remove_node(parent, stage, desired)?;
+        } else {
+            return Err(RestoreError::RecoveryStageMismatch);
+        }
+    }
+    if !verify_node(parent, name, expected, objects)? {
+        return Err(RestoreError::VerificationFailed);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn recover_index_journal(
+    store: &SessionStore,
+    journal: &mut IndexRestoreJournal,
+    journal_path: &Path,
+) -> Result<(), RestoreError> {
+    if journal.schema != 3 {
+        return Err(RestoreError::LegacyRecoveryUnsupported(
+            journal_path.display().to_string(),
+        ));
+    }
+    let session = store.load_session(journal.session_id)?;
+    let worktree = PathBuf::from(session.worktree_root.to_host()?);
+    let context = GitContext::discover(&worktree)?;
+    validate_store_identity(store, &context)?;
+    let recorded_index = PathBuf::from(
+        journal
+            .index_path
+            .as_ref()
+            .ok_or(RestoreError::IncompleteRecoveryJournal)?
+            .to_host()?,
+    );
+    if recorded_index != context.index_path() {
+        return Err(RestoreError::RecoveryPathMismatch);
+    }
+    let expected = journal
+        .expected
+        .as_ref()
+        .ok_or(RestoreError::IncompleteRecoveryJournal)?;
+    let desired = journal
+        .desired
+        .as_ref()
+        .ok_or(RestoreError::IncompleteRecoveryJournal)?;
+    let parent_path = recorded_index
+        .parent()
+        .ok_or(RestoreError::UnsafeIndexPath)?;
+    let name = recorded_index
+        .file_name()
+        .ok_or(RestoreError::UnsafeIndexPath)?;
+    let parent = Dir::open_ambient_dir(parent_path, ambient_authority())?;
+    let backup = validate_journal_temp_name(
+        journal
+            .backup_name
+            .as_deref()
+            .ok_or(RestoreError::IncompleteRecoveryJournal)?,
+        ".anchor-index-backup-",
+    )?;
+    let lock_path = recorded_index.with_extension("lock");
+    let lock_name = lock_path.file_name().ok_or(RestoreError::UnsafeIndexPath)?;
+    rollback_index_node(
+        &parent,
+        name,
+        lock_name,
+        &backup,
+        expected,
+        desired,
+        store.objects(),
+    )?;
+    journal.state = JournalState::RolledBack;
+    save_index_journal(journal_path, journal)
+}
+
+#[cfg(unix)]
+fn rollback_index_node(
+    parent: &Dir,
+    name: &OsStr,
+    lock_name: &OsStr,
+    backup: &OsStr,
+    expected: &IndexCapture,
+    desired: &IndexCapture,
+    objects: &ObjectStore,
+) -> Result<(), RestoreError> {
+    if parent.symlink_metadata(backup).is_ok() {
+        if !verify_index(parent, backup, expected, objects)? {
+            return Err(RestoreError::RecoveryBackupMismatch);
+        }
+        if parent.symlink_metadata(name).is_ok() {
+            if verify_index(parent, name, expected, objects)? {
+                parent.remove_file(backup)?;
+            } else if verify_index(parent, name, desired, objects)? {
+                parent.remove_file(name)?;
+                rename_noreplace(parent, backup, parent, name)?;
+            } else {
+                return Err(RestoreError::RecoveryCurrentChanged);
+            }
+        } else {
+            rename_noreplace(parent, backup, parent, name)?;
+        }
+    } else if verify_index(parent, name, expected, objects)? {
+        // The original was never evacuated, or recovery already restored it.
+    } else if matches!(expected, IndexCapture::Absent)
+        && verify_index(parent, name, desired, objects)?
+    {
+        parent.remove_file(name)?;
+    } else {
+        return Err(RestoreError::RecoveryBackupMissing);
+    }
+
+    if let Ok(metadata) = parent.symlink_metadata(lock_name) {
+        if !metadata.is_file() {
+            return Err(RestoreError::RecoveryStageMismatch);
+        }
+        let stage_matches = match desired {
+            IndexCapture::Present { .. } => verify_index(parent, lock_name, desired, objects)?,
+            IndexCapture::Absent => metadata.len() == 0,
+        };
+        if !stage_matches {
+            return Err(RestoreError::RecoveryStageMismatch);
+        }
+        parent.remove_file(lock_name)?;
+    }
+    if !verify_index(parent, name, expected, objects)? {
+        return Err(RestoreError::VerificationFailed);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validated_journal_worktree(
+    store: &SessionStore,
+    session_id: SessionId,
+    recorded: &anchor_core::NativeString,
+) -> Result<PathBuf, RestoreError> {
+    let session = store.load_session(session_id)?;
+    if &session.worktree_root != recorded {
+        return Err(RestoreError::RecoveryPathMismatch);
+    }
+    let worktree = PathBuf::from(recorded.to_host()?);
+    let context = GitContext::discover(&worktree)?;
+    validate_store_identity(store, &context)?;
+    Ok(worktree)
+}
+
+#[cfg(unix)]
+fn validate_store_identity(store: &SessionStore, context: &GitContext) -> Result<(), RestoreError> {
+    let location = context.store_location();
+    if location.worktree_key != store.worktree_key
+        || fs::canonicalize(location.root)? != fs::canonicalize(store.root())?
+    {
+        return Err(RestoreError::RecoveryPathMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_journal_temp_name(value: &str, prefix: &str) -> Result<OsString, RestoreError> {
+    if !value.starts_with(prefix)
+        || value.len() <= prefix.len()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return Err(RestoreError::UnsafeJournalName);
+    }
+    Ok(OsString::from(value))
 }
 
 #[cfg(not(unix))]
@@ -1036,6 +1536,24 @@ pub enum RestoreError {
     Journal(String),
     #[error("restore journal exceeds its size limit: {0}")]
     JournalTooLarge(PathBuf),
+    #[error("restore journal is not a regular file: {0}")]
+    UnsafeJournalFile(PathBuf),
+    #[error("restore journal contains an unsafe temporary name")]
+    UnsafeJournalName,
+    #[error("restore journal does not contain schema-v3 recovery data")]
+    IncompleteRecoveryJournal,
+    #[error("legacy interrupted transaction {0} cannot be recovered automatically")]
+    LegacyRecoveryUnsupported(String),
+    #[error("restore journal path or worktree identity does not match fresh repository discovery")]
+    RecoveryPathMismatch,
+    #[error("recovery backup does not match the byte-exact recorded current state")]
+    RecoveryBackupMismatch,
+    #[error("recovery backup is missing and the live path is not already restored")]
+    RecoveryBackupMissing,
+    #[error("live path changed after the interrupted restore; recovery refused")]
+    RecoveryCurrentChanged,
+    #[error("staged restore output does not match the journal")]
+    RecoveryStageMismatch,
     #[error(
         "unresolved restore transactions block mutation ({needs_recovery} need recovery, {unfinished} unfinished)"
     )]
@@ -1251,6 +1769,106 @@ mod tests {
             fs::read(root.path().join("file")).unwrap(),
             b"newer-current\nsession\ntail\n"
         );
+    }
+
+    #[test]
+    fn recovers_an_interrupted_evacuated_file_transaction() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"base").unwrap();
+        let (store, session_id) = run_change(root.path(), "printf session > file");
+        let session = store.load_session(session_id).unwrap();
+        let base = store.load_manifest(session.before.manifest).unwrap();
+        let after = store
+            .load_manifest(session.after.as_ref().unwrap().manifest)
+            .unwrap();
+        let desired = base.entries().first().unwrap();
+        let expected = after.entries().first().unwrap();
+
+        let transaction_id = Uuid::now_v7();
+        let transaction_path = store
+            .root()
+            .join("transactions")
+            .join(transaction_id.to_string());
+        private_transaction_dir(&transaction_path).unwrap();
+        let stage_text = format!(".anchor-stage-{transaction_id}");
+        let backup_text = format!(".anchor-backup-{transaction_id}");
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).unwrap();
+        stage_node(&parent, OsStr::new(&stage_text), desired, store.objects()).unwrap();
+        rename_noreplace(
+            &parent,
+            OsStr::new("file"),
+            &parent,
+            OsStr::new(&backup_text),
+        )
+        .unwrap();
+        let journal_path = transaction_path.join("journal.cbor");
+        save_journal(
+            &journal_path,
+            &RestoreJournal {
+                schema: 3,
+                session_id,
+                path: selected(b"file"),
+                stage_name: stage_text.clone(),
+                backup_name: Some(backup_text.clone()),
+                worktree_root: Some(anchor_core::NativeString::from_host(
+                    root.path().as_os_str(),
+                )),
+                worktree_key: Some(store.worktree_key.clone()),
+                expected: Some(JournalPresence::Present(JournalNode::from_entry(expected))),
+                desired: Some(JournalPresence::Present(JournalNode::from_entry(desired))),
+                state: JournalState::Evacuated,
+            },
+        )
+        .unwrap();
+
+        let report = TransactionRecoveryService::recover(&store).unwrap();
+        assert_eq!(report.rolled_back, vec![transaction_id.to_string()]);
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"session");
+        assert!(!root.path().join(stage_text).exists());
+        assert!(!root.path().join(backup_text).exists());
+        let summary = scan_transactions(store.root()).unwrap();
+        assert_eq!(summary.total, summary.complete);
+    }
+
+    #[test]
+    fn recovers_an_interrupted_installed_index_transaction() {
+        let root = repository();
+        let index_path = root.path().join(".git").join("index");
+        let index = empty_v2_index();
+        fs::write(&index_path, &index).unwrap();
+        let (store, session_id) = run_change(root.path(), "rm .git/index");
+        let session = store.load_session(session_id).unwrap();
+        let expected = session.after.as_ref().unwrap().index.clone();
+        let desired = session.before.index.clone();
+        fs::write(&index_path, &index).unwrap();
+
+        let transaction_id = Uuid::now_v7();
+        let transaction_path = store
+            .root()
+            .join("transactions")
+            .join(format!("index-{transaction_id}"));
+        private_transaction_dir(&transaction_path).unwrap();
+        let backup_text = format!(".anchor-index-backup-{transaction_id}");
+        let journal_path = transaction_path.join("journal.cbor");
+        save_index_journal(
+            &journal_path,
+            &IndexRestoreJournal {
+                schema: 3,
+                session_id,
+                backup_name: Some(backup_text),
+                worktree_key: Some(store.worktree_key.clone()),
+                index_path: Some(anchor_core::NativeString::from_host(index_path.as_os_str())),
+                expected: Some(expected),
+                desired: Some(desired),
+                state: JournalState::Installed,
+            },
+        )
+        .unwrap();
+
+        let report = TransactionRecoveryService::recover(&store).unwrap();
+        assert_eq!(report.rolled_back, vec![format!("index-{transaction_id}")]);
+        assert!(!index_path.exists());
+        assert_eq!(scan_transactions(store.root()).unwrap().unfinished, 0);
     }
 
     #[test]
