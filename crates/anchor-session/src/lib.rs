@@ -27,7 +27,7 @@ use uuid::Uuid;
 pub use maintenance::{
     DoctorReport, GarbageCollectionReport, MaintenanceError, MaintenanceService,
 };
-pub use restore::{RestoreApplyResult, RestoreError, RestoreService};
+pub use restore::{IndexRestoreResult, RestoreApplyResult, RestoreError, RestoreService};
 
 const SESSION_TAG: u64 = 0x4153_4553;
 const SESSION_SCHEMA: u16 = 1;

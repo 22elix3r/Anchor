@@ -38,7 +38,9 @@ changes “session-window changes,” never “changes made by the agent.”
 8. A concurrent creator is never overwritten. If rollback cannot safely reclaim
    the live name, the backup and journal remain for recovery.
 9. Binary and otherwise opaque files are not speculatively merged.
-10. Anchor never changes the real Git index in the current release.
+10. Index restoration requires the current raw index to equal the recorded
+    session-end index. It uses Git's `index.lock` convention plus evacuation and
+    no-replace installation; split indexes are refused.
 
 ## Restore decisions
 
@@ -82,8 +84,9 @@ format, sparse mode, and raw index bytes at both endpoints. It reports drift but
 does not move refs or rewrite history.
 
 The current mutation backend refuses restoration if repository state changed
-during the session or differs from the recorded session end. Index drift does
-not get overwritten because working-tree restoration never writes the index.
+during the session or differs from the recorded session end. Working-tree
+restoration never writes the index. The separate `restore-index` operation
+returns a conflict without writing when post-session index drift is present.
 
 ## Included and excluded data
 
@@ -117,7 +120,7 @@ Manifests and sessions are treated as untrusted:
 - no globally atomic snapshot;
 - no atomic multi-file restore;
 - no automatic three-way text merge;
-- no Git index or history restoration;
+- no split-index restoration or Git history restoration;
 - no recursive dirty-submodule capture or restoration;
 - no preservation of hard-link topology, ACLs, xattrs, ownership, or timestamps;
 - no safe automatic Windows mutation yet;

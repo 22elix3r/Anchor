@@ -6,8 +6,8 @@ use std::str::FromStr;
 use anchor_core::{ChangeKind, ManifestDiff, NativeRelativePath, NativeString, PathEncoding};
 use anchor_git::GitContext;
 use anchor_session::{
-    MaintenanceService, RestoreApplyResult, RestoreService, RunRequest, Session, SessionId,
-    SessionRunner, SessionStore,
+    IndexRestoreResult, MaintenanceService, RestoreApplyResult, RestoreService, RunRequest,
+    Session, SessionId, SessionRunner, SessionStore,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
@@ -60,6 +60,8 @@ enum Commands {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Restore exact raw index bytes if no post-session index drift exists.
+    RestoreIndex { session: String },
     /// Verify retained sessions, manifests, objects, and repository drift.
     Doctor {
         #[arg(long, value_enum, default_value_t)]
@@ -188,6 +190,29 @@ fn execute(cli: Cli) -> Result<i32> {
                 }
                 RestoreApplyResult::Conflict { reason } => {
                     eprintln!("conflict: {reason:?}; no filesystem change was made");
+                    Ok(4)
+                }
+            }
+        }
+        Commands::RestoreIndex { session } => {
+            let store = current_store()?;
+            let id = SessionId::from_str(&session)
+                .into_diagnostic()
+                .wrap_err("session ID is not a UUID")?;
+            match RestoreService::restore_index(&store, id)
+                .into_diagnostic()
+                .wrap_err("index restore was refused")?
+            {
+                IndexRestoreResult::Applied => {
+                    println!("restored exact pre-session index bytes");
+                    Ok(0)
+                }
+                IndexRestoreResult::NoChange => {
+                    println!("index already matches the safe target");
+                    Ok(0)
+                }
+                IndexRestoreResult::Conflict => {
+                    eprintln!("index conflict: post-session index drift was preserved");
                     Ok(4)
                 }
             }

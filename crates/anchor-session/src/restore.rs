@@ -15,7 +15,7 @@ use anchor_core::{
     NoChangeReason, ObservedKind, RestoreOutcome, RestorePlan, ScopeClassifier, ScopeDecision,
     ScopeError,
 };
-use anchor_git::GitContext;
+use anchor_git::{GitContext, IndexCapture};
 #[cfg(unix)]
 use atomic_write_file::AtomicWriteFile;
 #[cfg(unix)]
@@ -42,6 +42,13 @@ pub enum RestoreApplyResult {
     Conflict {
         reason: ConflictReason,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexRestoreResult {
+    Applied,
+    NoChange,
+    Conflict,
 }
 
 #[derive(Debug, Default)]
@@ -125,6 +132,66 @@ impl RestoreService {
             }
         }
     }
+
+    /// Restore exact raw index bytes only when the index has not drifted after the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RestoreError`] for incomplete sessions, repository drift, split indexes,
+    /// existing Git locks, corrupt stored bytes, or any failure of the no-replace transaction.
+    pub fn restore_index(
+        store: &SessionStore,
+        session_id: SessionId,
+    ) -> Result<IndexRestoreResult, RestoreError> {
+        let _lock = store.acquire_active_lock()?;
+        let session = store.load_session(session_id)?;
+        let after = session
+            .after
+            .as_ref()
+            .ok_or(RestoreError::IncompleteSession)?;
+        if session.before.repository != after.repository {
+            return Err(RestoreError::RepositoryChangedDuringSession);
+        }
+        if index_is_split(&session.before.index) || index_is_split(&after.index) {
+            return Err(RestoreError::SplitIndexUnsupported);
+        }
+        if session.before.index == after.index {
+            return Ok(IndexRestoreResult::NoChange);
+        }
+        let worktree = PathBuf::from(session.worktree_root.to_host()?);
+        let context = GitContext::discover(&worktree)?;
+        if context.repository_state()? != after.repository {
+            return Err(RestoreError::RepositoryDrift);
+        }
+        let current = context.capture_index(store.objects())?;
+        if current == session.before.index {
+            return Ok(IndexRestoreResult::NoChange);
+        }
+        if current != after.index {
+            return Ok(IndexRestoreResult::Conflict);
+        }
+        apply_index(
+            store,
+            session_id,
+            context.index_path(),
+            &after.index,
+            &session.before.index,
+        )?;
+        Ok(IndexRestoreResult::Applied)
+    }
+}
+
+fn index_is_split(index: &IndexCapture) -> bool {
+    matches!(
+        index,
+        IndexCapture::Present {
+            summary: anchor_git::IndexSummary {
+                split_index: true,
+                ..
+            },
+            ..
+        }
+    )
 }
 
 struct SelectedScope {
@@ -272,6 +339,151 @@ fn apply_one(
     journal.state = JournalState::Complete;
     save_journal(&journal_path, &journal)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn apply_index(
+    store: &SessionStore,
+    session_id: SessionId,
+    index_path: &Path,
+    expected: &IndexCapture,
+    desired: &IndexCapture,
+) -> Result<(), RestoreError> {
+    let parent_path = index_path.parent().ok_or(RestoreError::UnsafeIndexPath)?;
+    let name = index_path
+        .file_name()
+        .ok_or(RestoreError::UnsafeIndexPath)?;
+    let lock_path = index_path.with_extension("lock");
+    let lock_name = lock_path.file_name().ok_or(RestoreError::UnsafeIndexPath)?;
+    let parent = Dir::open_ambient_dir(parent_path, ambient_authority())?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut lock_file = parent
+        .open_with(lock_name, &options)
+        .map_err(RestoreError::IndexLock)?;
+    if let IndexCapture::Present {
+        object, raw_size, ..
+    } = desired
+    {
+        store
+            .objects()
+            .copy_verified(*object, *raw_size, &mut lock_file)?;
+    }
+    lock_file.sync_all()?;
+    drop(lock_file);
+
+    let transaction_id = Uuid::now_v7();
+    let transaction_path = store
+        .root()
+        .join("transactions")
+        .join(format!("index-{transaction_id}"));
+    private_transaction_dir(&transaction_path)?;
+    let transaction = Dir::open_ambient_dir(&transaction_path, ambient_authority())?;
+    let backup_name = OsStr::new("index.backup");
+    let journal_path = transaction_path.join("journal.cbor");
+    let mut journal = IndexRestoreJournal {
+        schema: 1,
+        session_id,
+        state: JournalState::Prepared,
+    };
+    save_index_journal(&journal_path, &journal)?;
+
+    let had_current = matches!(expected, IndexCapture::Present { .. });
+    if had_current {
+        if let Err(error) = rename_noreplace(&parent, name, &transaction, backup_name) {
+            let _cleanup = parent.remove_file(lock_name);
+            return Err(RestoreError::Evacuation(error));
+        }
+        journal.state = JournalState::Evacuated;
+        save_index_journal(&journal_path, &journal)?;
+        if !verify_index(&transaction, backup_name, expected, store.objects())? {
+            let rollback = rename_noreplace(&transaction, backup_name, &parent, name);
+            let _cleanup = parent.remove_file(lock_name);
+            journal.state = JournalState::NeedsRecovery;
+            save_index_journal(&journal_path, &journal)?;
+            return match rollback {
+                Ok(()) => Err(RestoreError::CurrentIndexChanged),
+                Err(error) => Err(RestoreError::RollbackFailed(error)),
+            };
+        }
+    } else if parent.symlink_metadata(name).is_ok() {
+        let _cleanup = parent.remove_file(lock_name);
+        return Err(RestoreError::CurrentIndexChanged);
+    }
+
+    if matches!(desired, IndexCapture::Present { .. }) {
+        if let Err(error) = rename_noreplace(&parent, lock_name, &parent, name) {
+            let rollback = if had_current {
+                rename_noreplace(&transaction, backup_name, &parent, name)
+            } else {
+                Ok(())
+            };
+            journal.state = JournalState::NeedsRecovery;
+            save_index_journal(&journal_path, &journal)?;
+            return match rollback {
+                Ok(()) => Err(RestoreError::Install(error)),
+                Err(rollback) => Err(RestoreError::RollbackFailed(rollback)),
+            };
+        }
+    } else {
+        parent.remove_file(lock_name)?;
+    }
+    journal.state = JournalState::Installed;
+    save_index_journal(&journal_path, &journal)?;
+    if !verify_index(&parent, name, desired, store.objects())? {
+        journal.state = JournalState::NeedsRecovery;
+        save_index_journal(&journal_path, &journal)?;
+        return Err(RestoreError::VerificationFailed);
+    }
+    journal.state = JournalState::Verified;
+    save_index_journal(&journal_path, &journal)?;
+    if had_current {
+        transaction.remove_file(backup_name)?;
+    }
+    journal.state = JournalState::Complete;
+    save_index_journal(&journal_path, &journal)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_index(
+    _store: &SessionStore,
+    _session_id: SessionId,
+    _index_path: &Path,
+    _expected: &IndexCapture,
+    _desired: &IndexCapture,
+) -> Result<(), RestoreError> {
+    Err(RestoreError::PlatformMutationUnsupported)
+}
+
+#[cfg(unix)]
+fn verify_index(
+    directory: &Dir,
+    name: &OsStr,
+    expected: &IndexCapture,
+    objects: &ObjectStore,
+) -> Result<bool, RestoreError> {
+    match expected {
+        IndexCapture::Absent => Ok(matches!(
+            directory.symlink_metadata(name),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        )),
+        IndexCapture::Present {
+            object, raw_size, ..
+        } => {
+            let metadata = match directory.symlink_metadata(name) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            if !metadata.is_file() {
+                return Ok(false);
+            }
+            let mut file = directory.open(name)?;
+            let (actual, size) = objects.put(&mut file)?;
+            Ok(actual == *object && size == *raw_size)
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -455,12 +667,31 @@ fn save_journal(path: &Path, journal: &RestoreJournal) -> Result<(), RestoreErro
 }
 
 #[cfg(unix)]
+fn save_index_journal(path: &Path, journal: &IndexRestoreJournal) -> Result<(), RestoreError> {
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(journal, &mut bytes)
+        .map_err(|error| RestoreError::Journal(error.to_string()))?;
+    let mut file = AtomicWriteFile::open(path)?;
+    file.write_all(&bytes)?;
+    file.commit()?;
+    Ok(())
+}
+
+#[cfg(unix)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RestoreJournal {
     schema: u16,
     session_id: SessionId,
     path: NativeRelativePath,
     stage_name: String,
+    state: JournalState,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IndexRestoreJournal {
+    schema: u16,
+    session_id: SessionId,
     state: JournalState,
 }
 
@@ -487,10 +718,18 @@ pub enum RestoreError {
     PathNotChanged,
     #[error("empty-directory restoration is not enabled in the first safe mutation backend")]
     DirectoryUnsupported,
+    #[error("split-index restoration is refused until shared-index dependencies are captured")]
+    SplitIndexUnsupported,
+    #[error("Git index path is unsafe")]
+    UnsafeIndexPath,
+    #[error("could not acquire Git index lock: {0}")]
+    IndexLock(io::Error),
     #[error("the worktree root itself cannot be restored")]
     UnsafeRootPath,
     #[error("current path state changed before it could be safely evacuated")]
     CurrentChanged,
+    #[error("current Git index changed before it could be safely evacuated")]
+    CurrentIndexChanged,
     #[error("could not evacuate current path without replacement: {0}")]
     Evacuation(io::Error),
     #[error("could not install staged path without replacement: {0}")]
@@ -601,5 +840,31 @@ mod tests {
         let result = RestoreService::restore_file(&store, session, selected(b"added")).unwrap();
         assert!(matches!(result, RestoreApplyResult::Applied { .. }));
         assert!(!root.path().join("added").exists());
+    }
+
+    #[test]
+    fn restores_raw_index_only_after_exact_endpoint_match() {
+        let root = repository();
+        let index = empty_v2_index();
+        fs::write(root.path().join(".git").join("index"), &index).unwrap();
+        let (store, session) = run_change(root.path(), "rm .git/index");
+        assert!(!root.path().join(".git").join("index").exists());
+        assert_eq!(
+            RestoreService::restore_index(&store, session).unwrap(),
+            IndexRestoreResult::Applied
+        );
+        assert_eq!(
+            fs::read(root.path().join(".git").join("index")).unwrap(),
+            index
+        );
+    }
+
+    fn empty_v2_index() -> Vec<u8> {
+        let mut bytes = b"DIRC\0\0\0\x02\0\0\0\0".to_vec();
+        bytes.extend_from_slice(&[
+            0x39, 0xd8, 0x90, 0x13, 0x9e, 0xe5, 0x35, 0x6c, 0x7e, 0xf5, 0x72, 0x21, 0x6c, 0xeb,
+            0xcd, 0x27, 0xaa, 0x41, 0xf9, 0xdf,
+        ]);
+        bytes
     }
 }

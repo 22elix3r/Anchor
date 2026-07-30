@@ -32,12 +32,14 @@ Anchor is pre-release software. The implemented safety-first subset is:
 - path-level diffs with unique exact-content rename detection;
 - structured three-state restoration planning;
 - single-path regular-file and symlink restore on Unix when safety is proven;
+- exact raw-index restore on Unix when the current index still equals the
+  session-end index (split indexes are refused);
 - refusal when current bytes, type, symlink target, mode, HEAD, or repository
   operation state is ambiguous;
 - storage integrity checking and reachability-based garbage collection.
 
 Not yet implemented: automatic text three-way merge, whole-session transactional
-rollback, index restoration, crash-journal recovery commands, empty-directory
+rollback, crash-journal recovery commands, empty-directory
 mutation, the terminal reviewer, and Windows filesystem mutation. Those cases
 are refused rather than approximated.
 
@@ -68,6 +70,7 @@ Restore one worktree-root-relative path:
 
 ```console
 anchor restore <session-id> --file src/main.rs
+anchor restore-index <session-id>
 ```
 
 The restore either applies a byte-verified inverse, reports that no action is
