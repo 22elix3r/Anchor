@@ -84,6 +84,7 @@ impl<C: ScopeClassifier> WindowsCapture<'_, C> {
         }
         let first = sorted_entries(directory, relative)?;
         if first.is_empty() && !is_root {
+            self.check_entry_limit(relative)?;
             self.entries.push(ManifestEntry {
                 path: relative.clone(),
                 node: ManifestNode::EmptyDirectory,
@@ -159,6 +160,7 @@ impl<C: ScopeClassifier> WindowsCapture<'_, C> {
         {
             return self.degrade_or_fail(path.clone(), OmissionReason::AlternateDataStream);
         }
+        self.check_entry_limit(path)?;
         self.check_limits_before_read(path, initial.size)?;
 
         for _ in 0..FILE_STABILITY_RETRIES {
@@ -219,6 +221,7 @@ impl<C: ScopeClassifier> WindowsCapture<'_, C> {
         if before != after || node.verify_path_identity().is_err() {
             return self.degrade_or_fail(path.clone(), OmissionReason::Unstable);
         }
+        self.check_entry_limit(path)?;
         self.entries.push(ManifestEntry {
             path: path.clone(),
             node: ManifestNode::Symlink {
@@ -256,16 +259,6 @@ impl<C: ScopeClassifier> WindowsCapture<'_, C> {
                 maximum: self.engine.options.limits.max_file_bytes,
             });
         }
-        let files = self
-            .statistics
-            .regular_files
-            .checked_add(1)
-            .ok_or(CaptureError::CountOverflow)?;
-        if files > self.engine.options.limits.max_files {
-            return Err(CaptureError::FileCountLimit {
-                maximum: self.engine.options.limits.max_files,
-            });
-        }
         let total = self
             .statistics
             .raw_bytes
@@ -275,6 +268,20 @@ impl<C: ScopeClassifier> WindowsCapture<'_, C> {
             return Err(CaptureError::TotalLimit {
                 size: total,
                 maximum: self.engine.options.limits.max_total_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    fn check_entry_limit(&self, path: &NativeRelativePath) -> Result<(), CaptureError> {
+        let next = u64::try_from(self.entries.len())
+            .map_err(|_| CaptureError::CountOverflow)?
+            .checked_add(1)
+            .ok_or(CaptureError::CountOverflow)?;
+        if next > self.engine.options.limits.max_entries {
+            return Err(CaptureError::EntryCountLimit {
+                path: path.clone(),
+                maximum: self.engine.options.limits.max_entries,
             });
         }
         Ok(())

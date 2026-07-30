@@ -90,6 +90,11 @@ contains:
 - repository state;
 - timestamps, child result, lifecycle state, and a bounded failure message.
 
+New sessions persist capture-policy version 2, where `max_entries` is the
+ceiling across regular files, symlinks, and empty directories. Policy version 1
+and the legacy serialized `max_files` field remain readable and are migrated to
+the same, conservatively stricter entry-ceiling meaning.
+
 The environment is not recorded. Command arguments can contain secrets and are
 therefore omitted by default. Schema-v1 and schema-v2 sessions remain readable.
 They predate complete policy freezing, so current-state capture and worktree

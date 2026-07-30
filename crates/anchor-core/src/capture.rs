@@ -81,7 +81,7 @@ impl ScopeClassifier for IncludeAll {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureLimits {
-    pub max_files: u64,
+    pub max_entries: u64,
     pub max_total_bytes: u64,
     pub max_file_bytes: u64,
 }
@@ -89,7 +89,7 @@ pub struct CaptureLimits {
 impl Default for CaptureLimits {
     fn default() -> Self {
         Self {
-            max_files: 250_000,
+            max_entries: 250_000,
             max_total_bytes: 2 * 1024 * 1024 * 1024,
             max_file_bytes: 256 * 1024 * 1024,
         }
@@ -238,6 +238,7 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
     ) -> Result<(), CaptureError> {
         let first_names = read_sorted_names(directory, relative)?;
         if first_names.is_empty() && !is_root {
+            self.check_entry_limit(relative)?;
             self.entries.push(ManifestEntry {
                 path: relative.clone(),
                 node: ManifestNode::EmptyDirectory,
@@ -335,6 +336,7 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
         name: &OsString,
         path: &NativeRelativePath,
     ) -> Result<(), CaptureError> {
+        self.check_entry_limit(path)?;
         for _ in 0..FILE_STABILITY_RETRIES {
             let before = directory
                 .symlink_metadata(name)
@@ -409,11 +411,6 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
             .regular_files
             .checked_add(1)
             .ok_or(CaptureError::CountOverflow)?;
-        if next_count > self.options.limits.max_files {
-            return Err(CaptureError::FileCountLimit {
-                maximum: self.options.limits.max_files,
-            });
-        }
         let total = self
             .statistics
             .raw_bytes
@@ -458,6 +455,7 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
         name: &OsString,
         path: &NativeRelativePath,
     ) -> Result<(), CaptureError> {
+        self.check_entry_limit(path)?;
         for _ in 0..FILE_STABILITY_RETRIES {
             let before = directory
                 .symlink_metadata(name)
@@ -496,6 +494,20 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
             }
         }
         self.degrade_or_fail(path.clone(), OmissionReason::Unstable)
+    }
+
+    fn check_entry_limit(&self, path: &NativeRelativePath) -> Result<(), CaptureError> {
+        let next = u64::try_from(self.entries.len())
+            .map_err(|_| CaptureError::CountOverflow)?
+            .checked_add(1)
+            .ok_or(CaptureError::CountOverflow)?;
+        if next > self.options.limits.max_entries {
+            return Err(CaptureError::EntryCountLimit {
+                path: path.clone(),
+                maximum: self.options.limits.max_entries,
+            });
+        }
+        Ok(())
     }
 
     fn degrade_or_fail(
@@ -695,8 +707,11 @@ pub enum CaptureError {
         size: u64,
         maximum: u64,
     },
-    #[error("capture exceeds the file-count limit {maximum}")]
-    FileCountLimit { maximum: u64 },
+    #[error("including {path:?} would exceed the manifest-entry limit {maximum}")]
+    EntryCountLimit {
+        path: NativeRelativePath,
+        maximum: u64,
+    },
     #[error("capture has {size} bytes, above total limit {maximum}")]
     TotalLimit { size: u64, maximum: u64 },
     #[error("capture file count overflow")]
@@ -788,5 +803,46 @@ mod tests {
             Completeness::Complete
         );
         assert!(result.manifest.entries().is_empty());
+    }
+
+    #[test]
+    fn empty_directories_consume_the_manifest_entry_limit() {
+        let worktree = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        fs::create_dir(worktree.path().join("a")).unwrap();
+        fs::create_dir(worktree.path().join("b")).unwrap();
+        let store = ObjectStore::open(store_root.path()).unwrap();
+        let mut options = CaptureOptions::default();
+        options.limits.max_entries = 1;
+
+        let error = CaptureEngine::new(&store, options)
+            .capture(worktree.path(), &IncludeAll)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CaptureError::EntryCountLimit { maximum: 1, .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_consume_the_manifest_entry_limit() {
+        let worktree = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("target", worktree.path().join("a")).unwrap();
+        std::os::unix::fs::symlink("target", worktree.path().join("b")).unwrap();
+        let store = ObjectStore::open(store_root.path()).unwrap();
+        let mut options = CaptureOptions::default();
+        options.limits.max_entries = 1;
+
+        let error = CaptureEngine::new(&store, options)
+            .capture(worktree.path(), &IncludeAll)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CaptureError::EntryCountLimit { maximum: 1, .. }
+        ));
     }
 }

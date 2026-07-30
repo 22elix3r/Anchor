@@ -170,10 +170,11 @@ even if live ignore files later change; drift is shown separately. Older
 session schemas remain readable but are review-only because they cannot prove a
 complete current-state scope.
 
-Default capture limits are 250,000 regular files, 2 GiB of raw content, and
-256 MiB per file. Exceeding a limit aborts before the child starts. Ignored
-files are not a security boundary: a nonignored `.env`, credential, or key file
-is stored exactly like source code.
+Default capture limits are 250,000 included manifest entries, 2 GiB of raw
+regular-file content, and 256 MiB per regular file. Regular files, symlinks, and
+empty directories all consume the entry ceiling. Exceeding a limit aborts
+before the child starts. Ignored files are not a security boundary: a
+nonignored `.env`, credential, or key file is stored exactly like source code.
 
 Command arguments are not retained by default because they commonly contain
 tokens and other secrets. Use `anchor run --record-arguments -- <command>` only

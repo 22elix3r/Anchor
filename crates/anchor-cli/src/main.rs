@@ -43,9 +43,9 @@ enum Commands {
         /// Retain all native command arguments in session metadata.
         #[arg(long)]
         record_arguments: bool,
-        /// Override the maximum number of included filesystem nodes.
-        #[arg(long)]
-        max_files: Option<u64>,
+        /// Override the maximum number of included manifest entries.
+        #[arg(long = "max-entries", visible_alias = "max-files")]
+        max_entries: Option<u64>,
         /// Override the maximum total raw bytes captured per endpoint.
         #[arg(long)]
         max_total_bytes: Option<u64>,
@@ -199,7 +199,7 @@ fn execute(cli: Cli) -> Result<i32> {
             allow_degraded,
             cross_mounts,
             record_arguments,
-            max_files,
+            max_entries,
             max_total_bytes,
             max_file_bytes,
             command,
@@ -214,7 +214,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 .into_diagnostic()
                 .wrap_err("cannot resolve Anchor configuration")?;
             let capture_policy = PolicyOverrides {
-                max_files,
+                max_entries,
                 max_total_bytes,
                 max_file_bytes,
                 allow_degraded,

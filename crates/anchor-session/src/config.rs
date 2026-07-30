@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const CONFIG_LIMIT: u64 = 1024 * 1024;
-const CAPTURE_POLICY_VERSION: u16 = 1;
+const CAPTURE_POLICY_VERSION: u16 = 2;
 
 /// Whether native command arguments are retained in session metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -19,7 +19,8 @@ pub enum CommandRecording {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CapturePolicy {
     pub version: u16,
-    pub max_files: u64,
+    #[serde(alias = "max_files")]
+    pub max_entries: u64,
     pub max_total_bytes: u64,
     pub max_file_bytes: u64,
     pub allow_degraded: bool,
@@ -32,7 +33,7 @@ impl Default for CapturePolicy {
         let limits = CaptureLimits::default();
         Self {
             version: CAPTURE_POLICY_VERSION,
-            max_files: limits.max_files,
+            max_entries: limits.max_entries,
             max_total_bytes: limits.max_total_bytes,
             max_file_bytes: limits.max_file_bytes,
             allow_degraded: false,
@@ -49,10 +50,10 @@ impl CapturePolicy {
     ///
     /// Returns [`ConfigError`] for unknown policy versions or zero-valued limits.
     pub fn validate(self) -> Result<Self, ConfigError> {
-        if self.version != CAPTURE_POLICY_VERSION {
+        if !matches!(self.version, 1 | CAPTURE_POLICY_VERSION) {
             return Err(ConfigError::UnsupportedPolicy(self.version));
         }
-        if self.max_files == 0 || self.max_total_bytes == 0 || self.max_file_bytes == 0 {
+        if self.max_entries == 0 || self.max_total_bytes == 0 || self.max_file_bytes == 0 {
             return Err(ConfigError::ZeroLimit);
         }
         Ok(self)
@@ -62,7 +63,7 @@ impl CapturePolicy {
     pub const fn capture_options(self) -> CaptureOptions {
         CaptureOptions {
             limits: CaptureLimits {
-                max_files: self.max_files,
+                max_entries: self.max_entries,
                 max_total_bytes: self.max_total_bytes,
                 max_file_bytes: self.max_file_bytes,
             },
@@ -75,7 +76,7 @@ impl CapturePolicy {
 /// Explicit command-line overrides, applied after user and project configuration.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PolicyOverrides {
-    pub max_files: Option<u64>,
+    pub max_entries: Option<u64>,
     pub max_total_bytes: Option<u64>,
     pub max_file_bytes: Option<u64>,
     pub allow_degraded: bool,
@@ -90,8 +91,8 @@ impl PolicyOverrides {
     ///
     /// Returns [`ConfigError`] if an explicit limit is zero.
     pub fn apply(self, mut policy: CapturePolicy) -> Result<CapturePolicy, ConfigError> {
-        if let Some(value) = self.max_files {
-            policy.max_files = value;
+        if let Some(value) = self.max_entries {
+            policy.max_entries = value;
         }
         if let Some(value) = self.max_total_bytes {
             policy.max_total_bytes = value;
@@ -197,7 +198,8 @@ impl ConfigFile {
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CaptureConfig {
-    max_files: Option<u64>,
+    #[serde(alias = "max_files")]
+    max_entries: Option<u64>,
     max_total_bytes: Option<u64>,
     max_file_bytes: Option<u64>,
     allow_degraded: Option<bool>,
@@ -206,9 +208,9 @@ struct CaptureConfig {
 
 impl CaptureConfig {
     fn apply_limits(self, policy: &mut CapturePolicy, only_tighten: bool) {
-        if let Some(value) = self.max_files {
-            policy.max_files = if only_tighten {
-                policy.max_files.min(value)
+        if let Some(value) = self.max_entries {
+            policy.max_entries = if only_tighten {
+                policy.max_entries.min(value)
             } else {
                 value
             };
@@ -339,7 +341,7 @@ mod tests {
         .unwrap();
         let user_policy = user.apply_user(CapturePolicy::default()).unwrap();
         let resolved = project.apply_project(user_policy).unwrap();
-        assert_eq!(resolved.max_files, 500);
+        assert_eq!(resolved.max_entries, 500);
         assert!(resolved.allow_degraded);
         assert!(resolved.cross_mounts);
         assert_eq!(resolved.command_recording, CommandRecording::FullArguments);
@@ -350,7 +352,7 @@ mod tests {
         )
         .unwrap();
         let resolved = restrictive.apply_project(resolved).unwrap();
-        assert_eq!(resolved.max_files, 100);
+        assert_eq!(resolved.max_entries, 100);
         assert!(!resolved.allow_degraded);
         assert!(!resolved.cross_mounts);
         assert_eq!(resolved.command_recording, CommandRecording::ProgramOnly);
@@ -359,7 +361,7 @@ mod tests {
     #[test]
     fn explicit_overrides_are_validated() {
         let error = PolicyOverrides {
-            max_files: Some(0),
+            max_entries: Some(0),
             ..PolicyOverrides::default()
         }
         .apply(CapturePolicy::default())
@@ -370,5 +372,46 @@ mod tests {
     #[test]
     fn rejects_unknown_fields() {
         assert!(toml::from_str::<ConfigFile>("[capture]\nmagic=true\n").is_err());
+    }
+
+    #[test]
+    fn legacy_max_files_key_maps_to_the_entry_ceiling() {
+        let config: ConfigFile = toml::from_str("[capture]\nmax_files=17\n").unwrap();
+        let policy = config.apply_user(CapturePolicy::default()).unwrap();
+        assert_eq!(policy.max_entries, 17);
+    }
+
+    #[test]
+    fn duplicate_legacy_and_current_entry_keys_are_rejected() {
+        assert!(toml::from_str::<ConfigFile>("[capture]\nmax_entries=17\nmax_files=18\n").is_err());
+    }
+
+    #[test]
+    fn persisted_policy_v1_decodes_with_conservative_entry_semantics() {
+        #[derive(Serialize)]
+        struct LegacyPolicy {
+            version: u16,
+            max_files: u64,
+            max_total_bytes: u64,
+            max_file_bytes: u64,
+            allow_degraded: bool,
+            cross_mounts: bool,
+            command_recording: CommandRecording,
+        }
+
+        let legacy = LegacyPolicy {
+            version: 1,
+            max_files: 17,
+            max_total_bytes: 100,
+            max_file_bytes: 50,
+            allow_degraded: false,
+            cross_mounts: false,
+            command_recording: CommandRecording::ProgramOnly,
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut bytes).unwrap();
+        let decoded: CapturePolicy = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+
+        assert_eq!(decoded.validate().unwrap().max_entries, 17);
     }
 }

@@ -21,7 +21,7 @@ authorization and are applied last.
 
 ```toml
 [capture]
-max_files = 250000
+max_entries = 250000
 max_total_bytes = 2147483648
 max_file_bytes = 268435456
 allow_degraded = false
@@ -39,7 +39,7 @@ Equivalent explicit overrides are:
 
 ```console
 anchor run \
-  --max-files 500000 \
+  --max-entries 500000 \
   --max-total-bytes 4294967296 \
   --max-file-bytes 536870912 \
   --allow-degraded \
@@ -50,3 +50,10 @@ anchor run \
 
 `--allow-degraded` weakens rollback completeness. A degraded manifest remains
 visible as degraded and is not eligible for automatic full rollback.
+
+`max_entries` counts every included manifest node: regular files, symlinks, and
+empty directories. Excluded nodes and nonempty directory containers do not
+count; separate hard-link names count independently because each is a distinct
+manifest path. The legacy `max_files` configuration key and `--max-files` CLI
+spelling remain accepted as aliases for `max_entries`; specifying both current
+and legacy configuration keys is an error.
