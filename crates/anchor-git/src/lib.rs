@@ -5,9 +5,11 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(windows))]
+use anchor_core::NativeString;
 use anchor_core::{
-    NativeRelativePath, NativeString, ObjectId, ObjectStore, ObservedKind, OmissionReason,
-    ScopeClassifier, ScopeDecision, ScopeError, StoreError,
+    NativeRelativePath, ObjectId, ObjectStore, ObservedKind, OmissionReason, ScopeClassifier,
+    ScopeDecision, ScopeError, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

@@ -63,9 +63,15 @@ pub fn extended_acl_present(file: BorrowedFd<'_>) -> io::Result<bool> {
     // SAFETY: `acl` remains live through the call and `entry` points to writable
     // storage for the borrowed entry pointer. Anchor does not retain it.
     match unsafe { acl_get_entry(acl.0, ACL_FIRST_ENTRY, &raw mut entry) } {
-        1 => Ok(true),
-        0 => Ok(false),
-        _ => Err(io::Error::last_os_error()),
+        0 => Ok(true),
+        _ => {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
     }
 }
 
