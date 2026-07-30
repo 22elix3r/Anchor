@@ -103,6 +103,11 @@ read captured contents. Unix store directories are forced to mode `0700`.
 Windows ACL hardening is not yet implemented, and `doctor` reports the store as
 not private there.
 
+Sparse checkout, sparse indexes, and split indexes are refused before launch.
+The current implementation cannot yet freeze index-sourced ignore files from a
+sparse worktree or retain every shared-index dependency, so claiming a complete
+snapshot in those modes would violate the completeness invariant.
+
 ## Malicious or corrupt storage
 
 Manifests and sessions are treated as untrusted:
@@ -123,7 +128,7 @@ Manifests and sessions are treated as untrusted:
 - no split-index restoration or Git history restoration;
 - no recursive dirty-submodule capture or restoration;
 - no preservation of hard-link topology, ACLs, xattrs, ownership, or timestamps;
-- no safe automatic Windows mutation yet;
+- no Windows session capture or mutation yet;
 - `SIGKILL`, power loss, or machine failure can leave an incomplete session;
 - crash-journal automatic recovery is not yet exposed as a command.
 

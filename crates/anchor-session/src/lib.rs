@@ -410,112 +410,132 @@ impl SessionRunner {
     /// Returns [`SessionError`] before launch when the safe before-snapshot cannot be completed,
     /// or after launch for process-management and persistence failures. An after-capture failure
     /// is persisted and returned in [`RunResult`] so the child outcome remains available.
+    #[allow(clippy::too_many_lines)]
     pub fn run(request: &RunRequest) -> Result<RunResult, SessionError> {
         if request.command.is_empty() {
             return Err(SessionError::EmptyCommand);
         }
-        let before_context = GitContext::discover(&request.invocation_directory)?;
-        let location = before_context.store_location();
-        let store = SessionStore::open(&location.root, location.worktree_key)?;
-        let _active_lock = store.acquire_active_lock()?;
+        #[cfg(windows)]
+        return Err(SessionError::PlatformCaptureUnsupported);
 
-        let before = capture_live_endpoint(&before_context, &store, request.capture_options)?;
-        let before_manifest = store.load_manifest(before.manifest)?;
-        let frozen_scope = before_context.frozen_scope(
-            &before_manifest,
-            store.objects(),
-            before_context.tracked_paths(),
-        )?;
-        let id = SessionId::new();
-        let mut session = Session {
-            id,
-            command: request
-                .command
-                .iter()
-                .map(|value| NativeString::from_host(value))
-                .collect(),
-            invocation_directory: NativeString::from_host(request.invocation_directory.as_os_str()),
-            worktree_root: NativeString::from_host(before_context.worktree_root().as_os_str()),
-            worktree_key: store.worktree_key.clone(),
-            before,
-            after: None,
-            started_at: Timestamp::now()?,
-            finished_at: None,
-            exit: None,
-            state: SessionState::BeforeSnapshotComplete,
-            failure: None,
-        };
-        store.save_session(&session)?;
+        #[cfg(not(windows))]
+        {
+            let before_context = GitContext::discover(&request.invocation_directory)?;
+            reject_unsupported_repository(&before_context.repository_state()?)?;
+            let location = before_context.store_location();
+            let store = SessionStore::open(&location.root, location.worktree_key)?;
+            let _active_lock = store.acquire_active_lock()?;
 
-        let interrupted = install_interrupt_flag()?;
-        let mut command = Command::new(&request.command[0]);
-        command
-            .args(&request.command[1..])
-            .current_dir(&request.invocation_directory)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                session.state = SessionState::LaunchFailed;
-                session.failure = Some(error.to_string());
-                session.finished_at = Some(Timestamp::now()?);
-                store.save_session(&session)?;
-                return Err(SessionError::ChildSpawn {
-                    session_id: id,
-                    source: error,
-                });
-            }
-        };
-        session.state = SessionState::ChildRunning;
-        store.save_session(&session)?;
+            let before = capture_live_endpoint(&before_context, &store, request.capture_options)?;
+            let before_manifest = store.load_manifest(before.manifest)?;
+            let frozen_scope = before_context.frozen_scope(
+                &before_manifest,
+                store.objects(),
+                before_context.tracked_paths(),
+            )?;
+            let id = SessionId::new();
+            let mut session = Session {
+                id,
+                command: request
+                    .command
+                    .iter()
+                    .map(|value| NativeString::from_host(value))
+                    .collect(),
+                invocation_directory: NativeString::from_host(
+                    request.invocation_directory.as_os_str(),
+                ),
+                worktree_root: NativeString::from_host(before_context.worktree_root().as_os_str()),
+                worktree_key: store.worktree_key.clone(),
+                before,
+                after: None,
+                started_at: Timestamp::now()?,
+                finished_at: None,
+                exit: None,
+                state: SessionState::BeforeSnapshotComplete,
+                failure: None,
+            };
+            store.save_session(&session)?;
 
-        let status = loop {
-            match child.wait() {
-                Ok(status) => break status,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(SessionError::ChildWait(error)),
-            }
-        };
-        let exit = ExitRecord::from_status(status);
-        session.exit = Some(exit);
-        session.state = SessionState::CapturingAfter;
-        store.save_session(&session)?;
+            let interrupted = install_interrupt_flag()?;
+            let mut command = Command::new(&request.command[0]);
+            command
+                .args(&request.command[1..])
+                .current_dir(&request.invocation_directory)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    session.state = SessionState::LaunchFailed;
+                    session.failure = Some(error.to_string());
+                    session.finished_at = Some(Timestamp::now()?);
+                    store.save_session(&session)?;
+                    return Err(SessionError::ChildSpawn {
+                        session_id: id,
+                        source: error,
+                    });
+                }
+            };
+            session.state = SessionState::ChildRunning;
+            store.save_session(&session)?;
 
-        let after_result = (|| {
-            let after_context = GitContext::discover(&request.invocation_directory)?;
-            capture_frozen_endpoint(
-                &after_context,
-                &store,
-                request.capture_options,
-                frozen_scope,
-            )
-        })();
-        session.finished_at = Some(Timestamp::now()?);
-        match after_result {
-            Ok(after) => {
-                session.after = Some(after);
-                session.state = if interrupted.load(Ordering::SeqCst) {
-                    SessionState::Interrupted
-                } else {
-                    SessionState::Completed
-                };
-                session.failure = None;
+            let status = loop {
+                match child.wait() {
+                    Ok(status) => break status,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(SessionError::ChildWait(error)),
+                }
+            };
+            let exit = ExitRecord::from_status(status);
+            session.exit = Some(exit);
+            session.state = SessionState::CapturingAfter;
+            store.save_session(&session)?;
+
+            let after_result = (|| {
+                let after_context = GitContext::discover(&request.invocation_directory)?;
+                capture_frozen_endpoint(
+                    &after_context,
+                    &store,
+                    request.capture_options,
+                    frozen_scope,
+                )
+            })();
+            session.finished_at = Some(Timestamp::now()?);
+            match after_result {
+                Ok(after) => {
+                    session.after = Some(after);
+                    session.state = if interrupted.load(Ordering::SeqCst) {
+                        SessionState::Interrupted
+                    } else {
+                        SessionState::Completed
+                    };
+                    session.failure = None;
+                }
+                Err(error) => {
+                    session.state = SessionState::AfterSnapshotFailed;
+                    session.failure = Some(error.to_string());
+                }
             }
-            Err(error) => {
-                session.state = SessionState::AfterSnapshotFailed;
-                session.failure = Some(error.to_string());
-            }
+            store.save_session(&session)?;
+            Ok(RunResult {
+                session_id: id,
+                exit,
+                state: session.state,
+                after_failure: session.failure,
+            })
         }
-        store.save_session(&session)?;
-        Ok(RunResult {
-            session_id: id,
-            exit,
-            state: session.state,
-            after_failure: session.failure,
-        })
     }
+}
+
+fn reject_unsupported_repository(state: &RepositoryState) -> Result<(), SessionError> {
+    if state.sparse_checkout || state.sparse_index {
+        return Err(SessionError::SparseRepositoryUnsupported);
+    }
+    if state.split_index {
+        return Err(SessionError::SplitIndexUnsupported);
+    }
+    Ok(())
 }
 
 fn capture_live_endpoint(
@@ -525,6 +545,7 @@ fn capture_live_endpoint(
 ) -> Result<EndpointSnapshot, SessionError> {
     for _ in 0..ENDPOINT_RETRIES {
         let repository_before = context.repository_state()?;
+        reject_unsupported_repository(&repository_before)?;
         let index_before = context.capture_index(store.objects())?;
         let scope = context.live_scope()?;
         let capture = CaptureEngine::new(store.objects(), options)
@@ -552,6 +573,7 @@ fn capture_frozen_endpoint(
     scope.include_tracked(after_context.tracked_paths().iter().cloned());
     for _ in 0..ENDPOINT_RETRIES {
         let repository_before = after_context.repository_state()?;
+        reject_unsupported_repository(&repository_before)?;
         let index_before = after_context.capture_index(store.objects())?;
         let capture = CaptureEngine::new(store.objects(), options)
             .capture(after_context.worktree_root(), &scope)?;
@@ -717,6 +739,14 @@ pub enum SessionError {
     ChildWait(io::Error),
     #[error("repository or index changed repeatedly during endpoint capture")]
     UnstableRepositoryEndpoint,
+    #[error("sparse checkout and sparse indexes are refused until scope parity is proven")]
+    SparseRepositoryUnsupported,
+    #[error("split indexes are refused until shared-index dependencies are captured")]
+    SplitIndexUnsupported,
+    #[error(
+        "Windows capture is refused until reparse-point containment and ACL handling are proven"
+    )]
+    PlatformCaptureUnsupported,
     #[error("system clock is before the Unix epoch")]
     ClockBeforeEpoch,
     #[error("invalid storage layout")]
@@ -774,6 +804,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn records_before_and_after_around_a_command() {
         let root = repository();
         let script = root.path().join("make-change.sh");

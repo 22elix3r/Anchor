@@ -113,11 +113,11 @@ See [Safety and threat model](docs/safety.md) and
 |---|---|---|
 | Linux | Supported | Experimental single-path |
 | macOS | Supported | Experimental single-path |
-| Windows | Experimental | Refused |
+| Windows | Wire-format and core tests only | Refused |
 
-Windows paths are represented losslessly from the start. Mutation remains
-disabled until no-replace replacement, reparse-point containment, ACLs, and
-console behavior have dedicated tests.
+Windows paths are represented losslessly from the start. Session capture and
+mutation are refused until reparse-point containment, private ACL creation,
+no-replace replacement, and console behavior have dedicated tests.
 
 ## Contributing
 

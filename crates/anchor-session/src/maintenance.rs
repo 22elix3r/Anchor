@@ -226,6 +226,7 @@ pub enum MaintenanceError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(windows))]
     use std::ffi::OsString;
 
     use anchor_core::CaptureOptions;
@@ -248,6 +249,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn doctor_verifies_reachable_data_and_gc_keeps_it() {
         let root = repository();
         fs::write(root.path().join("file"), b"before").unwrap();
@@ -286,19 +288,12 @@ mod tests {
         assert!(!store.objects().object_path(object).exists());
     }
 
+    #[cfg(not(windows))]
     fn change_command() -> Vec<OsString> {
-        if cfg!(windows) {
-            vec![
-                OsString::from("cmd"),
-                OsString::from("/C"),
-                OsString::from("echo after>file"),
-            ]
-        } else {
-            vec![
-                OsString::from("sh"),
-                OsString::from("-c"),
-                OsString::from("printf after > file"),
-            ]
-        }
+        vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("printf after > file"),
+        ]
     }
 }
