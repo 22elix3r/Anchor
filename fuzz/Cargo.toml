@@ -10,7 +10,9 @@ license = "MIT OR Apache-2.0"
 cargo-fuzz = true
 
 [dependencies]
-fence-core = { path = "../crates/fence-core" }
+fence-core = { path = "../crates/fence-core", features = ["fuzzing"] }
+fence-session = { path = "../crates/fence-session", features = ["fuzzing"] }
+imara-diff = { package = "gix-imara-diff", version = "0.2.4", features = ["unified_diff"] }
 libfuzzer-sys = "0.4.10"
 
 [[bin]]
@@ -23,6 +25,55 @@ bench = false
 [[bin]]
 name = "native_path_decode"
 path = "fuzz_targets/native_path_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_decode"
+path = "fuzz_targets/session_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frozen_policy_decode"
+path = "fuzz_targets/frozen_policy_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "restore_plan_decode"
+path = "fuzz_targets/restore_plan_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_decode"
+path = "fuzz_targets/journal_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "object_envelope_decode"
+path = "fuzz_targets/object_envelope_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "restore_plan_calculate"
+path = "fuzz_targets/restore_plan_calculate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diff_render"
+path = "fuzz_targets/diff_render.rs"
 test = false
 doc = false
 bench = false
