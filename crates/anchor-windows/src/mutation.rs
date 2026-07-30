@@ -9,7 +9,8 @@ use std::ptr;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile,
+    NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     GENERIC_READ, GENERIC_WRITE, HANDLE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING,
@@ -19,9 +20,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_DELETE_CHILD, FILE_DISPOSITION_FLAG_DELETE,
     FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_INFO_EX,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_WRITE_ATTRIBUTES, FileDispositionInfoEx, FileRenameInfo, SYNCHRONIZE,
-    SetFileInformationByHandle,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_WRITE_ATTRIBUTES, FileDispositionInfoEx, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
@@ -369,16 +369,15 @@ fn rename_handle(
         .checked_mul(2)
         .ok_or(WindowsError::TooLarge("rename filename"))?;
     // Windows requires the buffer to contain the complete declared structure plus the variable
-    // filename bytes. Using only `offset_of(FileName) + name_bytes` is rejected with
-    // ERROR_INVALID_PARAMETER even though the payload itself would fit.
-    let total = size_of::<FILE_RENAME_INFO>()
+    // filename bytes.
+    let total = size_of::<FILE_RENAME_INFORMATION>()
         .checked_add(name_bytes)
         .ok_or(WindowsError::TooLarge("rename information"))?;
     let mut buffer = vec![0_usize; total.div_ceil(size_of::<usize>())];
-    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     // SAFETY: The aligned buffer has room for the fixed header and every filename unit.
     unsafe {
-        ptr::write(info, FILE_RENAME_INFO::default());
+        ptr::write(info, FILE_RENAME_INFORMATION::default());
         (*info).Anonymous.ReplaceIfExists = false;
         (*info).RootDirectory = raw_handle(destination_directory);
         (*info).FileNameLength =
@@ -389,17 +388,23 @@ fn rename_handle(
             units.len(),
         );
     }
-    // SAFETY: `buffer` is a valid variable-sized FILE_RENAME_INFO and the source has DELETE.
-    if unsafe {
-        SetFileInformationByHandle(
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: `buffer` is a valid variable-sized FILE_RENAME_INFORMATION, both rooted handles
+    // remain live, and the source was opened with DELETE access.
+    let result = unsafe {
+        NtSetInformationFile(
             raw_handle(source),
-            FileRenameInfo,
+            ptr::from_mut(&mut status),
             buffer.as_ptr().cast::<c_void>(),
             u32::try_from(total).map_err(|_| WindowsError::TooLarge("rename information"))?,
+            FileRenameInformation,
         )
-    } == 0
-    {
-        return Err(io_error("SetFileInformationByHandle(FileRenameInfo)"));
+    };
+    if result < 0 {
+        return Err(WindowsError::NtStatus {
+            operation: "NtSetInformationFile(FileRenameInformation)",
+            status: result,
+        });
     }
     Ok(())
 }
