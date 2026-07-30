@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use atomic_write_file::AtomicWriteFile;
 use fence_core::{
     CaptureEngine, CaptureOptions, Completeness, Coverage, Manifest, ManifestEntry, ManifestNode,
     NativeRelativePath, NativeString, ObjectStore, ObservedKind, ScopeClassifier, ScopeDecision,
@@ -11,7 +12,6 @@ use fence_core::{
 };
 use fence_git::{GitContext, IndexCapture};
 use fence_windows::{DirectoryHandle, MutationRoot, SymbolicLinkData};
-use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

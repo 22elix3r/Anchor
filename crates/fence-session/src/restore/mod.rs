@@ -1,5 +1,3 @@
-#[cfg(all(test, unix))]
-use std::cell::Cell;
 use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::ffi::{OsStr, OsString};
@@ -8,17 +6,17 @@ use std::fs;
 use std::io;
 #[cfg(unix)]
 use std::io::Cursor;
-#[cfg(all(test, unix))]
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
+use cap_std::ambient_authority;
+#[cfg(unix)]
+use cap_std::fs::{Dir, OpenOptions};
+#[cfg(unix)]
 use fence_core::ObjectStore;
 use fence_core::{
-    CaptureEngine, ConflictReason, Manifest, ManifestEntry, ManifestId, ManifestNode,
-    NativeRelativePath, NoChangeReason, ObjectId, ObservedKind, RestoreConflict, RestoreOutcome,
-    RestorePlan, ScopeClassifier, ScopeDecision, ScopeError, TextMergeConflict, TextMergeLimits,
-    TextMergeResult, inverse_three_way_text_merge,
+    CaptureEngine, ConflictReason, ManifestEntry, ManifestId, ManifestNode, NativeRelativePath,
+    ObjectId, RestoreOutcome, RestorePlan,
 };
 #[cfg(unix)]
 use fence_core::{
@@ -26,10 +24,6 @@ use fence_core::{
     platform_managed_directory_metadata_equal, platform_managed_metadata_equal,
 };
 use fence_git::{GitContext, IndexCapture};
-#[cfg(unix)]
-use cap_std::ambient_authority;
-#[cfg(unix)]
-use cap_std::fs::{Dir, OpenOptions};
 use thiserror::Error;
 #[cfg(unix)]
 use uuid::Uuid;
@@ -40,11 +34,18 @@ use crate::restore_plan::{
 use crate::{SessionError, SessionId, SessionStore};
 
 #[cfg(windows)]
-#[path = "restore_windows.rs"]
 mod windows;
 
+#[cfg(all(test, unix))]
+mod fault;
 #[cfg(unix)]
 mod journal;
+mod planning;
+mod types;
+#[cfg(all(test, unix))]
+use fault::{
+    BatchFaultPoint, inject_batch_fault, maybe_inject_batch_fault, pause_subprocess_at_boundary,
+};
 #[cfg(all(test, unix))]
 use journal::JournalNode;
 #[cfg(unix)]
@@ -53,130 +54,14 @@ use journal::{
     BatchRestoreJournal, FILE_JOURNAL_SCHEMA, IndexRestoreJournal, JournalPresence, JournalState,
     MAX_JOURNAL_BYTES, RestoreJournal, save_batch_journal, save_index_journal, save_journal,
 };
-
-#[cfg(all(test, unix))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BatchFaultPoint {
-    Prepared,
-    FirstStaged,
-    Staged,
-    FirstEvacuated,
-    Evacuated,
-    FirstInstalled,
-    Installed,
-    FirstVerified,
-    Verified,
-}
-
-#[cfg(all(test, unix))]
-thread_local! {
-    static BATCH_FAULT_POINT: Cell<Option<BatchFaultPoint>> = const { Cell::new(None) };
-}
-
-#[cfg(all(test, unix))]
-fn inject_batch_fault(point: BatchFaultPoint) {
-    BATCH_FAULT_POINT.set(Some(point));
-}
-
-#[cfg(all(test, unix))]
-fn maybe_inject_batch_fault(point: BatchFaultPoint) -> Result<(), RestoreError> {
-    if BATCH_FAULT_POINT.get() == Some(point) {
-        BATCH_FAULT_POINT.set(None);
-        return Err(RestoreError::InjectedBatchCrash);
-    }
-    Ok(())
-}
-
-#[cfg(all(test, unix))]
-fn pause_subprocess_at_boundary(boundary: &str) {
-    if std::env::var_os("FENCE_CRASH_BOUNDARY").as_deref() != Some(OsStr::new(boundary)) {
-        return;
-    }
-    let marker =
-        std::env::var_os("FENCE_CRASH_MARKER").expect("crash helper requires FENCE_CRASH_MARKER");
-    let mut file = fs::File::create(marker).expect("crash helper could not create marker");
-    file.write_all(boundary.as_bytes())
-        .expect("crash helper could not write marker");
-    file.sync_all()
-        .expect("crash helper could not synchronize marker");
-    loop {
-        std::thread::park_timeout(std::time::Duration::from_secs(1));
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RestoreApplyResult {
-    Applied {
-        session_id: SessionId,
-        path: NativeRelativePath,
-        merged: bool,
-    },
-    TextMergeAvailable {
-        session_id: SessionId,
-        path: NativeRelativePath,
-        current_object: ObjectId,
-        current_raw_size: u64,
-        merged_object: ObjectId,
-        merged_raw_size: u64,
-    },
-    NoChange {
-        reason: NoChangeReason,
-    },
-    Conflict {
-        reason: ConflictReason,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IndexRestoreResult {
-    Applied,
-    NoChange,
-    Conflict,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum TextMergeMode {
-    #[default]
-    Disabled,
-    Preview,
-    Apply {
-        expected_object: ObjectId,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WholeRestoreMode {
-    Preview,
-    Apply { expected_current: ManifestId },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WholeRestoreResult {
-    Preview {
-        current_manifest: ManifestId,
-        writes: u64,
-        no_changes: u64,
-    },
-    Applied {
-        paths: u64,
-    },
-    Conflicts {
-        conflicts: Vec<WholeRestoreConflict>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WholeRestoreConflict {
-    pub path: NativeRelativePath,
-    pub reason: ConflictReason,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TransactionRecoveryReport {
-    pub rolled_back: Vec<String>,
-    pub completed: Vec<String>,
-    pub skipped_other_worktrees: u64,
-}
+use planning::{
+    BatchWrite, MergeResolution, SelectedScope, index_is_split, merge_regular_conflict, node_kind,
+    validate_manifest_mutation_paths, validate_mutation_path,
+};
+pub use types::{
+    IndexRestoreResult, RestoreApplyResult, TextMergeMode, TransactionRecoveryReport,
+    WholeRestoreConflict, WholeRestoreMode, WholeRestoreResult,
+};
 
 #[derive(Debug, Default)]
 pub struct TransactionRecoveryService;
@@ -595,195 +480,6 @@ impl RestoreService {
         )?;
         Ok(IndexRestoreResult::Applied)
     }
-}
-
-struct MergeCandidate {
-    desired: ManifestEntry,
-    base_object: ObjectId,
-    session_object: ObjectId,
-    current_object: ObjectId,
-    current_raw_size: u64,
-    merged_object: ObjectId,
-    merged_raw_size: u64,
-}
-
-enum MergeResolution {
-    Clean(Box<MergeCandidate>),
-    Conflict(ConflictReason),
-}
-
-fn merge_regular_conflict(
-    conflict: &RestoreConflict,
-    store: &SessionStore,
-) -> Result<MergeResolution, RestoreError> {
-    let (Some(base), Some(session), Some(current)) =
-        (&conflict.base, &conflict.session, &conflict.current)
-    else {
-        return Ok(MergeResolution::Conflict(
-            ConflictReason::TextMergeUnsupported,
-        ));
-    };
-    let (
-        ManifestNode::Regular {
-            object: base_object,
-            raw_size: base_size,
-            unix_exec_bits: base_unix_mode,
-            windows_readonly: base_windows_readonly,
-        },
-        ManifestNode::Regular {
-            object: session_object,
-            raw_size: session_size,
-            unix_exec_bits: session_unix_mode,
-            windows_readonly: session_windows_readonly,
-        },
-        ManifestNode::Regular {
-            object: current_object,
-            raw_size: current_size,
-            unix_exec_bits: current_unix_mode,
-            windows_readonly: current_windows_readonly,
-        },
-    ) = (&base.node, &session.node, &current.node)
-    else {
-        return Ok(MergeResolution::Conflict(
-            ConflictReason::TextMergeUnsupported,
-        ));
-    };
-    let Some(desired_unix_mode) =
-        inverse_scalar(*base_unix_mode, *session_unix_mode, *current_unix_mode)
-    else {
-        return Ok(MergeResolution::Conflict(ConflictReason::ModeDrifted));
-    };
-    let Some(desired_windows_readonly) = inverse_scalar(
-        *base_windows_readonly,
-        *session_windows_readonly,
-        *current_windows_readonly,
-    ) else {
-        return Ok(MergeResolution::Conflict(ConflictReason::ModeDrifted));
-    };
-    let limits = TextMergeLimits::default();
-    let base_bytes = store.objects().get(*base_object, *base_size)?;
-    let session_bytes = store.objects().get(*session_object, *session_size)?;
-    let current_bytes = store.objects().get(*current_object, *current_size)?;
-    match inverse_three_way_text_merge(&base_bytes, &session_bytes, &current_bytes, limits)? {
-        TextMergeResult::Clean(bytes) => {
-            let merged_raw_size =
-                u64::try_from(bytes.len()).map_err(|_| RestoreError::MergedFileTooLarge)?;
-            let merged_object = store.objects().put_bytes(&bytes)?;
-            Ok(MergeResolution::Clean(Box::new(MergeCandidate {
-                desired: ManifestEntry {
-                    path: current.path.clone(),
-                    node: ManifestNode::Regular {
-                        object: merged_object,
-                        raw_size: merged_raw_size,
-                        unix_exec_bits: desired_unix_mode,
-                        windows_readonly: desired_windows_readonly,
-                    },
-                    safety: current.safety.clone(),
-                },
-                base_object: *base_object,
-                session_object: *session_object,
-                current_object: *current_object,
-                current_raw_size: *current_size,
-                merged_object,
-                merged_raw_size,
-            })))
-        }
-        TextMergeResult::Conflict(reason) => Ok(MergeResolution::Conflict(match reason {
-            TextMergeConflict::OverlappingEdits => ConflictReason::TextMergeOverlaps,
-            TextMergeConflict::InputTooLarge | TextMergeConflict::OutputTooLarge => {
-                ConflictReason::TextMergeTooLarge
-            }
-            TextMergeConflict::NotUtf8 | TextMergeConflict::ContainsNul => {
-                ConflictReason::TextMergeUnsupported
-            }
-        })),
-    }
-}
-
-fn inverse_scalar<T: Copy + Eq>(base: T, session: T, current: T) -> Option<T> {
-    if base == session || current == base {
-        Some(current)
-    } else if current == session {
-        Some(base)
-    } else {
-        None
-    }
-}
-
-fn index_is_split(index: &IndexCapture) -> bool {
-    matches!(
-        index,
-        IndexCapture::Present {
-            summary: fence_git::IndexSummary {
-                split_index: true,
-                ..
-            },
-            ..
-        }
-    )
-}
-
-struct SelectedScope {
-    selected: NativeRelativePath,
-    expected_kind: Option<ObservedKind>,
-}
-
-impl ScopeClassifier for SelectedScope {
-    fn classify(
-        &self,
-        path: &NativeRelativePath,
-        kind: ObservedKind,
-    ) -> Result<ScopeDecision, ScopeError> {
-        if path == &self.selected {
-            if self.expected_kind.is_some_and(|expected| expected != kind) {
-                return Ok(ScopeDecision::Boundary(
-                    fence_core::OmissionReason::UnsupportedType,
-                ));
-            }
-            return Ok(ScopeDecision::Include);
-        }
-        if self.selected.components().starts_with(path.components()) {
-            return Ok(ScopeDecision::Include);
-        }
-        Ok(ScopeDecision::Exclude)
-    }
-}
-
-fn node_kind(node: &ManifestNode) -> ObservedKind {
-    match node {
-        ManifestNode::Regular { .. } => ObservedKind::Regular,
-        ManifestNode::Symlink { .. } => ObservedKind::Symlink,
-        ManifestNode::EmptyDirectory => ObservedKind::Directory,
-    }
-}
-
-fn validate_manifest_mutation_paths(
-    context: &GitContext,
-    policy: &fence_git::FrozenGitPolicy,
-    manifest: &Manifest,
-) -> Result<(), RestoreError> {
-    for entry in manifest.entries() {
-        validate_mutation_path(context, policy, &entry.path)?;
-    }
-    Ok(())
-}
-
-fn validate_mutation_path(
-    context: &GitContext,
-    policy: &fence_git::FrozenGitPolicy,
-    path: &NativeRelativePath,
-) -> Result<(), RestoreError> {
-    if context.is_protected_mutation_path(policy, path) {
-        return Err(RestoreError::ProtectedWorktreePath(path.clone()));
-    }
-    Ok(())
-}
-
-#[derive(Clone)]
-struct BatchWrite {
-    pub(super) path: NativeRelativePath,
-    pub(super) expected: Option<ManifestEntry>,
-    pub(super) desired: Option<ManifestEntry>,
 }
 
 #[cfg(unix)]
@@ -3306,9 +3002,7 @@ mod tests {
                 path: selected(b"file"),
                 stage_name: stage_text.clone(),
                 backup_name: Some(backup_text.clone()),
-                worktree_root: Some(fence_core::NativeString::from_host(
-                    root.path().as_os_str(),
-                )),
+                worktree_root: Some(fence_core::NativeString::from_host(root.path().as_os_str())),
                 worktree_key: Some(store.worktree_key.clone()),
                 expected: Some(JournalPresence::Present(JournalNode::from_entry(expected))),
                 desired: Some(JournalPresence::Present(JournalNode::from_entry(desired))),

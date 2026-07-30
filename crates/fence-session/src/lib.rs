@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use atomic_write_file::AtomicWriteFile;
 use fence_core::{
     CaptureEngine, CaptureOptions, CaptureStatistics, Manifest, ManifestError, ManifestId,
     NativeString, ObjectStore, StoreError,
@@ -27,7 +28,6 @@ use fence_core::{
 use fence_git::{
     FrozenGitPolicy, GitContext, GitError, IndexCapture, PolicyDrift, RepositoryState,
 };
-use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;

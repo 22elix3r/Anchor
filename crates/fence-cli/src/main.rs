@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 
+use clap::{Parser, Subcommand, ValueEnum};
 use fence_core::{
     ChangeKind, ManifestChange, ManifestDiff, ManifestId, ManifestNode, NativeRelativePath,
     NativeString, ObjectId, ObjectStore, PathEncoding,
@@ -15,7 +16,6 @@ use fence_session::{
     SessionInspection, SessionRunner, SessionStore, TextMergeMode, TransactionRecoveryService,
     WholeRestoreMode, WholeRestoreResult,
 };
-use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
 use serde::Serialize;
 
@@ -1266,9 +1266,10 @@ fn review_content(
                 text.lines().map(sanitize_diff_text).collect(),
             ))
         }
-        ManifestNode::Symlink { target, .. } => Ok(fence_tui::ReviewContent::Description(
-            format!("symlink → {}", display_native(target)),
-        )),
+        ManifestNode::Symlink { target, .. } => Ok(fence_tui::ReviewContent::Description(format!(
+            "symlink → {}",
+            display_native(target)
+        ))),
         ManifestNode::EmptyDirectory => Ok(fence_tui::ReviewContent::Description(
             "empty directory".to_owned(),
         )),

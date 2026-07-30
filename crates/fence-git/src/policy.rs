@@ -4,16 +4,16 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(windows))]
+use cap_std::ambient_authority;
+#[cfg(not(windows))]
+use cap_std::fs::{Dir, Metadata};
 use fence_core::{
     NativeRelativePath, NativeString, ObjectId, ObjectStore, ObservedKind, OmissionReason,
     ScopeClassifier, ScopeDecision,
 };
 #[cfg(windows)]
 use fence_windows::{DirectoryEntry, DirectoryHandle, NodeHandle, NodeKind, RootHandle};
-#[cfg(not(windows))]
-use cap_std::ambient_authority;
-#[cfg(not(windows))]
-use cap_std::fs::{Dir, Metadata};
 use serde::{Deserialize, Serialize};
 
 use super::{FrozenGitScope, GitContext, GitError, MAX_IGNORE_BYTES, read_stable_bounded};

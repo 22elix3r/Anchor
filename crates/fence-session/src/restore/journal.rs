@@ -1,9 +1,9 @@
 use std::io::Write as _;
 use std::path::Path;
 
+use atomic_write_file::AtomicWriteFile;
 use fence_core::{ManifestEntry, ManifestNode, NativeRelativePath, ObjectId};
 use fence_git::IndexCapture;
-use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
