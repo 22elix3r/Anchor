@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 #[cfg(unix)]
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -29,6 +29,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{SessionError, SessionId, SessionStore};
+
+#[cfg(unix)]
+const MAX_JOURNAL_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RestoreApplyResult {
@@ -67,7 +70,9 @@ impl RestoreService {
         session_id: SessionId,
         selected: NativeRelativePath,
     ) -> Result<RestoreApplyResult, RestoreError> {
+        let _store_lease = store.acquire_store_read_lease()?;
         let _lock = store.acquire_active_lock()?;
+        ensure_no_unresolved_transactions(store.root())?;
         let session = store.load_session(session_id)?;
         let after = session
             .after
@@ -143,7 +148,9 @@ impl RestoreService {
         store: &SessionStore,
         session_id: SessionId,
     ) -> Result<IndexRestoreResult, RestoreError> {
+        let _store_lease = store.acquire_store_read_lease()?;
         let _lock = store.acquire_active_lock()?;
+        ensure_no_unresolved_transactions(store.root())?;
         let session = store.load_session(session_id)?;
         let after = session
             .after
@@ -256,16 +263,17 @@ fn apply_one(
         .join("transactions")
         .join(transaction_id.to_string());
     private_transaction_dir(&transaction_path)?;
-    let transaction = Dir::open_ambient_dir(&transaction_path, ambient_authority())?;
     let stage_name_text = format!(".anchor-stage-{transaction_id}");
     let stage_name = OsString::from(&stage_name_text);
-    let backup_name = OsStr::new("backup");
+    let backup_name_text = format!(".anchor-backup-{transaction_id}");
+    let backup_name = OsString::from(&backup_name_text);
     let journal_path = transaction_path.join("journal.cbor");
     let mut journal = RestoreJournal {
-        schema: 1,
+        schema: 2,
         session_id,
         path: path.clone(),
         stage_name: stage_name_text,
+        backup_name: Some(backup_name_text),
         state: JournalState::Prepared,
     };
     save_journal(&journal_path, &journal)?;
@@ -276,14 +284,14 @@ fn apply_one(
 
     let had_current = expected.is_some();
     if had_current {
-        if let Err(error) = rename_noreplace(&parent, &name, &transaction, backup_name) {
+        if let Err(error) = rename_noreplace(&parent, &name, &parent, &backup_name) {
             cleanup_stage(&parent, &stage_name, desired);
             return Err(RestoreError::Evacuation(error));
         }
         journal.state = JournalState::Evacuated;
         save_journal(&journal_path, &journal)?;
-        if !verify_node(&transaction, backup_name, expected, store.objects())? {
-            let rollback = rename_noreplace(&transaction, backup_name, &parent, &name);
+        if !verify_node(&parent, &backup_name, expected, store.objects())? {
+            let rollback = rename_noreplace(&parent, &backup_name, &parent, &name);
             journal.state = JournalState::NeedsRecovery;
             save_journal(&journal_path, &journal)?;
             cleanup_stage(&parent, &stage_name, desired);
@@ -301,7 +309,7 @@ fn apply_one(
             ..
         }) = desired
         {
-            apply_stage_mode(&parent, &stage_name, &transaction, backup_name, *bits)?;
+            apply_stage_mode(&parent, &stage_name, &backup_name, *bits)?;
         }
     } else if parent.symlink_metadata(&name).is_ok() {
         cleanup_stage(&parent, &stage_name, desired);
@@ -311,7 +319,7 @@ fn apply_one(
     if desired.is_some() {
         if let Err(error) = rename_noreplace(&parent, &stage_name, &parent, &name) {
             let rollback = if had_current {
-                rename_noreplace(&transaction, backup_name, &parent, &name)
+                rename_noreplace(&parent, &backup_name, &parent, &name)
             } else {
                 Ok(())
             };
@@ -334,7 +342,7 @@ fn apply_one(
     save_journal(&journal_path, &journal)?;
 
     if had_current {
-        remove_node(&transaction, backup_name, expected)?;
+        remove_node(&parent, &backup_name, expected)?;
     }
     journal.state = JournalState::Complete;
     save_journal(&journal_path, &journal)?;
@@ -361,6 +369,11 @@ fn apply_index(
     let mut lock_file = parent
         .open_with(lock_name, &options)
         .map_err(RestoreError::IndexLock)?;
+    if !verify_index(&parent, name, expected, store.objects())? {
+        drop(lock_file);
+        let _cleanup = parent.remove_file(lock_name);
+        return Err(RestoreError::CurrentIndexChanged);
+    }
     if let IndexCapture::Present {
         object, raw_size, ..
     } = desired
@@ -378,26 +391,27 @@ fn apply_index(
         .join("transactions")
         .join(format!("index-{transaction_id}"));
     private_transaction_dir(&transaction_path)?;
-    let transaction = Dir::open_ambient_dir(&transaction_path, ambient_authority())?;
-    let backup_name = OsStr::new("index.backup");
+    let backup_name_text = format!(".anchor-index-backup-{transaction_id}");
+    let backup_name = OsString::from(&backup_name_text);
     let journal_path = transaction_path.join("journal.cbor");
     let mut journal = IndexRestoreJournal {
-        schema: 1,
+        schema: 2,
         session_id,
+        backup_name: Some(backup_name_text),
         state: JournalState::Prepared,
     };
     save_index_journal(&journal_path, &journal)?;
 
     let had_current = matches!(expected, IndexCapture::Present { .. });
     if had_current {
-        if let Err(error) = rename_noreplace(&parent, name, &transaction, backup_name) {
+        if let Err(error) = rename_noreplace(&parent, name, &parent, &backup_name) {
             let _cleanup = parent.remove_file(lock_name);
             return Err(RestoreError::Evacuation(error));
         }
         journal.state = JournalState::Evacuated;
         save_index_journal(&journal_path, &journal)?;
-        if !verify_index(&transaction, backup_name, expected, store.objects())? {
-            let rollback = rename_noreplace(&transaction, backup_name, &parent, name);
+        if !verify_index(&parent, &backup_name, expected, store.objects())? {
+            let rollback = rename_noreplace(&parent, &backup_name, &parent, name);
             let _cleanup = parent.remove_file(lock_name);
             journal.state = JournalState::NeedsRecovery;
             save_index_journal(&journal_path, &journal)?;
@@ -414,7 +428,7 @@ fn apply_index(
     if matches!(desired, IndexCapture::Present { .. }) {
         if let Err(error) = rename_noreplace(&parent, lock_name, &parent, name) {
             let rollback = if had_current {
-                rename_noreplace(&transaction, backup_name, &parent, name)
+                rename_noreplace(&parent, &backup_name, &parent, name)
             } else {
                 Ok(())
             };
@@ -438,7 +452,7 @@ fn apply_index(
     journal.state = JournalState::Verified;
     save_index_journal(&journal_path, &journal)?;
     if had_current {
-        transaction.remove_file(backup_name)?;
+        parent.remove_file(&backup_name)?;
     }
     journal.state = JournalState::Complete;
     save_index_journal(&journal_path, &journal)?;
@@ -552,12 +566,11 @@ fn stage_node(
 fn apply_stage_mode(
     parent: &Dir,
     stage: &OsStr,
-    transaction: &Dir,
     backup: &OsStr,
     execute_bits: u8,
 ) -> Result<(), RestoreError> {
     use cap_std::fs::{MetadataExt as _, PermissionsExt as _};
-    let backup_mode = transaction.symlink_metadata(backup)?.mode();
+    let backup_mode = parent.symlink_metadata(backup)?.mode();
     parent.set_permissions(
         stage,
         cap_std::fs::Permissions::from_mode((backup_mode & !0o111) | execute_mode(execute_bits)),
@@ -684,6 +697,8 @@ struct RestoreJournal {
     session_id: SessionId,
     path: NativeRelativePath,
     stage_name: String,
+    #[serde(default)]
+    backup_name: Option<String>,
     state: JournalState,
 }
 
@@ -692,11 +707,13 @@ struct RestoreJournal {
 struct IndexRestoreJournal {
     schema: u16,
     session_id: SessionId,
+    #[serde(default)]
+    backup_name: Option<String>,
     state: JournalState,
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum JournalState {
     Prepared,
     Evacuated,
@@ -704,6 +721,80 @@ enum JournalState {
     Verified,
     Complete,
     NeedsRecovery,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TransactionSummary {
+    pub total: u64,
+    pub complete: u64,
+    pub needs_recovery: u64,
+    pub unfinished: u64,
+}
+
+#[cfg(unix)]
+pub(crate) fn scan_transactions(root: &Path) -> Result<TransactionSummary, RestoreError> {
+    let transactions = root.join("transactions");
+    if !transactions.exists() {
+        return Ok(TransactionSummary::default());
+    }
+    let mut summary = TransactionSummary::default();
+    for entry in fs::read_dir(transactions)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        summary.total = summary.total.saturating_add(1);
+        let journal_path = entry.path().join("journal.cbor");
+        let metadata = match fs::metadata(&journal_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                summary.unfinished = summary.unfinished.saturating_add(1);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.len() > MAX_JOURNAL_BYTES {
+            return Err(RestoreError::JournalTooLarge(journal_path));
+        }
+        let bytes = fs::read(&journal_path)?;
+        let state = ciborium::de::from_reader::<RestoreJournal, _>(Cursor::new(&bytes))
+            .map(|journal| journal.state)
+            .or_else(|_| {
+                ciborium::de::from_reader::<IndexRestoreJournal, _>(Cursor::new(&bytes))
+                    .map(|journal| journal.state)
+            })
+            .map_err(|error| RestoreError::Journal(error.to_string()))?;
+        match state {
+            JournalState::Complete => summary.complete = summary.complete.saturating_add(1),
+            JournalState::NeedsRecovery => {
+                summary.needs_recovery = summary.needs_recovery.saturating_add(1);
+            }
+            JournalState::Prepared
+            | JournalState::Evacuated
+            | JournalState::Installed
+            | JournalState::Verified => {
+                summary.unfinished = summary.unfinished.saturating_add(1);
+            }
+        }
+    }
+    Ok(summary)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn scan_transactions(_root: &Path) -> Result<TransactionSummary, RestoreError> {
+    Ok(TransactionSummary::default())
+}
+
+pub(crate) fn ensure_no_unresolved_transactions(root: &Path) -> Result<(), RestoreError> {
+    let summary = scan_transactions(root)?;
+    if summary.total == summary.complete {
+        Ok(())
+    } else {
+        Err(RestoreError::UnresolvedTransaction {
+            needs_recovery: summary.needs_recovery,
+            unfinished: summary.unfinished,
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -740,6 +831,15 @@ pub enum RestoreError {
     VerificationFailed,
     #[error("restore journal encoding failed: {0}")]
     Journal(String),
+    #[error("restore journal exceeds its size limit: {0}")]
+    JournalTooLarge(PathBuf),
+    #[error(
+        "unresolved restore transactions block mutation ({needs_recovery} need recovery, {unfinished} unfinished)"
+    )]
+    UnresolvedTransaction {
+        needs_recovery: u64,
+        unfinished: u64,
+    },
     #[error("automatic filesystem mutation is not yet supported on this platform")]
     PlatformMutationUnsupported,
     #[error(transparent)]
@@ -815,6 +915,16 @@ mod tests {
             fs::read(root.path().join("file")).unwrap(),
             b"pre-existing human bytes"
         );
+        assert!(fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".anchor-backup-")
+        }));
+        let transactions = scan_transactions(store.root()).unwrap();
+        assert_eq!(transactions.total, 1);
+        assert_eq!(transactions.complete, 1);
     }
 
     #[test]
@@ -857,6 +967,45 @@ mod tests {
             fs::read(root.path().join(".git").join("index")).unwrap(),
             index
         );
+    }
+
+    #[test]
+    fn index_is_rechecked_after_its_lock_is_acquired() {
+        let root = repository();
+        let index_path = root.path().join(".git").join("index");
+        fs::write(&index_path, empty_v2_index()).unwrap();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let expected = context.capture_index(store.objects()).unwrap();
+        let drifted = b"post-check index bytes";
+        fs::write(&index_path, drifted).unwrap();
+
+        let error = apply_index(
+            &store,
+            SessionId::new(),
+            &index_path,
+            &expected,
+            &IndexCapture::Absent,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RestoreError::CurrentIndexChanged));
+        assert_eq!(fs::read(&index_path).unwrap(), drifted);
+        assert!(!index_path.with_extension("lock").exists());
+    }
+
+    #[test]
+    fn unfinished_transaction_blocks_new_mutations() {
+        let root = tempfile::tempdir().unwrap();
+        private_transaction_dir(&root.path().join("transactions").join("unfinished")).unwrap();
+        let error = ensure_no_unresolved_transactions(root.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            RestoreError::UnresolvedTransaction {
+                needs_recovery: 0,
+                unfinished: 1
+            }
+        ));
     }
 
     fn empty_v2_index() -> Vec<u8> {

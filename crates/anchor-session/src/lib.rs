@@ -335,6 +335,48 @@ impl SessionStore {
     /// Returns [`SessionError`] if any retained session cannot be read safely.
     pub fn list_sessions(&self) -> Result<Vec<Session>, SessionError> {
         let directory = self.root.join("sessions").join(&self.worktree_key);
+        let mut sessions = Self::list_sessions_in(&directory, &self.worktree_key)?;
+        sessions.sort_by_key(|session| session.started_at.seconds);
+        sessions.reverse();
+        Ok(sessions)
+    }
+
+    /// Hold a shared lease while reading or publishing data in the common store.
+    ///
+    /// Garbage collection takes the exclusive side of this lease, so callers that perform a
+    /// multi-step read must retain the returned value until every referenced object is consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::StoreBusy`] when an exclusive maintenance operation is active.
+    pub fn acquire_store_read_lease(&self) -> Result<StoreLease, SessionError> {
+        let file = self.open_store_lock()?;
+        fs4::FileExt::try_lock_shared(&file)
+            .map_err(|error| SessionError::StoreBusy(error.to_string()))?;
+        Ok(StoreLease { _file: file })
+    }
+
+    pub(crate) fn list_all_sessions(&self) -> Result<Vec<Session>, SessionError> {
+        let root = self.root.join("sessions");
+        let mut sessions = Vec::new();
+        for namespace in fs::read_dir(root)? {
+            let namespace = namespace?;
+            if !namespace.file_type()?.is_dir() {
+                continue;
+            }
+            let key = namespace
+                .file_name()
+                .into_string()
+                .map_err(|_| SessionError::InvalidWorktreeNamespace)?;
+            sessions.extend(Self::list_sessions_in(&namespace.path(), &key)?);
+        }
+        Ok(sessions)
+    }
+
+    fn list_sessions_in(
+        directory: &Path,
+        expected_worktree_key: &str,
+    ) -> Result<Vec<Session>, SessionError> {
         let mut sessions = Vec::new();
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
@@ -347,11 +389,13 @@ impl SessionStore {
                 let bytes = bounded_read(&entry.path(), MAX_SESSION_BYTES)?;
                 let wire: SessionWire = ciborium::de::from_reader(Cursor::new(bytes))
                     .map_err(|error| SessionError::Decode(error.to_string()))?;
-                sessions.push(wire.into_session()?);
+                let session = wire.into_session()?;
+                if session.worktree_key != expected_worktree_key {
+                    return Err(SessionError::WrongWorktreeNamespace);
+                }
+                sessions.push(session);
             }
         }
-        sessions.sort_by_key(|session| session.started_at.seconds);
-        sessions.reverse();
         Ok(sessions)
     }
 
@@ -386,6 +430,28 @@ impl SessionStore {
             .map_err(|error| SessionError::ActiveSession(error.to_string()))?;
         Ok(ActiveLock { file })
     }
+
+    pub(crate) fn acquire_store_write_lease(&self) -> Result<StoreLease, SessionError> {
+        let file = self.open_store_lock()?;
+        fs4::FileExt::try_lock(&file)
+            .map_err(|error| SessionError::StoreBusy(error.to_string()))?;
+        Ok(StoreLease { _file: file })
+    }
+
+    fn open_store_lock(&self) -> Result<File, SessionError> {
+        Ok(OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.root.join("locks").join("store.activity.lock"))?)
+    }
+}
+
+/// RAII lease preventing common-store garbage collection.
+#[derive(Debug)]
+pub struct StoreLease {
+    _file: File,
 }
 
 pub(crate) struct ActiveLock {
@@ -435,7 +501,10 @@ impl SessionRunner {
             reject_unsupported_repository(&before_context.repository_state()?)?;
             let location = before_context.store_location();
             let store = SessionStore::open(&location.root, location.worktree_key)?;
+            let _store_lease = store.acquire_store_read_lease()?;
             let active_lock = store.acquire_active_lock()?;
+            restore::ensure_no_unresolved_transactions(store.root())
+                .map_err(|error| SessionError::TransactionState(error.to_string()))?;
 
             let before = capture_live_endpoint(&before_context, &store, request.capture_options)?;
             let before_manifest = store.load_manifest(before.manifest)?;
@@ -744,6 +813,10 @@ pub enum SessionError {
     EmptyCommand,
     #[error("another Anchor session is active in this worktree: {0}")]
     ActiveSession(String),
+    #[error("the shared Anchor store is busy with another operation: {0}")]
+    StoreBusy(String),
+    #[error("restore transaction state blocks a new session: {0}")]
+    TransactionState(String),
     #[error("session {session_id} could not launch its child: {source}")]
     ChildSpawn {
         session_id: SessionId,
@@ -765,6 +838,8 @@ pub enum SessionError {
     ClockBeforeEpoch,
     #[error("invalid storage layout")]
     InvalidLayout,
+    #[error("worktree namespace is not valid UTF-8")]
+    InvalidWorktreeNamespace,
     #[error("session belongs to a different worktree namespace")]
     WrongWorktreeNamespace,
     #[error("session record exceeds its encoded size limit")]
@@ -907,5 +982,18 @@ mod tests {
         ));
         child.wait().unwrap();
         assert!(store.acquire_active_lock().is_ok());
+    }
+
+    #[test]
+    fn store_read_lease_excludes_garbage_collection_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(root.path(), "worktree").unwrap();
+        let read = store.acquire_store_read_lease().unwrap();
+        assert!(matches!(
+            store.acquire_store_write_lease(),
+            Err(SessionError::StoreBusy(_))
+        ));
+        drop(read);
+        assert!(store.acquire_store_write_lease().is_ok());
     }
 }

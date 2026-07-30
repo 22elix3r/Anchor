@@ -120,6 +120,10 @@ fn execute(cli: Cli) -> Result<i32> {
         }
         Commands::Status { format } => {
             let store = current_store()?;
+            let _lease = store
+                .acquire_store_read_lease()
+                .into_diagnostic()
+                .wrap_err("Anchor storage is busy")?;
             let sessions = store
                 .list_sessions()
                 .into_diagnostic()
@@ -138,6 +142,10 @@ fn execute(cli: Cli) -> Result<i32> {
         }
         Commands::Sessions { format } => {
             let store = current_store()?;
+            let _lease = store
+                .acquire_store_read_lease()
+                .into_diagnostic()
+                .wrap_err("Anchor storage is busy")?;
             let sessions = store
                 .list_sessions()
                 .into_diagnostic()
@@ -147,12 +155,20 @@ fn execute(cli: Cli) -> Result<i32> {
         }
         Commands::Show { session, format } => {
             let store = current_store()?;
+            let _lease = store
+                .acquire_store_read_lease()
+                .into_diagnostic()
+                .wrap_err("Anchor storage is busy")?;
             let session = load_session(&store, &session)?;
             print_sessions(std::slice::from_ref(&session), format)?;
             Ok(0)
         }
         Commands::Diff { session, format } => {
             let store = current_store()?;
+            let _lease = store
+                .acquire_store_read_lease()
+                .into_diagnostic()
+                .wrap_err("Anchor storage is busy")?;
             let session = load_session(&store, &session)?;
             let Some(after) = &session.after else {
                 miette::bail!(
@@ -175,6 +191,10 @@ fn execute(cli: Cli) -> Result<i32> {
         }
         Commands::Review { session } => {
             let store = current_store()?;
+            let _lease = store
+                .acquire_store_read_lease()
+                .into_diagnostic()
+                .wrap_err("Anchor storage is busy")?;
             let session = load_session(&store, &session)?;
             let Some(after) = &session.after else {
                 miette::bail!(
@@ -260,6 +280,9 @@ fn execute(cli: Cli) -> Result<i32> {
                         "incomplete_sessions": report.incomplete_sessions,
                         "manifests_verified": report.manifests_verified,
                         "objects_verified": report.objects_verified,
+                        "transactions": report.transactions,
+                        "transactions_needing_recovery": report.transactions_needing_recovery,
+                        "unfinished_transactions": report.unfinished_transactions,
                         "repository_drift_from_latest": report.repository_drift_from_latest,
                         "store_private": report.store_private,
                     }))
@@ -270,6 +293,15 @@ fn execute(cli: Cli) -> Result<i32> {
                 println!("incomplete sessions: {}", report.incomplete_sessions);
                 println!("manifests verified: {}", report.manifests_verified);
                 println!("objects verified: {}", report.objects_verified);
+                println!("restore transactions: {}", report.transactions);
+                println!(
+                    "transactions needing recovery: {}",
+                    report.transactions_needing_recovery
+                );
+                println!(
+                    "unfinished transactions: {}",
+                    report.unfinished_transactions
+                );
                 println!(
                     "repository drift from latest: {}",
                     report.repository_drift_from_latest
@@ -278,6 +310,8 @@ fn execute(cli: Cli) -> Result<i32> {
             }
             Ok(i32::from(
                 report.incomplete_sessions > 0
+                    || report.transactions_needing_recovery > 0
+                    || report.unfinished_transactions > 0
                     || report.repository_drift_from_latest
                     || !report.store_private,
             ))

@@ -6,6 +6,7 @@ use anchor_core::{Manifest, ManifestNode, ObjectId};
 use anchor_git::{GitContext, IndexCapture};
 use thiserror::Error;
 
+use crate::restore::scan_transactions;
 use crate::{SessionError, SessionState, SessionStore};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,6 +15,9 @@ pub struct DoctorReport {
     pub incomplete_sessions: u64,
     pub manifests_verified: u64,
     pub objects_verified: u64,
+    pub transactions: u64,
+    pub transactions_needing_recovery: u64,
+    pub unfinished_transactions: u64,
     pub repository_drift_from_latest: bool,
     pub store_private: bool,
 }
@@ -39,7 +43,10 @@ impl MaintenanceService {
         store: &SessionStore,
         context: &GitContext,
     ) -> Result<DoctorReport, MaintenanceError> {
-        let sessions = store.list_sessions()?;
+        let _lease = store.acquire_store_read_lease()?;
+        let current_sessions = store.list_sessions()?;
+        let sessions = store.list_all_sessions()?;
+        let transactions = scan_transactions(store.root())?;
         let mut manifests = BTreeSet::new();
         let mut objects = BTreeSet::new();
         let mut incomplete = 0_u64;
@@ -66,7 +73,7 @@ impl MaintenanceService {
         for (id, raw_size) in &objects {
             store.objects().verify(*id, *raw_size)?;
         }
-        let repository_drift_from_latest = sessions.first().is_some_and(|session| {
+        let repository_drift_from_latest = current_sessions.first().is_some_and(|session| {
             session.after.as_ref().is_some_and(|after| {
                 context.repository_state().ok().as_ref() != Some(&after.repository)
             })
@@ -76,6 +83,9 @@ impl MaintenanceService {
             incomplete_sessions: incomplete,
             manifests_verified: u64::try_from(manifests.len()).unwrap_or(u64::MAX),
             objects_verified: u64::try_from(objects.len()).unwrap_or(u64::MAX),
+            transactions: transactions.total,
+            transactions_needing_recovery: transactions.needs_recovery,
+            unfinished_transactions: transactions.unfinished,
             repository_drift_from_latest,
             store_private: store_is_private(store.root())?,
         })
@@ -86,13 +96,21 @@ impl MaintenanceService {
     /// # Errors
     ///
     /// Returns [`MaintenanceError`] without deleting anything when retained metadata is corrupt.
-    /// The worktree mutation lock excludes active snapshot publication and restoration.
+    /// An exclusive common-store lease excludes snapshot publication, readers, and restoration in
+    /// every linked worktree sharing this store.
     pub fn gc(
         store: &SessionStore,
         dry_run: bool,
     ) -> Result<GarbageCollectionReport, MaintenanceError> {
-        let _lock = store.acquire_active_lock()?;
-        let sessions = store.list_sessions()?;
+        let _lease = store.acquire_store_write_lease()?;
+        let transactions = scan_transactions(store.root())?;
+        if transactions.total != transactions.complete {
+            return Err(MaintenanceError::UnresolvedTransactions {
+                needs_recovery: transactions.needs_recovery,
+                unfinished: transactions.unfinished,
+            });
+        }
+        let sessions = store.list_all_sessions()?;
         let mut reachable_manifests = BTreeSet::new();
         let mut reachable_objects = BTreeSet::new();
         for session in &sessions {
@@ -216,8 +234,17 @@ fn store_is_private(_root: &Path) -> Result<bool, MaintenanceError> {
 
 #[derive(Debug, Error)]
 pub enum MaintenanceError {
+    #[error(
+        "garbage collection is refused while restore transactions are unresolved ({needs_recovery} need recovery, {unfinished} unfinished)"
+    )]
+    UnresolvedTransactions {
+        needs_recovery: u64,
+        unfinished: u64,
+    },
     #[error(transparent)]
     Session(#[from] SessionError),
+    #[error(transparent)]
+    Restore(#[from] crate::RestoreError),
     #[error(transparent)]
     Store(#[from] anchor_core::StoreError),
     #[error(transparent)]
@@ -229,7 +256,10 @@ mod tests {
     #[cfg(not(windows))]
     use std::ffi::OsString;
 
-    use anchor_core::CaptureOptions;
+    use anchor_core::{
+        CaptureOptions, Completeness, Coverage, Manifest, ManifestEntry, ManifestNode,
+        NativeRelativePath, PathEncoding, SafetyObservations,
+    };
 
     use super::*;
     use crate::{RunRequest, SessionRunner};
@@ -286,6 +316,55 @@ mod tests {
         let swept = MaintenanceService::gc(&store, false).unwrap();
         assert_eq!(swept.objects_removed, 1);
         assert!(!store.objects().object_path(object).exists());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn gc_marks_sessions_from_every_linked_worktree_namespace() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"before").unwrap();
+        let result = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: change_command(),
+            capture_options: CaptureOptions::default(),
+        })
+        .unwrap();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(&location.root, &location.worktree_key).unwrap();
+        let other = SessionStore::open(&location.root, "wt-other").unwrap();
+        let object = other.objects().put_bytes(b"only-other-worktree").unwrap();
+        let manifest = Manifest::new(
+            PathEncoding::UnixBytes,
+            vec![ManifestEntry {
+                path: NativeRelativePath::new(PathEncoding::UnixBytes, vec![b"other".to_vec()])
+                    .unwrap(),
+                node: ManifestNode::Regular {
+                    object,
+                    raw_size: 19,
+                    unix_exec_bits: Some(0),
+                },
+                safety: SafetyObservations::default(),
+            }],
+            Coverage {
+                completeness: Completeness::Complete,
+                omissions: Vec::new(),
+            },
+        )
+        .unwrap();
+        let manifest_id = other.put_manifest(&manifest).unwrap();
+        let mut session = store.load_session(result.session_id).unwrap();
+        session.id = crate::SessionId::new();
+        session.worktree_key = "wt-other".to_owned();
+        session.before.manifest = manifest_id;
+        session.after = None;
+        session.state = SessionState::BeforeSnapshotComplete;
+        other.save_session(&session).unwrap();
+
+        let report = MaintenanceService::gc(&store, false).unwrap();
+        assert!(other.objects().object_path(object).exists());
+        assert!(other.load_manifest(manifest_id).is_ok());
+        assert_eq!(report.objects_removed, 0);
     }
 
     #[cfg(not(windows))]
