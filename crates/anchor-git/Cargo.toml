@@ -12,6 +12,7 @@ authors.workspace = true
 [dependencies]
 anchor-core.workspace = true
 blake3.workspace = true
+cap-std.workspace = true
 gix.workspace = true
 serde.workspace = true
 thiserror.workspace = true

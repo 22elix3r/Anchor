@@ -26,7 +26,9 @@ Anchor is pre-release software. The implemented safety-first subset is:
 - lossless Unix-byte and Windows-WTF-16 path records;
 - immutable BLAKE3-addressed, Zstandard-compressed raw-byte objects;
 - versioned CBOR manifests and session records;
-- frozen per-session capture policy with schema-v1 migration support;
+- content-addressed per-session inclusion policy freezing global excludes,
+  common `info/exclude`, in-tree ignore bytes, tracked overlays, and repository
+  boundaries;
 - read-only Git discovery, index capture, tracked-path and ignore awareness via
   `gix`;
 - stable before/after capture around inherited interactive terminal or console streams;
@@ -142,8 +144,9 @@ The default diff is `before → session end`. `--current` is `before → current
 `--drift` is `session end → current` and separately reports repository and raw
 index drift. `anchor recover` never guesses a missing session end: after it can
 acquire the worktree lock, it marks stale nonterminal records `Abandoned`.
-`anchor recover-transactions --yes` is separate: it byte-verifies and rolls
-back interrupted schema-v3 single-path/index or pre-commit batch transactions.
+`anchor recover-transactions --yes` is separate: it validates the immutable
+restore plan, byte-verifies, and rolls back interrupted single-path/index or
+pre-commit batch transactions.
 Once every batch target verified, recovery instead finishes backup cleanup
 because that state is the durable commit point. Legacy incomplete journals
 remain visible but require manual recovery because they lack sufficient state.
@@ -159,6 +162,13 @@ By default Anchor includes tracked files and nonignored untracked files. It
 excludes Git metadata, its own store, ignored files, and submodule contents. A
 root `.anchorignore` adds Git-style exclusions but cannot re-include a
 Git-ignored path. `.anchorignore` itself is captured.
+
+Anchor freezes the selected global Git excludes, common `info/exclude`, nested
+`.gitignore`, root `.anchorignore`, case mode, and repository boundaries before
+the initial capture. Session-end and current captures use those retained bytes
+even if live ignore files later change; drift is shown separately. Older
+session schemas remain readable but are review-only because they cannot prove a
+complete current-state scope.
 
 Default capture limits are 250,000 regular files, 2 GiB of raw content, and
 256 MiB per file. Exceeding a limit aborts before the child starts. Ignored

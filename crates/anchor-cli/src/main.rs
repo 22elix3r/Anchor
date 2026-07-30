@@ -8,7 +8,7 @@ use anchor_core::{
     ChangeKind, ManifestChange, ManifestDiff, ManifestId, ManifestNode, NativeRelativePath,
     NativeString, ObjectId, ObjectStore, PathEncoding,
 };
-use anchor_git::GitContext;
+use anchor_git::{GitContext, PolicyDrift};
 use anchor_session::{
     CapturePolicy, ConfigLoader, IndexRestoreResult, MaintenanceService, PolicyOverrides,
     RecoveryService, RestoreApplyResult, RestoreService, RunRequest, Session, SessionId,
@@ -847,6 +847,15 @@ fn print_sessions(sessions: &[Session], format: OutputFormat) -> Result<()> {
         if let Some(failure) = &session.failure {
             println!("  failure: {failure}");
         }
+        if let Some(drift) = session
+            .after
+            .as_ref()
+            .and_then(|endpoint| endpoint.policy_observation)
+            .map(|observation| observation.drift)
+            .filter(|drift| drift.any())
+        {
+            println!("  policy drift: {drift:?} (frozen scope remained in effect)");
+        }
     }
     Ok(())
 }
@@ -1331,6 +1340,8 @@ struct SessionJson {
     redacted_argument_count: u64,
     capture_policy: CapturePolicy,
     worktree: NativeStringJson,
+    frozen_policy: Option<String>,
+    after_policy_drift: Option<PolicyDrift>,
     before_manifest: String,
     after_manifest: Option<String>,
     exit_code: Option<i32>,
@@ -1347,6 +1358,12 @@ impl From<&Session> for SessionJson {
             redacted_argument_count: session.redacted_argument_count,
             capture_policy: session.capture_policy,
             worktree: NativeStringJson::from(&session.worktree_root),
+            frozen_policy: session.frozen_policy.map(|id| id.to_string()),
+            after_policy_drift: session
+                .after
+                .as_ref()
+                .and_then(|endpoint| endpoint.policy_observation)
+                .map(|observation| observation.drift),
             before_manifest: session.before.manifest.to_string(),
             after_manifest: session
                 .after

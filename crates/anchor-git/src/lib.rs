@@ -2,18 +2,22 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(not(windows))]
-use anchor_core::NativeString;
 use anchor_core::{
-    Manifest, ManifestNode, NativeRelativePath, ObjectId, ObjectStore, ObservedKind,
-    OmissionReason, ScopeClassifier, ScopeDecision, ScopeError, StoreError,
+    NativeRelativePath, NativeString, ObjectId, ObjectStore, ObservedKind, OmissionReason,
+    ScopeClassifier, ScopeDecision, ScopeError, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod policy;
+
+pub use policy::{
+    ExternalIgnoreOrigin, ExternalIgnorePolicy, FrozenGitPolicy, FrozenIgnoreFile,
+    FrozenIgnoreSource, PolicyBlob, PolicyDrift,
+};
 
 const MAX_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_IGNORE_BYTES: u64 = 16 * 1024 * 1024;
@@ -164,112 +168,6 @@ impl GitContext {
         })
     }
 
-    /// Compile a frozen ignore policy from the complete before manifest.
-    ///
-    /// Nested `.gitignore` and `.anchorignore` bytes are read from immutable Anchor objects, so
-    /// later edits to those files do not change the session scope.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GitError`] when an ignore source is missing, corrupt, or cannot be compiled.
-    pub fn frozen_scope(
-        &self,
-        before: &Manifest,
-        store: &ObjectStore,
-        endpoint_tracked: &BTreeSet<NativeRelativePath>,
-    ) -> Result<FrozenGitScope, GitError> {
-        let mut git_search = gix::ignore::Search::default();
-        let mut anchor_search = gix::ignore::Search::default();
-        let parser = gix::ignore::search::Ignore::default();
-
-        if let Some(global) = self.global_ignore_path()? {
-            add_external_ignore(&mut git_search, &global)?;
-        }
-        add_external_ignore(
-            &mut git_search,
-            &self.common_dir.join("info").join("exclude"),
-        )?;
-
-        let mut in_tree_sources = before
-            .entries()
-            .iter()
-            .filter_map(|entry| {
-                let filename = entry.path.to_host_path().ok()?.file_name()?.to_owned();
-                let kind = if filename == OsStr::new(".gitignore") {
-                    IgnoreSourceKind::Git
-                } else if filename == OsStr::new(".anchorignore") {
-                    if entry.path.components().len() != 1 {
-                        return None;
-                    }
-                    IgnoreSourceKind::Anchor
-                } else {
-                    return None;
-                };
-                let ManifestNode::Regular {
-                    object, raw_size, ..
-                } = &entry.node
-                else {
-                    return None;
-                };
-                Some((kind, entry.path.clone(), *object, *raw_size))
-            })
-            .collect::<Vec<_>>();
-        in_tree_sources.sort_by(|left, right| {
-            left.1
-                .components()
-                .len()
-                .cmp(&right.1.components().len())
-                .then_with(|| left.1.cmp(&right.1))
-        });
-        for (kind, path, object, raw_size) in in_tree_sources {
-            let bytes = store.get(object, raw_size)?;
-            let host = path
-                .to_host_path()
-                .map_err(|error| GitError::Ignore(error.to_string()))?;
-            let search = match kind {
-                IgnoreSourceKind::Git => &mut git_search,
-                IgnoreSourceKind::Anchor => &mut anchor_search,
-            };
-            search.add_patterns_buffer(
-                &bytes,
-                self.worktree_root.join(host),
-                Some(&self.worktree_root),
-                parser,
-            );
-        }
-
-        let mut tracked = self.tracked.clone();
-        tracked.extend(endpoint_tracked.iter().cloned());
-        Ok(FrozenGitScope {
-            git_search,
-            anchor_search,
-            case: self.ignore_case(),
-            tracked,
-            submodules: self.submodules.clone(),
-            worktree_root: self.worktree_root.clone(),
-            store_relative: self
-                .store_location()
-                .root
-                .strip_prefix(&self.worktree_root)
-                .ok()
-                .and_then(|path| NativeRelativePath::from_host_path(path).ok()),
-        })
-    }
-
-    fn global_ignore_path(&self) -> Result<Option<PathBuf>, GitError> {
-        if let Some(path) = self
-            .repository
-            .config_snapshot()
-            .trusted_path("core.excludesFile")
-            .map_err(|error| GitError::Ignore(error.to_string()))?
-        {
-            return Ok(Some(path));
-        }
-        Ok(gix::path::env::xdg_config("git/ignore", &mut |name| {
-            std::env::var_os(name)
-        }))
-    }
-
     fn ignore_case(&self) -> gix::glob::pattern::Case {
         if self
             .repository
@@ -369,6 +267,18 @@ impl GitContext {
             let check = fs::read(&self.index_path)?;
             if check != bytes || lock_path.exists() {
                 continue;
+            }
+            let mut parsed_tracked = BTreeSet::new();
+            let mut parsed_submodules = BTreeSet::new();
+            for entry in parsed.entries() {
+                let path = git_index_path(entry.path(&parsed))?;
+                parsed_tracked.insert(path.clone());
+                if entry.mode == gix::index::entry::Mode::COMMIT {
+                    parsed_submodules.insert(path);
+                }
+            }
+            if parsed_tracked != self.tracked || parsed_submodules != self.submodules {
+                return Err(GitError::StaleIndexContext);
             }
             let object = store.put_bytes(&bytes)?;
             let summary = IndexSummary {
@@ -491,7 +401,7 @@ pub struct FrozenGitScope {
     case: gix::glob::pattern::Case,
     tracked: BTreeSet<NativeRelativePath>,
     submodules: BTreeSet<NativeRelativePath>,
-    worktree_root: PathBuf,
+    nested_repositories: BTreeSet<NativeRelativePath>,
     store_relative: Option<NativeRelativePath>,
 }
 
@@ -524,11 +434,8 @@ impl ScopeClassifier for FrozenGitScope {
         {
             return Ok(ScopeDecision::Include);
         }
-        if kind == ObservedKind::Directory {
-            let host = path.to_host_path().map_err(scope_error)?;
-            if self.worktree_root.join(host).join(".git").exists() {
-                return Ok(ScopeDecision::Boundary(OmissionReason::NestedRepository));
-            }
+        if kind == ObservedKind::Directory && self.nested_repositories.contains(path) {
+            return Ok(ScopeDecision::Boundary(OmissionReason::NestedRepository));
         }
 
         let host = path.to_host_path().map_err(scope_error)?;
@@ -550,13 +457,6 @@ impl ScopeClassifier for FrozenGitScope {
         } else {
             ScopeDecision::Include
         })
-    }
-}
-
-impl FrozenGitScope {
-    /// Add paths tracked at a later endpoint without changing the frozen ignore policy.
-    pub fn include_tracked(&mut self, paths: impl IntoIterator<Item = NativeRelativePath>) {
-        self.tracked.extend(paths);
     }
 }
 
@@ -623,33 +523,18 @@ pub struct IndexSummary {
     pub checksum_present: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IgnoreSourceKind {
-    Git,
-    Anchor,
-}
-
-fn add_external_ignore(search: &mut gix::ignore::Search, path: &Path) -> Result<(), GitError> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let bytes = read_stable_bounded(path, MAX_IGNORE_BYTES)?;
-    search.add_patterns_buffer(
-        &bytes,
-        path.to_path_buf(),
-        None,
-        gix::ignore::search::Ignore::default(),
-    );
-    Ok(())
-}
-
 fn add_in_tree_ignore(
     search: &mut gix::ignore::Search,
     path: &Path,
     root: &Path,
 ) -> Result<(), GitError> {
-    if !path.exists() {
-        return Ok(());
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(GitError::UnsupportedIgnoreSource(path.to_path_buf()));
     }
     let bytes = read_stable_bounded(path, MAX_IGNORE_BYTES)?;
     search.add_patterns_buffer(
@@ -802,6 +687,10 @@ pub enum GitError {
     Index(String),
     #[error("Git ignore policy error: {0}")]
     Ignore(String),
+    #[error("frozen Git policy schema {0} is not supported")]
+    UnsupportedPolicySchema(u16),
+    #[error("invalid frozen Git policy: {0}")]
+    InvalidFrozenPolicy(String),
     #[error("ignore source {path} has {size} bytes, above limit {maximum}")]
     IgnoreSourceTooLarge {
         path: PathBuf,
@@ -810,6 +699,12 @@ pub enum GitError {
     },
     #[error("ignore source remained unstable at {0}")]
     UnstableIgnoreSource(PathBuf),
+    #[error("ignore source is not a readable regular file: {0}")]
+    UnsupportedIgnoreSource(PathBuf),
+    #[error("inclusion-policy discovery exceeded its {0}-entry safety limit")]
+    PolicyScanLimitExceeded(usize),
+    #[error("inclusion-policy namespace remained unstable at {0:?}")]
+    UnstablePolicyNamespace(NativeRelativePath),
     #[error("Git HEAD error: {0}")]
     Head(String),
     #[error("Git HEAD state is internally inconsistent")]
@@ -824,6 +719,8 @@ pub enum GitError {
     IndexTooLarge(u64),
     #[error("Git index remained unstable at {0}")]
     UnstableIndex(PathBuf),
+    #[error("Git index paths changed after repository discovery; retry the operation")]
+    StaleIndexContext,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -836,8 +733,6 @@ pub enum GitError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anchor_core::{CaptureEngine, CaptureOptions};
-
     fn unborn_repository() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         let git = root.path().join(".git");
@@ -882,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_scope_uses_before_ignore_bytes() {
+    fn frozen_policy_uses_captured_ignore_bytes() {
         let root = unborn_repository();
         let store_root = tempfile::tempdir().unwrap();
         fs::write(root.path().join(".gitignore"), b"ignored\n").unwrap();
@@ -893,23 +788,9 @@ mod tests {
 
         let context = GitContext::discover(root.path()).unwrap();
         let store = ObjectStore::open(store_root.path()).unwrap();
-        let before = CaptureEngine::new(&store, CaptureOptions::default())
-            .capture(root.path(), &context.live_scope().unwrap())
-            .unwrap()
-            .manifest;
-        let names = before
-            .entries()
-            .iter()
-            .map(|entry| entry.path.to_host_path().unwrap())
-            .collect::<BTreeSet<_>>();
-        assert!(names.contains(Path::new(".gitignore")));
-        assert!(names.contains(Path::new(".anchorignore")));
-        assert!(names.contains(Path::new("kept")));
-        assert!(!names.contains(Path::new("ignored")));
-        assert!(!names.contains(Path::new("anchor-only")));
-
-        let frozen = context
-            .frozen_scope(&before, &store, context.tracked_paths())
+        let policy = context.capture_frozen_policy(&store).unwrap();
+        let frozen = policy
+            .compile(&store, root.path(), context.tracked_paths())
             .unwrap();
         fs::write(root.path().join(".gitignore"), b"").unwrap();
         fs::write(root.path().join(".anchorignore"), b"").unwrap();
@@ -931,5 +812,49 @@ mod tests {
                 .unwrap(),
             ScopeDecision::Exclude
         );
+    }
+
+    #[test]
+    fn endpoint_tracked_paths_override_the_frozen_ignore_match() {
+        let root = unborn_repository();
+        let store_root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".gitignore"), b"generated\n").unwrap();
+        fs::write(root.path().join("generated"), b"content").unwrap();
+        let context = GitContext::discover(root.path()).unwrap();
+        let store = ObjectStore::open(store_root.path()).unwrap();
+        let policy = context.capture_frozen_policy(&store).unwrap();
+        let generated = NativeRelativePath::from_host_path(Path::new("generated")).unwrap();
+        let endpoint_tracked = BTreeSet::from([generated.clone()]);
+        let scope = policy
+            .compile(&store, root.path(), &endpoint_tracked)
+            .unwrap();
+        assert_eq!(
+            scope.classify(&generated, ObservedKind::Regular).unwrap(),
+            ScopeDecision::Include
+        );
+        assert!(
+            !policy
+                .drift_from(&context.capture_frozen_policy(&store).unwrap())
+                .any()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn root_anchorignore_symlink_is_refused_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = unborn_repository();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), b"secret-pattern\n").unwrap();
+        symlink(outside.path(), root.path().join(".anchorignore")).unwrap();
+        let context = GitContext::discover(root.path()).unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(store_root.path()).unwrap();
+        assert!(matches!(
+            context.capture_frozen_policy(&store),
+            Err(GitError::UnsupportedIgnoreSource(path))
+                if path == root.path().join(".anchorignore")
+        ));
     }
 }

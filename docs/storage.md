@@ -6,6 +6,8 @@ On Unix, Anchor stores data beneath the resolved Git common directory:
 $GIT_COMMON_DIR/anchor/users/<principal>/v1/
 ├── objects/b3/<prefix>/<suffix>.zst
 ├── manifests/b3/<prefix>/<suffix>.cbor
+├── policies/b3/<prefix>/<suffix>.cbor
+├── plans/b3/<prefix>/<suffix>.cbor
 ├── sessions/<worktree-key>/<session-id>.cbor
 ├── deleted-sessions/<worktree-key>/<session-id>.cbor
 ├── locks/<worktree-key>.active.lock
@@ -65,22 +67,50 @@ reparse points are never silently encoded as ordinary files.
 
 ## Sessions
 
-Session records are mutable, atomically replaced CBOR records. Schema v2
+Session records are mutable, atomically replaced CBOR records. Schema v3
 contains:
 
 - a UUIDv7 session ID;
 - the native command program and, only when opted in, its arguments;
 - the count of arguments deliberately omitted from metadata;
 - the frozen capture limits, completeness switches, and recording policy;
+- the content-derived ID of the complete frozen inclusion policy;
 - the native invocation directory and worktree root;
 - before and optional after endpoint records;
+- the policy observed at each endpoint and structured drift from the frozen
+  policy;
 - raw-index object references and parsed summaries;
 - repository state;
 - timestamps, child result, lifecycle state, and a bounded failure message.
 
 The environment is not recorded. Command arguments can contain secrets and are
-therefore omitted by default. Schema-v1 sessions remain readable and are
-reported as having recorded full arguments because that was the v1 behavior.
+therefore omitted by default. Schema-v1 and schema-v2 sessions remain readable.
+They predate complete policy freezing, so current-state capture and worktree
+restoration refuse them instead of reconstructing policy from live files.
+Schema-v1 records are reported as having recorded full arguments because that
+was the v1 behavior.
+
+## Frozen inclusion policies
+
+Before the initial worktree capture, Anchor reads and content-addresses the
+selected `core.excludesFile` (including explicit absence), the common Git
+directory's `info/exclude`, every reachable in-tree `.gitignore`, and the root
+`.anchorignore`. The policy record also stores source ordering,
+`core.ignoreCase`, the base tracked set, submodule boundaries,
+nested-repository boundaries, and the worktree-relative Anchor-store exclusion
+when applicable.
+
+The before capture is made with that compiled immutable record. Anchor repeats
+policy discovery after the capture and does not launch the child unless the two
+records are equal. Session-end and current captures compile the retained policy
+and add only endpoint tracked paths. They separately observe live policy
+sources and record drift; changed ignore bytes do not alter the frozen scope. A
+changed submodule or nested-repository boundary makes the endpoint incomplete
+instead of allowing a different tree meaning.
+
+Policy source contents are ordinary immutable Anchor objects. Garbage
+collection marks objects referenced by both the frozen policy and endpoint
+observations before sweeping.
 
 ## Garbage collection
 
@@ -101,14 +131,17 @@ Writers emit only the newest schema. Unsupported future schemas are refused.
 ## Restore journals
 
 Restore transaction directories contain an atomically replaced `journal.cbor`.
-Schema v3 records the owning session/worktree, validated target path, sibling
-stage and backup names, exact expected node, desired node, and progress state.
+Unix single-path/index schema v4 and Windows schema v2 record the owning
+session/worktree, immutable restore-plan ID, transaction ID, validated target
+path, sibling stage and backup names, exact expected node, desired node, and
+progress state.
 Index journals additionally record the freshly validated index path and raw
 before/after captures.
 
-Batch-journal schema v1 stores the owning session/worktree and an ordered list
-of validated relative paths, exact expected/desired nodes, collision-resistant
-sibling stage/backup names, per-item progress, and a batch state. Journal input
+Batch-journal schema v2 stores the owning session/worktree, immutable
+restore-plan ID, transaction ID, and an ordered list of validated relative
+paths, exact expected/desired nodes, collision-resistant sibling stage/backup
+names, per-item progress, and a batch state. Journal input
 is capped at 256 MiB and duplicate paths or temporary names are rejected during
 recovery. `Verified` is the durable commit point: recovery rolls earlier states
 back and rolls this state forward by verifying targets and removing backups.

@@ -196,6 +196,9 @@ impl RestoreService {
         let _lock = store.acquire_active_lock()?;
         ensure_no_unresolved_transactions(store.root())?;
         let session = store.load_session(session_id)?;
+        if session.frozen_policy.is_none() {
+            return Err(RestoreError::LegacySessionWithoutFrozenPolicy);
+        }
         if !matches!(
             session.state,
             crate::SessionState::Completed | crate::SessionState::Interrupted
@@ -214,14 +217,17 @@ impl RestoreService {
         if context.repository_state()? != after.repository {
             return Err(RestoreError::RepositoryDrift);
         }
+        let policy_id = session
+            .frozen_policy
+            .ok_or(RestoreError::LegacySessionWithoutFrozenPolicy)?;
+        let frozen_policy = store.load_frozen_policy(policy_id)?;
         let base = store.load_manifest(session.before.manifest)?;
         let endpoint = store.load_manifest(after.manifest)?;
-        let frozen_scope = context.frozen_scope(&base, store.objects(), context.tracked_paths())?;
         let current_endpoint = crate::capture_frozen_endpoint(
             &context,
             store,
             session.capture_policy.capture_options(),
-            frozen_scope,
+            &frozen_policy,
         )?;
         let current = store.load_manifest(current_endpoint.manifest)?;
         if let WholeRestoreMode::Apply { expected_current } = mode {
@@ -335,6 +341,9 @@ impl RestoreService {
         let _lock = store.acquire_active_lock()?;
         ensure_no_unresolved_transactions(store.root())?;
         let session = store.load_session(session_id)?;
+        if session.frozen_policy.is_none() {
+            return Err(RestoreError::LegacySessionWithoutFrozenPolicy);
+        }
         if !matches!(
             session.state,
             crate::SessionState::Completed | crate::SessionState::Interrupted
@@ -2432,6 +2441,8 @@ pub(crate) fn ensure_no_unresolved_transactions(root: &Path) -> Result<(), Resto
 pub enum RestoreError {
     #[error("session has no complete after-snapshot")]
     IncompleteSession,
+    #[error("session predates complete policy freezing and is review-only")]
+    LegacySessionWithoutFrozenPolicy,
     #[error("repository state changed during the session; automatic worktree restore is refused")]
     RepositoryChangedDuringSession,
     #[error("repository state has drifted since the session ended")]

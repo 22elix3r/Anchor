@@ -45,6 +45,10 @@ changes “session-window changes,” never “changes made by the agent.”
     the entire batch if any path has a structured conflict. It stages every
     output before mutation and retains every evacuated node until every target
     verifies.
+12. Before capture freezes the exact external and in-tree ignore-source bytes,
+    source selection, case mode, tracked set, and repository boundaries. Every
+    later endpoint compiles that retained record; live policy drift is reported
+    but does not redefine the session scope.
 
 ## Restore decisions
 
@@ -75,12 +79,15 @@ Confirmation also supplies the previewed BLAKE3 object ID; Anchor recalculates
 under the worktree lock and refuses if the result changed. Anchor returns a
 structured conflict instead of writing conflict markers.
 
-Schema-v3 restore journals retain the verified pre-restore node, intended node,
-worktree identity, and sibling staging names. `anchor recover-transactions
---yes` validates those paths against the retained session and fresh repository
-discovery, then rolls an interrupted file or index operation back to its
-pre-restore state. Live, staged, or backup byte drift is a hard conflict.
-Incomplete schema-v1/v2 journals are reported but not guessed at.
+Current plan-bound restore journals retain the verified pre-restore node,
+intended node, worktree identity, and sibling staging names. `anchor recover-transactions
+--yes` loads a content-addressed restore plan and independently recalculates its
+transformation from retained base/session/current manifests before trusting
+journal-authored paths. It then validates those paths against the retained
+session and fresh repository discovery and rolls an interrupted file or index
+operation back to its pre-restore state. Live, staged, or backup byte drift is
+a hard conflict. Journals without a restore-plan binding are reported but not
+guessed at.
 
 Batch journals record every path, expected and desired node, sibling temporary
 name, and item state. `Verified` is the batch commit point: before it, recovery
@@ -109,6 +116,14 @@ Directory names are enumerated before and after traversal, and the whole capture
 is retried twice if the namespace changed. Persistent instability aborts.
 Repository state and raw index bytes are sampled around the filesystem capture;
 endpoint drift also triggers a bounded retry and then failure.
+
+Every ignore-policy source is stably read into the object store before the
+before capture. The resulting policy is compiled for that capture and observed
+again afterward; disagreement triggers a bounded retry and then prevents child
+launch. Session-end and current capture observe external-policy drift for
+diagnostics while continuing to use the retained bytes. A changed nested
+repository or submodule boundary aborts the endpoint because traversing a
+different repository topology would change the declared capture meaning.
 
 On Unix the active-session lock's open file description is inherited by the
 wrapped child. If the wrapper crashes but the child keeps running, a second
@@ -153,6 +168,13 @@ submodule contents, and explicit repository boundaries are excluded.
 `.anchorignore` is a monotonic exclusion layer: its negation rules can cancel
 earlier `.anchorignore` rules but cannot re-include a Git-ignored path.
 
+The selected global exclude path, explicit absence, common
+`.git/info/exclude`, nested `.gitignore` files, and root `.anchorignore` are
+part of the immutable session policy. Paths newly tracked at a later endpoint
+are included as a tracked overlay without changing ignore-rule bytes or
+precedence. `core.ignoreCase` is retained in the policy and repository state;
+changing it during or after a session makes automatic restoration ineligible.
+
 Sensitive nonignored files are included. Anchor is local-only and performs no
 telemetry or network I/O, but local users or malware able to read the store may
 read captured contents. Unix store directories are forced to mode `0700`.
@@ -172,12 +194,15 @@ snapshot in those modes would violate the completeness invariant.
 
 ## Malicious or corrupt storage
 
-Manifests and sessions are treated as untrusted:
+Manifests, frozen policies, restore plans, journals, and sessions are treated
+as untrusted:
 
 - record tag, schema, size, path encoding, and tree invariants are validated;
 - path traversal and leaf-prefix collisions are rejected;
 - object decompression has a caller-supplied raw-size ceiling;
 - object IDs and manifest IDs are recomputed on read;
+- frozen-policy and restore-plan IDs are recomputed before their records are
+  used;
 - garbage collection aborts if retained metadata cannot be decoded and all
   reachable objects cannot be verified.
 
@@ -196,5 +221,8 @@ Manifests and sessions are treated as untrusted:
 - Windows support is experimental on non-NTFS filesystems, case-sensitive
   directories, and systems where security software denies delete sharing;
 - no automatic reconstruction of missing uncaptured parent directories.
+- schema-v1/v2 sessions can be inspected as historical before/session-end
+  records, but cannot recapture current state or mutate the worktree because
+  they do not contain a complete frozen policy.
 
 These cases must remain visible limitations, not silent fallbacks.

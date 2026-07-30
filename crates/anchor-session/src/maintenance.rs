@@ -7,7 +7,7 @@ use anchor_git::{GitContext, IndexCapture};
 use thiserror::Error;
 
 use crate::restore::scan_transactions;
-use crate::{SessionError, SessionState, SessionStore};
+use crate::{FrozenPolicyId, SessionError, SessionState, SessionStore};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoctorReport {
@@ -51,6 +51,7 @@ impl MaintenanceService {
         let transactions = scan_transactions(store.root())?;
         let mut manifests = BTreeSet::new();
         let mut objects = BTreeSet::new();
+        let mut policies = BTreeSet::new();
         let mut incomplete = 0_u64;
         for session in &sessions {
             if !session.state.is_terminal()
@@ -58,15 +59,20 @@ impl MaintenanceService {
                     session.state,
                     SessionState::AfterSnapshotFailed | SessionState::LaunchFailed
                 )
+                || session.frozen_policy.is_none()
             {
                 incomplete += 1;
             }
             manifests.insert(session.before.manifest);
+            collect_session_policies(store, session, &mut policies)?;
             collect_index_object(&session.before.index, &mut objects);
             if let Some(after) = &session.after {
                 manifests.insert(after.manifest);
                 collect_index_object(&after.index, &mut objects);
             }
+        }
+        for id in policies {
+            objects.extend(store.load_frozen_policy(id)?.referenced_objects());
         }
         for (_, plan) in store.list_restore_plans()? {
             manifests.extend(plan.referenced_manifests());
@@ -119,13 +125,18 @@ impl MaintenanceService {
         let sessions = store.list_all_retained_sessions()?;
         let mut reachable_manifests = BTreeSet::new();
         let mut reachable_objects = BTreeSet::new();
+        let mut reachable_policies = BTreeSet::new();
         for session in &sessions {
             reachable_manifests.insert(session.before.manifest);
+            collect_session_policies(store, session, &mut reachable_policies)?;
             collect_index_object(&session.before.index, &mut reachable_objects);
             if let Some(after) = &session.after {
                 reachable_manifests.insert(after.manifest);
                 collect_index_object(&after.index, &mut reachable_objects);
             }
+        }
+        for id in reachable_policies {
+            reachable_objects.extend(store.load_frozen_policy(id)?.referenced_objects());
         }
         for (_, plan) in store.list_restore_plans()? {
             reachable_manifests.extend(plan.referenced_manifests());
@@ -170,6 +181,29 @@ impl MaintenanceService {
         )?;
         Ok(report)
     }
+}
+
+fn collect_session_policies(
+    store: &SessionStore,
+    session: &crate::Session,
+    policies: &mut BTreeSet<FrozenPolicyId>,
+) -> Result<(), MaintenanceError> {
+    let Some(frozen_id) = session.frozen_policy else {
+        return Ok(());
+    };
+    policies.insert(frozen_id);
+    let frozen = store.load_frozen_policy(frozen_id)?;
+    for endpoint in std::iter::once(&session.before).chain(session.after.iter()) {
+        let observation = endpoint
+            .policy_observation
+            .ok_or(MaintenanceError::PolicyObservationMismatch(session.id))?;
+        policies.insert(observation.observed_policy);
+        let observed = store.load_frozen_policy(observation.observed_policy)?;
+        if frozen.drift_from(&observed) != observation.drift {
+            return Err(MaintenanceError::PolicyObservationMismatch(session.id));
+        }
+    }
+    Ok(())
 }
 
 fn collect_index_object(index: &IndexCapture, objects: &mut BTreeSet<(ObjectId, u64)>) {
@@ -251,6 +285,8 @@ pub enum MaintenanceError {
         needs_recovery: u64,
         unfinished: u64,
     },
+    #[error("session {0} contains a policy observation that does not match retained policy bytes")]
+    PolicyObservationMismatch(crate::SessionId),
     #[error(transparent)]
     Session(#[from] SessionError),
     #[error(transparent)]

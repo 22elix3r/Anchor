@@ -1,6 +1,7 @@
 //! Durable session lifecycle and interactive command execution.
 
 mod config;
+mod frozen_policy;
 mod maintenance;
 mod restore;
 mod restore_plan;
@@ -23,13 +24,16 @@ use anchor_core::{
     CaptureEngine, CaptureOptions, CaptureStatistics, Manifest, ManifestError, ManifestId,
     NativeString, ObjectStore, StoreError,
 };
-use anchor_git::{GitContext, GitError, IndexCapture, RepositoryState};
+use anchor_git::{
+    FrozenGitPolicy, GitContext, GitError, IndexCapture, PolicyDrift, RepositoryState,
+};
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub use frozen_policy::FrozenPolicyId;
 pub use restore_plan::RestorePlanId;
 
 pub use config::{
@@ -45,7 +49,7 @@ pub use restore::{
 };
 
 const SESSION_TAG: u64 = 0x4153_4553;
-const SESSION_SCHEMA: u16 = 2;
+const SESSION_SCHEMA: u16 = 3;
 const MAX_SESSION_BYTES: usize = 16 * 1024 * 1024;
 const ENDPOINT_RETRIES: usize = 2;
 
@@ -89,6 +93,7 @@ pub struct Session {
     pub invocation_directory: NativeString,
     pub worktree_root: NativeString,
     pub worktree_key: String,
+    pub frozen_policy: Option<FrozenPolicyId>,
     pub before: EndpointSnapshot,
     pub after: Option<EndpointSnapshot>,
     pub started_at: Timestamp,
@@ -104,6 +109,14 @@ pub struct EndpointSnapshot {
     pub index: IndexCapture,
     pub repository: RepositoryState,
     pub statistics: SnapshotStatistics,
+    #[serde(default)]
+    pub policy_observation: Option<PolicyObservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PolicyObservation {
+    pub observed_policy: FrozenPolicyId,
+    pub drift: PolicyDrift,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -245,6 +258,7 @@ impl SessionStore {
         let worktree_key = worktree_key.into();
         let objects = ObjectStore::open(&root)?;
         private_directory(&root.join("manifests").join("b3"))?;
+        private_directory(&root.join("policies").join("b3"))?;
         private_directory(&root.join("plans").join("b3"))?;
         private_directory(&root.join("sessions").join(&worktree_key))?;
         private_directory(&root.join("deleted-sessions").join(&worktree_key))?;
@@ -327,7 +341,8 @@ impl SessionStore {
         if session.worktree_key != self.worktree_key {
             return Err(SessionError::WrongWorktreeNamespace);
         }
-        let wire = SessionWireV2::from_session(session);
+        validate_session_policy_binding(session)?;
+        let wire = SessionWireV3::from_session(session);
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&wire, &mut bytes)
             .map_err(|error| SessionError::Encode(error.to_string()))?;
@@ -347,7 +362,9 @@ impl SessionStore {
     /// Returns [`SessionError`] for malformed, missing, oversized, or unsupported data.
     pub fn load_session(&self, id: SessionId) -> Result<Session, SessionError> {
         let bytes = bounded_read(&self.session_path(id), MAX_SESSION_BYTES)?;
-        decode_session(&bytes)
+        let session = decode_session(&bytes)?;
+        validate_session_policy_binding(&session)?;
+        Ok(session)
     }
 
     /// Load all sessions in this worktree namespace, newest first.
@@ -468,6 +485,7 @@ impl SessionStore {
             {
                 let bytes = bounded_read(&entry.path(), MAX_SESSION_BYTES)?;
                 let session = decode_session(&bytes)?;
+                validate_session_policy_binding(&session)?;
                 if session.worktree_key != expected_worktree_key {
                     return Err(SessionError::WrongWorktreeNamespace);
                 }
@@ -576,16 +594,17 @@ impl SessionInspection {
     ) -> Result<CurrentSnapshot, SessionError> {
         let lease = store.acquire_store_read_lease()?;
         let session = store.load_session(session_id)?;
-        let before = store.load_manifest(session.before.manifest)?;
+        let policy_id = session
+            .frozen_policy
+            .ok_or(SessionError::LegacySessionWithoutFrozenPolicy)?;
+        let frozen_policy = store.load_frozen_policy(policy_id)?;
         let worktree = PathBuf::from(session.worktree_root.to_host()?);
         let context = GitContext::discover(&worktree)?;
-        let frozen_scope =
-            context.frozen_scope(&before, store.objects(), context.tracked_paths())?;
         let endpoint = capture_frozen_endpoint(
             &context,
             store,
             session.capture_policy.capture_options(),
-            frozen_scope,
+            &frozen_policy,
         )?;
         let manifest = store.load_manifest(endpoint.manifest)?;
         Ok(CurrentSnapshot {
@@ -681,13 +700,8 @@ impl SessionRunner {
 
         let capture_policy = request.capture_policy.validate()?;
         let capture_options = capture_policy.capture_options();
-        let before = capture_live_endpoint(&before_context, &store, capture_options)?;
-        let before_manifest = store.load_manifest(before.manifest)?;
-        let frozen_scope = before_context.frozen_scope(
-            &before_manifest,
-            store.objects(),
-            before_context.tracked_paths(),
-        )?;
+        let (before, frozen_policy, frozen_policy_id) =
+            capture_before_endpoint(&before_context, &store, capture_options)?;
         let id = SessionId::new();
         let command = request
             .command
@@ -715,6 +729,7 @@ impl SessionRunner {
             invocation_directory: NativeString::from_host(request.invocation_directory.as_os_str()),
             worktree_root: NativeString::from_host(before_context.worktree_root().as_os_str()),
             worktree_key: store.worktree_key.clone(),
+            frozen_policy: Some(frozen_policy_id),
             before,
             after: None,
             started_at: Timestamp::now()?,
@@ -757,7 +772,7 @@ impl SessionRunner {
                             &after_context,
                             &store,
                             capture_options,
-                            frozen_scope,
+                            &frozen_policy,
                         )
                     })();
                     session.finished_at = Some(Timestamp::now()?);
@@ -815,7 +830,7 @@ impl SessionRunner {
 
         let after_result = (|| {
             let after_context = GitContext::discover(&request.invocation_directory)?;
-            capture_frozen_endpoint(&after_context, &store, capture_options, frozen_scope)
+            capture_frozen_endpoint(&after_context, &store, capture_options, &frozen_policy)
         })();
         session.finished_at = Some(Timestamp::now()?);
         match after_result {
@@ -869,27 +884,45 @@ fn reject_unsupported_repository(state: &RepositoryState) -> Result<(), SessionE
     Ok(())
 }
 
-fn capture_live_endpoint(
+fn capture_before_endpoint(
     context: &GitContext,
     store: &SessionStore,
     options: CaptureOptions,
-) -> Result<EndpointSnapshot, SessionError> {
+) -> Result<(EndpointSnapshot, FrozenGitPolicy, FrozenPolicyId), SessionError> {
     for _ in 0..ENDPOINT_RETRIES {
+        let policy_before = context.capture_frozen_policy(store.objects())?;
+        let scope = policy_before.compile(
+            store.objects(),
+            context.worktree_root(),
+            context.tracked_paths(),
+        )?;
         let repository_before = context.repository_state()?;
         reject_unsupported_repository(&repository_before)?;
         let index_before = context.capture_index(store.objects())?;
-        let scope = context.live_scope()?;
         let capture = CaptureEngine::new(store.objects(), options)
             .capture(context.worktree_root(), &scope)?;
         let index_after = context.capture_index(store.objects())?;
         let repository_after = context.repository_state()?;
-        if repository_before == repository_after && index_before == index_after {
-            return Ok(EndpointSnapshot {
-                manifest: store.put_manifest(&capture.manifest)?,
-                index: index_after,
-                repository: repository_after,
-                statistics: capture.statistics.into(),
-            });
+        let policy_after = context.capture_frozen_policy(store.objects())?;
+        if repository_before == repository_after
+            && index_before == index_after
+            && policy_before == policy_after
+        {
+            let policy_id = store.put_frozen_policy(&policy_before)?;
+            return Ok((
+                EndpointSnapshot {
+                    manifest: store.put_manifest(&capture.manifest)?,
+                    index: index_after,
+                    repository: repository_after,
+                    statistics: capture.statistics.into(),
+                    policy_observation: Some(PolicyObservation {
+                        observed_policy: policy_id,
+                        drift: PolicyDrift::default(),
+                    }),
+                },
+                policy_before,
+                policy_id,
+            ));
         }
     }
     Err(SessionError::UnstableRepositoryEndpoint)
@@ -899,10 +932,19 @@ fn capture_frozen_endpoint(
     after_context: &GitContext,
     store: &SessionStore,
     options: CaptureOptions,
-    mut scope: anchor_git::FrozenGitScope,
+    policy: &FrozenGitPolicy,
 ) -> Result<EndpointSnapshot, SessionError> {
-    scope.include_tracked(after_context.tracked_paths().iter().cloned());
     for _ in 0..ENDPOINT_RETRIES {
+        let scope = policy.compile(
+            store.objects(),
+            after_context.worktree_root(),
+            after_context.tracked_paths(),
+        )?;
+        let observed_before = after_context.observe_frozen_policy(store.objects(), &scope)?;
+        let drift = policy.drift_from(&observed_before);
+        if drift.capture_boundary_changed() {
+            return Err(SessionError::PolicyBoundaryDrift);
+        }
         let repository_before = after_context.repository_state()?;
         reject_unsupported_repository(&repository_before)?;
         let index_before = after_context.capture_index(store.objects())?;
@@ -910,16 +952,34 @@ fn capture_frozen_endpoint(
             .capture(after_context.worktree_root(), &scope)?;
         let index_after = after_context.capture_index(store.objects())?;
         let repository_after = after_context.repository_state()?;
-        if repository_before == repository_after && index_before == index_after {
+        let observed_after = after_context.observe_frozen_policy(store.objects(), &scope)?;
+        if repository_before == repository_after
+            && index_before == index_after
+            && observed_before == observed_after
+        {
+            let observed_policy = store.put_frozen_policy(&observed_after)?;
             return Ok(EndpointSnapshot {
                 manifest: store.put_manifest(&capture.manifest)?,
                 index: index_after,
                 repository: repository_after,
                 statistics: capture.statistics.into(),
+                policy_observation: Some(PolicyObservation {
+                    observed_policy,
+                    drift,
+                }),
             });
         }
     }
     Err(SessionError::UnstableRepositoryEndpoint)
+}
+
+#[cfg(test)]
+fn capture_live_endpoint(
+    context: &GitContext,
+    store: &SessionStore,
+    options: CaptureOptions,
+) -> Result<EndpointSnapshot, SessionError> {
+    capture_before_endpoint(context, store, options).map(|(endpoint, _, _)| endpoint)
 }
 
 #[cfg(unix)]
@@ -1097,6 +1157,7 @@ impl SessionWireV1 {
             invocation_directory: self.4.into_native()?,
             worktree_root: self.5.into_native()?,
             worktree_key: self.6,
+            frozen_policy: None,
             before: self.7,
             after: self.8,
             started_at: self.9,
@@ -1129,6 +1190,59 @@ struct SessionWireV2(
 );
 
 impl SessionWireV2 {
+    fn into_session(self) -> Result<Session, SessionError> {
+        if self.0 != SESSION_TAG {
+            return Err(SessionError::WrongTag);
+        }
+        if self.1 != 2 {
+            return Err(SessionError::UnsupportedSchema(self.1));
+        }
+        Ok(Session {
+            id: self.2,
+            command: self
+                .3
+                .into_iter()
+                .map(NativeStringWire::into_native)
+                .collect::<Result<_, _>>()?,
+            redacted_argument_count: self.14,
+            capture_policy: self.15.validate()?,
+            invocation_directory: self.4.into_native()?,
+            worktree_root: self.5.into_native()?,
+            worktree_key: self.6,
+            frozen_policy: None,
+            before: self.7,
+            after: self.8,
+            started_at: self.9,
+            finished_at: self.10,
+            exit: self.11,
+            state: self.12,
+            failure: self.13,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SessionWireV3(
+    u64,
+    u16,
+    SessionId,
+    Vec<NativeStringWire>,
+    NativeStringWire,
+    NativeStringWire,
+    String,
+    EndpointSnapshot,
+    Option<EndpointSnapshot>,
+    Timestamp,
+    Option<Timestamp>,
+    Option<ExitRecord>,
+    SessionState,
+    Option<String>,
+    u64,
+    CapturePolicy,
+    Option<FrozenPolicyId>,
+);
+
+impl SessionWireV3 {
     fn from_session(session: &Session) -> Self {
         Self(
             SESSION_TAG,
@@ -1151,6 +1265,7 @@ impl SessionWireV2 {
             session.failure.clone(),
             session.redacted_argument_count,
             session.capture_policy,
+            session.frozen_policy,
         )
     }
 
@@ -1173,6 +1288,7 @@ impl SessionWireV2 {
             invocation_directory: self.4.into_native()?,
             worktree_root: self.5.into_native()?,
             worktree_key: self.6,
+            frozen_policy: self.16,
             before: self.7,
             after: self.8,
             started_at: self.9,
@@ -1185,12 +1301,43 @@ impl SessionWireV2 {
 }
 
 fn decode_session(bytes: &[u8]) -> Result<Session, SessionError> {
+    if let Ok(wire) = ciborium::de::from_reader::<SessionWireV3, _>(Cursor::new(bytes)) {
+        return wire.into_session();
+    }
     if let Ok(wire) = ciborium::de::from_reader::<SessionWireV2, _>(Cursor::new(bytes)) {
         return wire.into_session();
     }
     let wire: SessionWireV1 = ciborium::de::from_reader(Cursor::new(bytes))
         .map_err(|error| SessionError::Decode(error.to_string()))?;
     wire.into_session()
+}
+
+fn validate_session_policy_binding(session: &Session) -> Result<(), SessionError> {
+    let Some(frozen) = session.frozen_policy else {
+        if session.before.policy_observation.is_some()
+            || session
+                .after
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.policy_observation.is_some())
+        {
+            return Err(SessionError::InvalidPolicyBinding);
+        }
+        return Ok(());
+    };
+    let Some(before) = session.before.policy_observation else {
+        return Err(SessionError::InvalidPolicyBinding);
+    };
+    if before.observed_policy != frozen || before.drift != PolicyDrift::default() {
+        return Err(SessionError::InvalidPolicyBinding);
+    }
+    if session
+        .after
+        .as_ref()
+        .is_some_and(|endpoint| endpoint.policy_observation.is_none())
+    {
+        return Err(SessionError::InvalidPolicyBinding);
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1276,6 +1423,18 @@ pub enum SessionError {
     RestorePlanCollision(RestorePlanId),
     #[error("restore-plan object {0} failed identity verification")]
     RestorePlanIdentityMismatch(RestorePlanId),
+    #[error("frozen-policy record exceeds its encoded size limit")]
+    FrozenPolicyTooLarge,
+    #[error("frozen-policy object {0} failed identity verification")]
+    FrozenPolicyIdentityMismatch(FrozenPolicyId),
+    #[error("frozen-policy object contains trailing bytes")]
+    FrozenPolicyTrailingBytes,
+    #[error("session predates complete policy freezing and is review-only")]
+    LegacySessionWithoutFrozenPolicy,
+    #[error("repository boundaries changed while the frozen policy was active")]
+    PolicyBoundaryDrift,
+    #[error("session endpoints are not bound consistently to its frozen inclusion policy")]
+    InvalidPolicyBinding,
     #[error(transparent)]
     RestorePlan(#[from] restore_plan::RestorePlanError),
     #[error("session encoding failed: {0}")]
@@ -1390,6 +1549,9 @@ mod tests {
             invocation_directory: NativeString::from_host(root.path().as_os_str()),
             worktree_root: NativeString::from_host(root.path().as_os_str()),
             worktree_key: store.worktree_key.clone(),
+            frozen_policy: endpoint
+                .policy_observation
+                .map(|observation| observation.observed_policy),
             before: endpoint,
             after: None,
             started_at: Timestamp::now().unwrap(),
@@ -1403,12 +1565,52 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_session_migrates_to_full_argument_policy() {
+    fn session_rejects_a_mismatched_before_policy_binding() {
         let root = repository();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
         let store = SessionStore::open(location.root, location.worktree_key).unwrap();
         let endpoint = capture_live_endpoint(&context, &store, CaptureOptions::default()).unwrap();
+        let mut session = Session {
+            id: SessionId::new(),
+            command: Vec::new(),
+            redacted_argument_count: 0,
+            capture_policy: CapturePolicy::default(),
+            invocation_directory: NativeString::from_host(root.path().as_os_str()),
+            worktree_root: NativeString::from_host(root.path().as_os_str()),
+            worktree_key: store.worktree_key.clone(),
+            frozen_policy: endpoint
+                .policy_observation
+                .map(|observation| observation.observed_policy),
+            before: endpoint,
+            after: None,
+            started_at: Timestamp::now().unwrap(),
+            finished_at: None,
+            exit: None,
+            state: SessionState::BeforeSnapshotComplete,
+            failure: None,
+        };
+        session
+            .before
+            .policy_observation
+            .as_mut()
+            .unwrap()
+            .observed_policy = FrozenPolicyId::from_bytes([0x55; 32]);
+        assert!(matches!(
+            store.save_session(&session),
+            Err(SessionError::InvalidPolicyBinding)
+        ));
+    }
+
+    #[test]
+    fn schema_v1_session_migrates_to_full_argument_policy() {
+        let root = repository();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let mut endpoint =
+            capture_live_endpoint(&context, &store, CaptureOptions::default()).unwrap();
+        endpoint.policy_observation = None;
         let id = SessionId::new();
         let wire = SessionWireV1(
             SESSION_TAG,
@@ -1545,6 +1747,221 @@ mod tests {
         let drift = anchor_core::ManifestDiff::between(&after, &current.manifest);
         assert_eq!(drift.changes.len(), 1);
         assert_eq!(drift.changes[0].kind, anchor_core::ChangeKind::Modified);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn external_global_ignore_bytes_are_frozen_for_every_endpoint() {
+        let root = repository();
+        let external = root
+            .path()
+            .parent()
+            .unwrap()
+            .join(format!("anchor-global-ignore-{}", SessionId::new()));
+        fs::write(&external, b"frozen-by-global\n").unwrap();
+        fs::write(
+            root.path().join(".git").join("config"),
+            format!(
+                "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\texcludesFile = {}\n",
+                external.display()
+            ),
+        )
+        .unwrap();
+
+        let result = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from(
+                    "printf 'live-global\\n' > \"$1\"; printf frozen > frozen-by-global; printf live > live-global",
+                ),
+                OsString::from("anchor-test"),
+                external.clone().into_os_string(),
+            ],
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap();
+        assert_eq!(result.state, SessionState::Completed);
+
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let session = store.load_session(result.session_id).unwrap();
+        let after = session.after.as_ref().unwrap();
+        let names = store
+            .load_manifest(after.manifest)
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|entry| entry.path.to_host_path().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!names.contains(Path::new("frozen-by-global")));
+        assert!(names.contains(Path::new("live-global")));
+        let observation = after.policy_observation.unwrap();
+        assert!(observation.drift.ignore_sources_changed);
+        assert_ne!(observation.observed_policy, session.frozen_policy.unwrap());
+
+        fs::write(&external, b"third-global\n").unwrap();
+        fs::write(root.path().join("third-global"), b"third").unwrap();
+        let current = SessionInspection::capture_current(&store, session.id).unwrap();
+        let current_names = current
+            .manifest
+            .entries()
+            .iter()
+            .map(|entry| entry.path.to_host_path().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!current_names.contains(Path::new("frozen-by-global")));
+        assert!(current_names.contains(Path::new("live-global")));
+        assert!(current_names.contains(Path::new("third-global")));
+        fs::remove_file(external).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn common_info_exclude_bytes_are_frozen_for_session_end() {
+        let root = repository();
+        let info = root.path().join(".git").join("info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("exclude"), b"frozen-by-info\n").unwrap();
+        let result = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from(
+                    "printf 'live-info\\n' > .git/info/exclude; printf frozen > frozen-by-info; printf live > live-info",
+                ),
+            ],
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let session = store.load_session(result.session_id).unwrap();
+        let after = session.after.as_ref().unwrap();
+        let names = store
+            .load_manifest(after.manifest)
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|entry| entry.path.to_host_path().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!names.contains(Path::new("frozen-by-info")));
+        assert!(names.contains(Path::new("live-info")));
+        assert!(
+            after
+                .policy_observation
+                .unwrap()
+                .drift
+                .ignore_sources_changed
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn absent_external_ignore_is_frozen_as_absent() {
+        let root = repository();
+        let external = root.path().join("not-created-yet.ignore");
+        fs::write(
+            root.path().join(".git").join("config"),
+            format!(
+                "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\texcludesFile = {}\n",
+                external.display()
+            ),
+        )
+        .unwrap();
+        let result = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from(
+                    "printf 'created-after-freeze\\n' > not-created-yet.ignore; printf content > created-after-freeze",
+                ),
+            ],
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let session = store.load_session(result.session_id).unwrap();
+        let after = session.after.as_ref().unwrap();
+        let names = store
+            .load_manifest(after.manifest)
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|entry| entry.path.to_host_path().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(names.contains(Path::new("created-after-freeze")));
+        assert!(
+            after
+                .policy_observation
+                .unwrap()
+                .drift
+                .ignore_sources_changed
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn new_nested_repository_boundary_makes_after_snapshot_incomplete() {
+        let root = repository();
+        let result = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from(
+                    "mkdir -p nested/.git/objects nested/.git/refs/heads; printf 'ref: refs/heads/main\\n' > nested/.git/HEAD",
+                ),
+            ],
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap();
+        assert_eq!(result.state, SessionState::AfterSnapshotFailed);
+        assert!(
+            result
+                .after_failure
+                .as_deref()
+                .is_some_and(|message| message.contains("boundaries changed"))
+        );
+    }
+
+    #[test]
+    fn legacy_session_cannot_reconstruct_current_scope() {
+        let root = repository();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let mut endpoint =
+            capture_live_endpoint(&context, &store, CaptureOptions::default()).unwrap();
+        endpoint.policy_observation = None;
+        let session = Session {
+            id: SessionId::new(),
+            command: Vec::new(),
+            redacted_argument_count: 0,
+            capture_policy: CapturePolicy::default(),
+            invocation_directory: NativeString::from_host(root.path().as_os_str()),
+            worktree_root: NativeString::from_host(root.path().as_os_str()),
+            worktree_key: store.worktree_key.clone(),
+            frozen_policy: None,
+            before: endpoint,
+            after: None,
+            started_at: Timestamp::now().unwrap(),
+            finished_at: None,
+            exit: None,
+            state: SessionState::BeforeSnapshotComplete,
+            failure: None,
+        };
+        store.save_session(&session).unwrap();
+        assert!(matches!(
+            SessionInspection::capture_current(&store, session.id),
+            Err(SessionError::LegacySessionWithoutFrozenPolicy)
+        ));
     }
 
     #[test]
