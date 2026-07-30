@@ -2513,6 +2513,32 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "invoked only as the recovery child of subprocess_crash_recovery_matrix"]
+    fn subprocess_recovery_helper() {
+        let root = PathBuf::from(
+            std::env::var_os("FENCE_CRASH_WORKTREE")
+                .expect("recovery helper requires FENCE_CRASH_WORKTREE"),
+        );
+        let result_path = PathBuf::from(
+            std::env::var_os("FENCE_RECOVERY_RESULT")
+                .expect("recovery helper requires FENCE_RECOVERY_RESULT"),
+        );
+        let context = GitContext::discover(&root).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let report = TransactionRecoveryService::recover(&store).unwrap();
+        fs::write(
+            result_path,
+            format!(
+                "completed={}\nrolled_back={}\n",
+                report.completed.len(),
+                report.rolled_back.len()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn subprocess_crash_recovery_matrix() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2546,6 +2572,7 @@ mod tests {
                  ln -sfn after-target link; rmdir empty-removed; mkdir empty-added; \
                  chmod +x mode; mv old new",
             );
+            let store_root = store.root().to_path_buf();
             let marker_dir = tempfile::tempdir().unwrap();
             let marker = marker_dir.path().join("durable-boundary");
             let mut child = Command::new(std::env::current_exe().unwrap())
@@ -2585,14 +2612,50 @@ mod tests {
                 "crash helper was not killed at {boundary}"
             );
 
-            let report = TransactionRecoveryService::recover(&store).unwrap();
+            drop(store);
+            let recovery_result = marker_dir.path().join("recovery-result");
+            let mut recovery = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "restore::tests::subprocess_recovery_helper",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("FENCE_CRASH_WORKTREE", root.path())
+                .env("FENCE_RECOVERY_RESULT", &recovery_result)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut recovery_status = None;
+            for _ in 0..1_000 {
+                if let Some(status) = recovery.try_wait().unwrap() {
+                    recovery_status = Some(status);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let Some(recovery_status) = recovery_status else {
+                recovery.kill().unwrap();
+                let _ = recovery.wait();
+                panic!("fresh recovery process timed out at {boundary}");
+            };
+            assert!(
+                recovery_status.success(),
+                "fresh recovery process failed at {boundary} with {recovery_status}"
+            );
+            let recovery_result = fs::read_to_string(&recovery_result).unwrap();
             let post_commit = matches!(
                 *boundary,
                 "commit-recorded" | "backup-cleanup-started" | "cleanup-completed"
             );
             if post_commit {
-                assert_eq!(report.completed.len(), 1, "{boundary}");
-                assert!(report.rolled_back.is_empty(), "{boundary}");
+                assert_eq!(
+                    recovery_result, "completed=1\nrolled_back=0\n",
+                    "{boundary}"
+                );
                 assert_eq!(
                     fs::read(root.path().join("alpha")).unwrap(),
                     b"alpha-base",
@@ -2627,8 +2690,10 @@ mod tests {
                 );
                 assert!(!root.path().join("new").exists(), "{boundary}");
             } else {
-                assert_eq!(report.rolled_back.len(), 1, "{boundary}");
-                assert!(report.completed.is_empty(), "{boundary}");
+                assert_eq!(
+                    recovery_result, "completed=0\nrolled_back=1\n",
+                    "{boundary}"
+                );
                 assert_eq!(
                     fs::read(root.path().join("alpha")).unwrap(),
                     b"alpha-session",
@@ -2663,7 +2728,7 @@ mod tests {
                     "{boundary}"
                 );
             }
-            let terminal = scan_transactions(store.root()).unwrap();
+            let terminal = scan_transactions(&store_root).unwrap();
             assert_eq!(terminal.total, terminal.complete, "{boundary}");
             assert!(
                 fs::read_dir(root.path()).unwrap().all(|entry| {
