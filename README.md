@@ -30,6 +30,8 @@ Anchor is pre-release software. The implemented safety-first subset is:
   `gix`;
 - stable before/after capture around inherited interactive terminal streams;
 - path-level diffs with unique exact-content rename detection;
+- bounded, control-character-sanitized unified text diffs;
+- a read-only side-by-side terminal reviewer with narrow-layout fallback;
 - structured three-state restoration planning;
 - single-path regular-file and symlink restore on Unix when safety is proven;
 - exact raw-index restore on Unix when the current index still equals the
@@ -40,7 +42,7 @@ Anchor is pre-release software. The implemented safety-first subset is:
 
 Not yet implemented: automatic text three-way merge, whole-session transactional
 rollback, crash-journal recovery commands, empty-directory
-mutation, the terminal reviewer, and Windows filesystem mutation. Those cases
+mutation, TUI-triggered restore actions, and Windows filesystem mutation. Those cases
 are refused rather than approximated.
 
 ## Build
@@ -64,6 +66,7 @@ anchor sessions
 anchor show <session-id>
 anchor diff <session-id>
 anchor diff <session-id> --format json
+anchor review <session-id>
 ```
 
 Restore one worktree-root-relative path:

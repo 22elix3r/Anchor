@@ -56,6 +56,8 @@ enum Commands {
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
     },
+    /// Open a read-only terminal reviewer for a completed session.
+    Review { session: String },
     /// Remove one path's session-window change when it is provably safe.
     Restore {
         session: String,
@@ -170,6 +172,31 @@ fn execute(cli: Cli) -> Result<i32> {
             let diff = ManifestDiff::between(&before, &after);
             print_diff(&diff, format, store.objects())?;
             Ok(i32::from(!diff.is_empty()))
+        }
+        Commands::Review { session } => {
+            let store = current_store()?;
+            let session = load_session(&store, &session)?;
+            let Some(after) = &session.after else {
+                miette::bail!(
+                    "session {} has no complete after-snapshot ({:?})",
+                    session.id,
+                    session.state
+                );
+            };
+            let before = store
+                .load_manifest(session.before.manifest)
+                .into_diagnostic()
+                .wrap_err("cannot load before manifest")?;
+            let after = store
+                .load_manifest(after.manifest)
+                .into_diagnostic()
+                .wrap_err("cannot load after manifest")?;
+            let diff = ManifestDiff::between(&before, &after);
+            let model = review_model(session.id, &diff, store.objects())?;
+            anchor_tui::review(&model)
+                .into_diagnostic()
+                .wrap_err("terminal review failed")?;
+            Ok(0)
         }
         Commands::Restore { session, file } => {
             let store = current_store()?;
@@ -443,6 +470,67 @@ fn print_content_diff(change: &ManifestChange, objects: &ObjectStore) -> Result<
         }
     }
     Ok(())
+}
+
+fn review_model(
+    session_id: SessionId,
+    diff: &ManifestDiff,
+    objects: &ObjectStore,
+) -> Result<anchor_tui::ReviewModel> {
+    let files = diff
+        .changes
+        .iter()
+        .map(|change| {
+            Ok(anchor_tui::ReviewFile {
+                path: display_path(&change.path),
+                status: change_symbol(change.kind).to_owned(),
+                before: review_content(change.before.as_ref(), objects)?,
+                after: review_content(change.after.as_ref(), objects)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(anchor_tui::ReviewModel {
+        title: format!("Session {session_id}"),
+        files,
+    })
+}
+
+fn review_content(
+    entry: Option<&anchor_core::ManifestEntry>,
+    objects: &ObjectStore,
+) -> Result<anchor_tui::ReviewContent> {
+    const MAX_TUI_FILE_BYTES: u64 = 2 * 1024 * 1024;
+    let Some(entry) = entry else {
+        return Ok(anchor_tui::ReviewContent::Absent);
+    };
+    match &entry.node {
+        ManifestNode::Regular {
+            object, raw_size, ..
+        } => {
+            if *raw_size > MAX_TUI_FILE_BYTES {
+                return Ok(anchor_tui::ReviewContent::Binary { size: *raw_size });
+            }
+            let bytes = objects
+                .get(*object, *raw_size)
+                .into_diagnostic()
+                .wrap_err("cannot load review object")?;
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                return Ok(anchor_tui::ReviewContent::Binary { size: *raw_size });
+            };
+            if bytes.contains(&0) {
+                return Ok(anchor_tui::ReviewContent::Binary { size: *raw_size });
+            }
+            Ok(anchor_tui::ReviewContent::Text(
+                text.lines().map(sanitize_diff_text).collect(),
+            ))
+        }
+        ManifestNode::Symlink { target, .. } => Ok(anchor_tui::ReviewContent::Description(
+            format!("symlink → {}", display_native(target)),
+        )),
+        ManifestNode::EmptyDirectory => Ok(anchor_tui::ReviewContent::Description(
+            "empty directory".to_owned(),
+        )),
+    }
 }
 
 fn load_regular(

@@ -11,7 +11,9 @@ authors.workspace = true
 
 [dependencies]
 anchor-core.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
-

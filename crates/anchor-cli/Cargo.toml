@@ -17,6 +17,7 @@ path = "src/main.rs"
 anchor-core.workspace = true
 anchor-git.workspace = true
 anchor-session.workspace = true
+anchor-tui.workspace = true
 clap.workspace = true
 miette.workspace = true
 imara-diff.workspace = true
