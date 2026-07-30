@@ -12,22 +12,25 @@ tested and documented.
 | Raw object store | BLAKE3 identity, Zstandard envelope, verified reads, atomic publication | Streaming large-object write/read paths and performance benchmarks |
 | Manifests | Versioned CBOR, lossless Unix/WTF-16 paths, coverage and omission records | Migration fixture corpus and parser fuzzing |
 | Git awareness | `gix` discovery, tracked paths, ignores, raw index and repository state | Sparse/split-index proof, broader linked-worktree fixtures |
-| Capture | No-follow traversal, per-file and directory stability checks, limits | Incremental reuse and bounded parallel I/O |
+| Capture | No-follow traversal, per-file/directory stability checks, complete frozen policy, all-entry ceiling | Incremental reuse and bounded parallel I/O |
 | Sessions | Crash-visible lifecycle, inherited TTY/console, Unix signal forwarding, Windows Job containment, stale recovery | PTY opt-in spike only if inherited handles prove insufficient |
 | Diff | Structured path changes, exact rename detection, bounded unified text | Lazy large-session rendering and optional fuzzy rename |
 | Restore | Exact path inverse, bounded text inverse merge, recoverable worktree batch | Batch text merge, safe parent reconstruction, index composition |
 | Index | Exact raw restore after no-drift proof | Split index and combined worktree/index transaction |
 | TUI | Side-by-side/unified review and confirmed file restore | Conflicts, batch selection, hunk restore, very-large-file paging |
 | Maintenance | Doctor, shared-store GC, tombstones, transaction recovery | Retention policy and terminal-journal pruning |
-| Windows | Native no-follow capture, ACL hardening, Job containment, journaled worktree/index restore | Broader filesystem, antivirus, console, and crash-fault matrix |
+| Windows | Native no-follow capture, ACL hardening and Job containment | Metadata-safe mutation proof, broader filesystem, antivirus, console, and crash-fault matrix |
 
 ## Release-critical phases
 
 ### R1. Restoration fault-injection matrix
 
-Status: in progress. Deterministic crashes at all whole-batch and first-item
-boundaries, post-commit roll-forward, concurrent-creator refusal, and duplicate
-journal-path refusal are implemented.
+Status: complete for the Unix process-crash scope. A separate restore process is
+killed externally after twelve durable boundaries. The fixture combines
+regular add/delete/modify, symlink change, empty-directory add/delete,
+executable-bit change, exact rename, and multiple paths. Post-commit
+roll-forward, concurrent-creator refusal, and duplicate journal-path refusal
+are implemented. Machine-power-loss durability remains a separate spike.
 
 Objective: prove that every persisted batch state either rolls back to the
 recorded current state or rolls forward from the verified commit point.
@@ -111,8 +114,10 @@ Acceptance:
 ### R4. Integration, property, and fuzz suites
 
 Status: in progress. Core absent/present/content restoration invariants use
-`proptest`; manifest and native-path parser harnesses run in an isolated
-`cargo-fuzz` workspace with a scheduled smoke workflow.
+`proptest`; a named 30-row `base × session-end × current` decision table guards
+regular, symlink, directory, type and mode cases; manifest and native-path
+parser harnesses run in an isolated `cargo-fuzz` workspace with a scheduled
+smoke workflow.
 
 Objective: move safety claims out of unit-only fixtures.
 
@@ -164,7 +169,9 @@ Acceptance:
 
 ## Windows enablement
 
-Windows capture and restoration are enabled as experimental. Implemented:
+Windows capture/review is experimental. A native transaction backend exists,
+but public mutation is not claimed because extended-metadata absence is not yet
+proved. Implemented:
 
 1. handle-relative enumeration/open with 128-bit identity checks;
 2. standard symlink preservation and explicit refusal of unknown reparse tags,
@@ -172,7 +179,8 @@ Windows capture and restoration are enabled as experimental. Implemented:
 3. Local AppData storage with protected current-user/SYSTEM DACL verification;
 4. kill-on-close Job containment for the wrapped process tree;
 5. `NtCreateFile` staging, no-replace handle rename/delete, endpoint
-   verification, and durable worktree/index recovery journals.
+   verification, and recovery-journal code retained behind conservative
+   metadata refusal.
 
 Remaining hardening is a real-runner matrix for ReFS/network volumes, long and
 reserved paths, case-sensitive directories, antivirus sharing failures,
@@ -216,15 +224,8 @@ restoration remain explicit non-goals.
 
 ## Immediate next task
 
-Implement R1’s test-only fault hook for batch restore, beginning with
-`Prepared → Staged → Evacuating → Installing → Verified → Complete`.
-
-The task is independently reviewable when:
-
-- production behavior is unchanged when the hook is absent;
-- one integration test restarts recovery after each transition for a two-file
-  batch;
-- pre-commit transitions recover the exact session-end tree;
-- post-commit transitions retain the exact restored tree;
-- unresolved corruption is a visible refusal;
-- workspace tests, strict Clippy, Rustdoc, and all three platform CI builds pass.
+Refactor `anchor-session/src/restore.rs` into audit-oriented internal modules
+without changing behavior. Move public service/outcome types first, then journal
+schemas and validation, Unix mutation, batch state transitions, and recovery in
+separate commits. The existing unit, formal matrix, and subprocess-crash suites
+must remain byte-for-byte behavioral characterization throughout the move.

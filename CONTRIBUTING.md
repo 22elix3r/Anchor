@@ -30,6 +30,14 @@ Every restoration change needs state-matrix tests proving pre-session and
 post-session bytes survive. Filesystem mutation changes also need injected-race
 or evacuation/rollback tests on each supported platform.
 
+Start safety-critical review with the [independent audit
+guide](docs/audit-guide.md). Changes to capture authorization, restore
+planning, path verification, journals, recovery, index replacement, object
+publication, or garbage collection should be submitted as small semantic
+commits and receive review from someone other than the author before release.
+Pure code movement must be separate from behavior changes so reviewers can
+confirm that mutation semantics did not move at the same time.
+
 Runtime code must not invoke the `git` executable or require network access.
 Tests may eventually use Git as a parity oracle but must also retain executable-
 free fixtures.

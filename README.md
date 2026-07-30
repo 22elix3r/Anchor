@@ -184,8 +184,9 @@ degraded-behavior switches can be configured or overridden explicitly; see
 
 See [Safety and threat model](docs/safety.md) and
 [Storage format](docs/storage.md) before using Anchor on sensitive worktrees.
-Implemented and remaining work is tracked in the
-[implementation roadmap](docs/roadmap.md).
+Independent reviewers can start with the
+[audit guide](docs/audit-guide.md). Implemented and remaining work is tracked
+in the [implementation roadmap](docs/roadmap.md).
 
 ## Platform support
 
