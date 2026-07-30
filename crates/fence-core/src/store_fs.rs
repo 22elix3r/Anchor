@@ -361,13 +361,16 @@ impl StoreTempFile {
         destination: impl AsRef<OsStr>,
     ) -> io::Result<()> {
         self.file_mut().sync_all()?;
+        // Windows refuses creation of the hard-link publication name while this process retains
+        // the temporary file without delete sharing. Close it after durable content has been
+        // established; the private temporary name still retains the file until publication.
+        self.file.take();
         self.directory.hard_link(
             &self.name,
             destination_directory,
             Path::new(destination.as_ref()),
         )?;
         self.directory.remove_file(&self.name)?;
-        self.file.take();
         destination_directory
             .try_clone()?
             .into_std_file()
@@ -645,5 +648,23 @@ mod tests {
             store.open_lock("locks/session.lock"),
             Err(StoreFsError::UnsafeFile(_))
         ));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn publishes_without_clobber_below_a_hardened_nested_root() {
+        let trusted = tempfile::tempdir().unwrap();
+        let store =
+            StoreFs::open_beneath(trusted.path(), "Fence/repositories/test-worktree/v1").unwrap();
+        let mut temporary = store.temporary_file("").unwrap();
+        temporary.write_all(b"private record").unwrap();
+        temporary.persist_noclobber("record").unwrap();
+
+        assert_eq!(store.read_bounded("record", 64).unwrap(), b"private record");
+        assert!(store.root_is_private().unwrap());
     }
 }
