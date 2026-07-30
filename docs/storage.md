@@ -45,7 +45,7 @@ object is fully verified instead of overwritten.
 ## Manifests
 
 Manifest identity is a domain-separated BLAKE3 hash of deterministic CBOR.
-Writers emit schema v2; schema v1 remains byte-identical and readable. The
+Writers emit schema v3; schemas v1 and v2 remain byte-identical and readable. The
 explicit tuple contains:
 
 - record tag and schema version;
@@ -64,6 +64,13 @@ Windows read-only attribute. Windows symlinks additionally retain link kind,
 substitute name, print name, and reparse flags. Sockets, FIFOs, devices,
 junctions, cloud placeholders, EFS files, alternate streams, and unsupported
 reparse points are never silently encoded as ordinary files.
+
+Schema v3 safety observations distinguish unqueried legacy metadata, proven
+absence, detected unmodeled metadata, query failure, and platform-managed
+metadata. Regular entries also retain observed link count and a capture-local
+hard-link group. These fields authorize or refuse a mutation; they do not claim
+to reproduce topology or metadata. The schema-v1/v2 Boolean `false` is migrated
+to `Unknown`, never to proven absence.
 
 ## Sessions
 
@@ -131,17 +138,18 @@ Writers emit only the newest schema. Unsupported future schemas are refused.
 ## Restore journals
 
 Restore transaction directories contain an atomically replaced `journal.cbor`.
-Unix single-path/index schema v4 and Windows schema v2 record the owning
+Unix single-path schema v5 and index schema v4 record the owning
 session/worktree, immutable restore-plan ID, transaction ID, validated target
 path, sibling stage and backup names, exact expected node, desired node, and
-progress state.
+progress state. Windows remains on schema v2 and is not a supported mutation
+backend for the Unix alpha.
 Index journals additionally record the freshly validated index path and raw
 before/after captures.
 
-Batch-journal schema v2 stores the owning session/worktree, immutable
+Unix batch-journal schema v3 stores the owning session/worktree, immutable
 restore-plan ID, transaction ID, and an ordered list of validated relative
-paths, exact expected/desired nodes, collision-resistant sibling stage/backup
-names, per-item progress, and a batch state. Journal input
+paths, exact expected/desired nodes and safety observations, collision-resistant
+sibling stage/backup names, per-item progress, and a batch state. Journal input
 is capped at 256 MiB and duplicate paths or temporary names are rejected during
 recovery. `Verified` is the durable commit point: recovery rolls earlier states
 back and rolls this state forward by verifying targets and removing backups.

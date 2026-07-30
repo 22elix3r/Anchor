@@ -192,17 +192,19 @@ Implemented and remaining work is tracked in the
 |---|---|---|
 | Linux | Supported | Experimental single-path and batch |
 | macOS | Supported | Experimental single-path and batch |
-| Windows | Experimental native support | Experimental single-path and batch |
+| Windows | Experimental native support | Not claimed; metadata-safe mutation is pending |
 
 Windows paths and command arguments retain exact WTF-16. Capture uses pinned
 directory handles, 128-bit file identities, reparse-point inspection, and
-alternate-stream detection. Restore uses handle-relative NT creation plus
-no-replace handle renames and durable recovery journals. Stores live under the
-current user's Local AppData and receive a protected current-user/SYSTEM DACL.
-The wrapped process tree is assigned to a kill-on-close Job object. Windows
-remains experimental while its real-runner compatibility matrix grows,
-especially for non-NTFS volumes, antivirus sharing interference, unusual
-case-sensitive directories, and third-party console applications.
+alternate-stream detection. A native no-replace transaction backend exists,
+but the current manifest records extended-metadata observation as unavailable,
+so public worktree mutation remains refused until that proof gap is closed.
+Stores live under the current user's Local AppData and receive a protected
+current-user/SYSTEM DACL. The wrapped process tree is assigned to a
+kill-on-close Job object. Windows capture/review remains experimental while its
+real-runner compatibility matrix grows, especially for non-NTFS volumes,
+antivirus sharing interference, unusual case-sensitive directories, and
+third-party console applications.
 
 ## Contributing
 

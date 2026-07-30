@@ -49,6 +49,14 @@ changes “session-window changes,” never “changes made by the agent.”
     source selection, case mode, tracked set, and repository boundaries. Every
     later endpoint compiles that retained record; live policy drift is reported
     but does not redefine the session scope.
+13. Worktree mutation refuses every `.git` path component (under conservative
+    ASCII case folding), every frozen submodule or nested-repository boundary,
+    and every worktree-relative Git or Anchor-store location. The same check is
+    repeated when an untrusted recovery plan is loaded.
+14. A regular file with more than one hard link is never replaced. On Linux and
+    macOS, regular files and empty directories are replaced only after Anchor
+    proves that unmodeled extended metadata is absent. Query failure is a
+    refusal, not an assumed absence.
 
 ## Restore decisions
 
@@ -65,9 +73,14 @@ changes “session-window changes,” never “changes made by the agent.”
 | present | present | third opaque state | Conflict |
 
 Executable bits are reasoned about independently. If the session changed only
-the executable bits, Anchor can invert them while retaining later content. It
-does not preserve ownership, timestamps, ACLs, extended attributes, or general
-permission bits.
+the executable bits, Anchor can invert them while retaining later content.
+Anchor does not restore ownership, timestamps, ACLs, extended attributes, or
+general permission bits. Instead, Unix mutation refuses hard-linked regular
+files and nodes on which ACL/xattr observation reports unmodeled metadata or is
+unavailable. Linux SELinux labels are treated as platform-managed metadata only:
+replacement proceeds only when the staged and current open handles carry the
+same label. Device/inode identity and link count are safety observations, not
+backup metadata.
 
 For a regular text file whose current bytes differ from both endpoints,
 `--merge` may calculate an inverse three-way merge with `session end` as the
@@ -203,6 +216,9 @@ as untrusted:
 - object IDs and manifest IDs are recomputed on read;
 - frozen-policy and restore-plan IDs are recomputed before their records are
   used;
+- restore targets are rejected if they address Git metadata, Anchor storage,
+  submodules, or nested repositories, even if a corrupt manifest contains such
+  a path;
 - garbage collection aborts if retained metadata cannot be decoded and all
   reachable objects cannot be verified.
 
@@ -215,7 +231,14 @@ as untrusted:
 - no worktree-plus-index combined transaction;
 - no split-index restoration or Git history restoration;
 - no recursive dirty-submodule capture or restoration;
-- no preservation of hard-link topology, ACLs, xattrs, ownership, or timestamps;
+- no preservation of hard-link topology, ACLs, xattrs, ownership, timestamps,
+  resource forks, filesystem flags, or general Unix mode bits; detected
+  hard-link/xattr/ACL cases are refused rather than partially preserved;
+- schema-v1/v2 manifests did not prove metadata absence and are therefore
+  review-only for any restoration that would mutate a regular file or
+  directory;
+- Windows capture records extended-metadata observation as unavailable, so the
+  current release makes no Windows worktree-mutation safety claim;
 - `SIGKILL`, power loss, or machine failure can leave an incomplete session
   that must be marked abandoned after its child lock is free;
 - Windows support is experimental on non-NTFS filesystems, case-sensitive

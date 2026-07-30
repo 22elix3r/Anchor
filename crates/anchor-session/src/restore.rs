@@ -13,10 +13,15 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use anchor_core::ObjectStore;
 use anchor_core::{
-    CaptureEngine, ConflictReason, ManifestEntry, ManifestId, ManifestNode, NativeRelativePath,
-    NoChangeReason, ObjectId, ObservedKind, RestoreConflict, RestoreOutcome, RestorePlan,
-    ScopeClassifier, ScopeDecision, ScopeError, TextMergeConflict, TextMergeLimits,
-    TextMergeResult, inverse_three_way_text_merge,
+    CaptureEngine, ConflictReason, Manifest, ManifestEntry, ManifestId, ManifestNode,
+    MetadataObservation, NativeRelativePath, NoChangeReason, ObjectId, ObservedKind,
+    RestoreConflict, RestoreOutcome, RestorePlan, ScopeClassifier, ScopeDecision, ScopeError,
+    TextMergeConflict, TextMergeLimits, TextMergeResult, inverse_three_way_text_merge,
+};
+#[cfg(unix)]
+use anchor_core::{
+    observe_directory_extended_metadata, observe_extended_metadata,
+    platform_managed_directory_metadata_equal, platform_managed_metadata_equal,
 };
 use anchor_git::{GitContext, IndexCapture};
 #[cfg(unix)]
@@ -32,7 +37,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::restore_plan::{
-    PlanItem, PlanOperation, PlanPresence, PlanProof, RestorePlanId, RestorePlanRecord,
+    PlanItem, PlanOperation, PlanPresence, PlanProof, PlanSafety, RestorePlanId, RestorePlanRecord,
 };
 use crate::{SessionError, SessionId, SessionStore};
 
@@ -44,6 +49,10 @@ mod windows;
 const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(unix)]
 const BATCH_JOURNAL_TAG: u64 = 0x414e_4348_4f52_424a;
+#[cfg(unix)]
+const FILE_JOURNAL_SCHEMA: u16 = 5;
+#[cfg(unix)]
+const BATCH_JOURNAL_SCHEMA: u16 = 3;
 
 #[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,6 +232,8 @@ impl RestoreService {
         let frozen_policy = store.load_frozen_policy(policy_id)?;
         let base = store.load_manifest(session.before.manifest)?;
         let endpoint = store.load_manifest(after.manifest)?;
+        validate_manifest_mutation_paths(&context, &frozen_policy, &base)?;
+        validate_manifest_mutation_paths(&context, &frozen_policy, &endpoint)?;
         let current_endpoint = crate::capture_frozen_endpoint(
             &context,
             store,
@@ -364,8 +375,15 @@ impl RestoreService {
             return Err(RestoreError::RepositoryDrift);
         }
 
+        let policy_id = session
+            .frozen_policy
+            .ok_or(RestoreError::LegacySessionWithoutFrozenPolicy)?;
+        let frozen_policy = store.load_frozen_policy(policy_id)?;
         let base = store.load_manifest(session.before.manifest)?;
         let endpoint = store.load_manifest(after.manifest)?;
+        validate_manifest_mutation_paths(&context, &frozen_policy, &base)?;
+        validate_manifest_mutation_paths(&context, &frozen_policy, &endpoint)?;
+        validate_mutation_path(&context, &frozen_policy, &selected)?;
         let expected = endpoint
             .entries()
             .iter()
@@ -722,6 +740,28 @@ fn node_kind(node: &ManifestNode) -> ObservedKind {
     }
 }
 
+fn validate_manifest_mutation_paths(
+    context: &GitContext,
+    policy: &anchor_git::FrozenGitPolicy,
+    manifest: &Manifest,
+) -> Result<(), RestoreError> {
+    for entry in manifest.entries() {
+        validate_mutation_path(context, policy, &entry.path)?;
+    }
+    Ok(())
+}
+
+fn validate_mutation_path(
+    context: &GitContext,
+    policy: &anchor_git::FrozenGitPolicy,
+    path: &NativeRelativePath,
+) -> Result<(), RestoreError> {
+    if context.is_protected_mutation_path(policy, path) {
+        return Err(RestoreError::ProtectedWorktreePath(path.clone()));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct BatchWrite {
     pub(super) path: NativeRelativePath,
@@ -749,7 +789,7 @@ fn apply_batch(
     let journal_path = transaction_path.join("journal.cbor");
     let mut journal = BatchRestoreJournal {
         tag: BATCH_JOURNAL_TAG,
-        schema: 2,
+        schema: BATCH_JOURNAL_SCHEMA,
         plan_id: Some(plan_id),
         transaction_id: Some(transaction_id),
         session_id,
@@ -818,10 +858,24 @@ fn apply_batch_inner(
     journal_path: &Path,
 ) -> Result<(), RestoreError> {
     for (index, write) in writes.iter().enumerate() {
-        let (parent, _) = open_batch_parent(worktree, &write.path)?;
+        let (parent, current_name) = open_batch_parent(worktree, &write.path)?;
         let stage = OsString::from(&journal.items[index].stage_name);
         if let Some(desired) = &write.desired {
             stage_node(&parent, &stage, desired, store.objects())?;
+            if !verify_node(&parent, &stage, Some(desired), store.objects())? {
+                return Err(RestoreError::VerificationFailed);
+            }
+            if let Some(expected) = &write.expected {
+                if !platform_metadata_survives_replace(
+                    &parent,
+                    &current_name,
+                    expected,
+                    &stage,
+                    desired,
+                )? {
+                    return Err(RestoreError::VerificationFailed);
+                }
+            }
         }
         journal.items[index].state = BatchItemState::Staged;
         save_batch_journal(journal_path, journal)?;
@@ -1025,7 +1079,7 @@ fn apply_one(
     let backup_name = OsString::from(&backup_name_text);
     let journal_path = transaction_path.join("journal.cbor");
     let mut journal = RestoreJournal {
-        schema: 4,
+        schema: FILE_JOURNAL_SCHEMA,
         session_id,
         plan_id: Some(plan_id),
         transaction_id: Some(transaction_id),
@@ -1042,6 +1096,17 @@ fn apply_one(
 
     if let Some(desired) = desired {
         stage_node(&parent, &stage_name, desired, store.objects())?;
+        if !verify_node(&parent, &stage_name, Some(desired), store.objects())? {
+            cleanup_stage(&parent, &stage_name, Some(desired));
+            return Err(RestoreError::VerificationFailed);
+        }
+        if let Some(expected) = expected {
+            if !platform_metadata_survives_replace(&parent, &name, expected, &stage_name, desired)?
+            {
+                cleanup_stage(&parent, &stage_name, Some(desired));
+                return Err(RestoreError::VerificationFailed);
+            }
+        }
     }
 
     let had_current = expected.is_some();
@@ -1361,6 +1426,39 @@ fn execute_mode(bits: u8) -> u32 {
 }
 
 #[cfg(unix)]
+fn platform_metadata_survives_replace(
+    parent: &Dir,
+    current_name: &OsStr,
+    current: &ManifestEntry,
+    stage_name: &OsStr,
+    staged: &ManifestEntry,
+) -> Result<bool, RestoreError> {
+    if current.safety.extended_metadata != MetadataObservation::PlatformManaged
+        && staged.safety.extended_metadata != MetadataObservation::PlatformManaged
+    {
+        return Ok(true);
+    }
+    if current.safety.extended_metadata != MetadataObservation::PlatformManaged
+        || staged.safety.extended_metadata != MetadataObservation::PlatformManaged
+    {
+        return Ok(false);
+    }
+    match (&current.node, &staged.node) {
+        (ManifestNode::Regular { .. }, ManifestNode::Regular { .. }) => {
+            let current = parent.open(current_name)?;
+            let staged = parent.open(stage_name)?;
+            Ok(platform_managed_metadata_equal(&current, &staged))
+        }
+        (ManifestNode::EmptyDirectory, ManifestNode::EmptyDirectory) => {
+            let current = parent.open_dir(current_name)?;
+            let staged = parent.open_dir(stage_name)?;
+            Ok(platform_managed_directory_metadata_equal(&current, &staged))
+        }
+        _ => Ok(false),
+    }
+}
+
+#[cfg(unix)]
 fn verify_node(
     directory: &Dir,
     name: &OsStr,
@@ -1386,13 +1484,37 @@ fn verify_node(
                 return Ok(false);
             }
             let mut file = directory.open(name)?;
+            let opened = file.metadata()?;
+            {
+                use cap_std::fs::MetadataExt as _;
+                if metadata.dev() != opened.dev()
+                    || metadata.ino() != opened.ino()
+                    || opened.nlink() != expected.safety.link_count
+                {
+                    return Ok(false);
+                }
+            }
+            let extended_before = observe_extended_metadata(&file);
             let (actual, size) = objects.put(&mut file)?;
             if actual != *object || size != *raw_size {
                 return Ok(false);
             }
+            let after = file.metadata()?;
+            let extended_after = observe_extended_metadata(&file);
+            {
+                use cap_std::fs::MetadataExt as _;
+                if opened.dev() != after.dev()
+                    || opened.ino() != after.ino()
+                    || after.nlink() != expected.safety.link_count
+                    || extended_before != expected.safety.extended_metadata
+                    || extended_after != expected.safety.extended_metadata
+                {
+                    return Ok(false);
+                }
+            }
             if let Some(expected_bits) = unix_exec_bits {
                 use cap_std::fs::MetadataExt as _;
-                let mode = metadata.mode();
+                let mode = after.mode();
                 let actual_bits = u8::from(mode & 0o100 != 0) << 2
                     | u8::from(mode & 0o010 != 0) << 1
                     | u8::from(mode & 0o001 != 0);
@@ -1413,7 +1535,9 @@ fn verify_node(
                 return Ok(false);
             }
             let directory = directory.open_dir(name)?;
-            Ok(directory.entries()?.next().is_none())
+            Ok(directory.entries()?.next().is_none()
+                && observe_directory_extended_metadata(&directory)
+                    == expected.safety.extended_metadata)
         }
     }
 }
@@ -1602,14 +1726,20 @@ enum JournalNode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum JournalPresence {
     Absent,
+    /// Legacy representation from journal schemas through file v4 / batch v2.
     Present(JournalNode),
+    PresentV2 {
+        node: JournalNode,
+        safety: PlanSafety,
+    },
 }
 
 #[cfg(unix)]
 impl JournalPresence {
     fn from_entry(entry: Option<&ManifestEntry>) -> Self {
-        entry.map_or(Self::Absent, |entry| {
-            Self::Present(JournalNode::from_entry(entry))
+        entry.map_or(Self::Absent, |entry| Self::PresentV2 {
+            node: JournalNode::from_entry(entry),
+            safety: PlanSafety::from_observations(&entry.safety),
         })
     }
 
@@ -1617,6 +1747,11 @@ impl JournalPresence {
         match self {
             Self::Absent => None,
             Self::Present(node) => Some(node.to_entry(path)),
+            Self::PresentV2 { node, safety } => {
+                let mut entry = node.to_entry(path);
+                entry.safety = safety.to_observations();
+                Some(entry)
+            }
         }
     }
 }
@@ -1727,7 +1862,7 @@ pub(crate) fn scan_transactions(root: &Path) -> Result<TransactionSummary, Resto
         if let Ok(journal) =
             ciborium::de::from_reader::<BatchRestoreJournal, _>(Cursor::new(&bytes))
         {
-            if journal.tag != BATCH_JOURNAL_TAG || !matches!(journal.schema, 1 | 2) {
+            if journal.tag != BATCH_JOURNAL_TAG || !matches!(journal.schema, 1..=3) {
                 return Err(RestoreError::Journal(format!(
                     "transaction {} has an unsupported batch journal",
                     entry.file_name().to_string_lossy()
@@ -1893,6 +2028,10 @@ fn validate_restore_plan(
     let worktree = PathBuf::from(session.worktree_root.to_host()?);
     let context = GitContext::discover(&worktree)?;
     validate_store_identity(store, &context)?;
+    let policy_id = session
+        .frozen_policy
+        .ok_or(RestoreError::LegacySessionWithoutFrozenPolicy)?;
+    let frozen_policy = store.load_frozen_policy(policy_id)?;
     if context.repository_state()? != plan.repository {
         return Err(RestoreError::RepositoryDrift);
     }
@@ -1904,12 +2043,18 @@ fn validate_restore_plan(
             current_manifest,
             items,
         } => {
+            for item in items {
+                validate_mutation_path(&context, &frozen_policy, &item.path)?;
+            }
             if *base_manifest != session.before.manifest || *session_manifest != after.manifest {
                 return Err(RestoreError::RecoveryPlanMismatch);
             }
             let base = store.load_manifest(*base_manifest)?;
             let endpoint = store.load_manifest(*session_manifest)?;
             let current = store.load_manifest(*current_manifest)?;
+            validate_manifest_mutation_paths(&context, &frozen_policy, &base)?;
+            validate_manifest_mutation_paths(&context, &frozen_policy, &endpoint)?;
+            validate_manifest_mutation_paths(&context, &frozen_policy, &current)?;
             let selected = items
                 .iter()
                 .map(|item| item.path.clone())
@@ -1985,7 +2130,7 @@ fn recover_batch_journal(
     journal: &mut BatchRestoreJournal,
     journal_path: &Path,
 ) -> Result<(), RestoreError> {
-    if journal.tag != BATCH_JOURNAL_TAG || journal.schema != 2 {
+    if journal.tag != BATCH_JOURNAL_TAG || journal.schema != BATCH_JOURNAL_SCHEMA {
         return Err(RestoreError::LegacyRecoveryUnsupported(
             journal_path.display().to_string(),
         ));
@@ -2067,7 +2212,7 @@ fn recover_file_journal(
     journal: &mut RestoreJournal,
     journal_path: &Path,
 ) -> Result<(), RestoreError> {
-    if journal.schema != 4 {
+    if journal.schema != FILE_JOURNAL_SCHEMA {
         return Err(RestoreError::LegacyRecoveryUnsupported(
             journal_path.display().to_string(),
         ));
@@ -2154,7 +2299,9 @@ fn recover_file_journal(
 fn same_optional_node(left: Option<&ManifestEntry>, right: Option<&ManifestEntry>) -> bool {
     match (left, right) {
         (None, None) => true,
-        (Some(left), Some(right)) => left.path == right.path && left.node == right.node,
+        (Some(left), Some(right)) => {
+            left.path == right.path && left.node == right.node && left.safety == right.safety
+        }
         _ => false,
     }
 }
@@ -2457,6 +2604,10 @@ pub enum RestoreError {
     IndexLock(io::Error),
     #[error("the worktree root itself cannot be restored")]
     UnsafeRootPath,
+    #[error(
+        "restore path addresses protected Git, Anchor-store, submodule, or nested-repository data: {0:?}"
+    )]
+    ProtectedWorktreePath(NativeRelativePath),
     #[error("current path state changed before it could be safely evacuated")]
     CurrentChanged,
     #[error("current Git index changed before it could be safely evacuated")]
@@ -2604,7 +2755,10 @@ mod tests {
         fs::write(root.path().join("file"), b"pre-existing human bytes").unwrap();
         let (store, session) = run_change(root.path(), "printf session > file");
         let result = RestoreService::restore_file(&store, session, selected(b"file")).unwrap();
-        assert!(matches!(result, RestoreApplyResult::Applied { .. }));
+        assert!(
+            matches!(result, RestoreApplyResult::Applied { .. }),
+            "{result:?}"
+        );
         assert_eq!(
             fs::read(root.path().join("file")).unwrap(),
             b"pre-existing human bytes"
@@ -3287,12 +3441,89 @@ mod tests {
     }
 
     #[test]
+    fn restore_refuses_git_metadata_before_selected_capture() {
+        let root = repository();
+        let (store, session) = run_change(root.path(), "printf session > added");
+        let config_before = fs::read(root.path().join(".git").join("config")).unwrap();
+        let selected = NativeRelativePath::from_host_path(Path::new(".git/config")).unwrap();
+
+        let error = RestoreService::restore_file(&store, session, selected.clone()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RestoreError::ProtectedWorktreePath(path) if path == selected
+        ));
+        assert_eq!(
+            fs::read(root.path().join(".git").join("config")).unwrap(),
+            config_before
+        );
+    }
+
+    #[test]
+    fn restore_refuses_a_hardlinked_regular_file() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root = repository();
+        fs::write(root.path().join("file"), b"base").unwrap();
+        fs::hard_link(root.path().join("file"), root.path().join("alias")).unwrap();
+        let (store, session) = run_change(root.path(), "printf session > file");
+        let inode_before = fs::metadata(root.path().join("file")).unwrap().ino();
+
+        let result = RestoreService::restore_file(&store, session, selected(b"file")).unwrap();
+
+        assert!(matches!(
+            result,
+            RestoreApplyResult::Conflict {
+                reason: ConflictReason::HardlinkTopology
+            }
+        ));
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"session");
+        assert_eq!(fs::read(root.path().join("alias")).unwrap(), b"session");
+        assert_eq!(
+            fs::metadata(root.path().join("alias")).unwrap().ino(),
+            inode_before
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_refuses_a_regular_file_with_unmodeled_xattrs() {
+        let root = repository();
+        let path = root.path().join("file");
+        fs::write(&path, b"base").unwrap();
+        rustix::fs::setxattr(
+            &path,
+            "user.anchor-test",
+            b"retain-me",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+        let (store, session) = run_change(root.path(), "printf session > file");
+
+        let result = RestoreService::restore_file(&store, session, selected(b"file")).unwrap();
+
+        assert!(matches!(
+            result,
+            RestoreApplyResult::Conflict {
+                reason: ConflictReason::UnmodeledMetadataPresent
+            }
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"session");
+        let mut value = [0_u8; 32];
+        let length = rustix::fs::getxattr(&path, "user.anchor-test", &mut value).unwrap();
+        assert_eq!(&value[..length], b"retain-me");
+    }
+
+    #[test]
     fn restores_empty_directory_additions_and_deletions() {
         let added_root = repository();
         let (store, session) = run_change(added_root.path(), "mkdir added-empty");
         let result =
             RestoreService::restore_file(&store, session, selected(b"added-empty")).unwrap();
-        assert!(matches!(result, RestoreApplyResult::Applied { .. }));
+        assert!(
+            matches!(result, RestoreApplyResult::Applied { .. }),
+            "{result:?}"
+        );
         assert!(!added_root.path().join("added-empty").exists());
 
         let deleted_root = repository();

@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::{NativeRelativePath, NativeString, ObjectId, PathEncoding, PathError};
 
 const MANIFEST_TAG: u64 = 0x414d;
-const MANIFEST_SCHEMA: u16 = 2;
+const MANIFEST_SCHEMA: u16 = 3;
 const MAX_ENCODED_MANIFEST: usize = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 1_000_000;
 
@@ -185,12 +185,23 @@ impl Manifest {
                 ciborium::ser::into_writer(&wire, &mut output)
                     .map_err(|error| ManifestError::Encode(error.to_string()))?;
             }
-            MANIFEST_SCHEMA => {
+            2 => {
                 let wire = ManifestWireV2(
+                    MANIFEST_TAG,
+                    2,
+                    encoding_tag(self.path_encoding),
+                    self.entries.iter().map(EntryWireV2::from).collect(),
+                    CoverageWire::from(&self.coverage),
+                );
+                ciborium::ser::into_writer(&wire, &mut output)
+                    .map_err(|error| ManifestError::Encode(error.to_string()))?;
+            }
+            MANIFEST_SCHEMA => {
+                let wire = ManifestWireV3(
                     MANIFEST_TAG,
                     MANIFEST_SCHEMA,
                     encoding_tag(self.path_encoding),
-                    self.entries.iter().map(EntryWireV2::from).collect(),
+                    self.entries.iter().map(EntryWireV3::from).collect(),
                     CoverageWire::from(&self.coverage),
                 );
                 ciborium::ser::into_writer(&wire, &mut output)
@@ -213,11 +224,20 @@ impl Manifest {
         if bytes.len() > MAX_ENCODED_MANIFEST {
             return Err(ManifestError::EncodedTooLarge);
         }
-        if let Ok(wire) = ciborium::de::from_reader::<ManifestWireV2, _>(Cursor::new(bytes)) {
+        if let Ok(wire) = ciborium::de::from_reader::<ManifestWireV3, _>(Cursor::new(bytes)) {
             if wire.0 != MANIFEST_TAG {
                 return Err(ManifestError::WrongTag);
             }
             if wire.1 != MANIFEST_SCHEMA {
+                return Err(ManifestError::UnsupportedSchema(wire.1));
+            }
+            return Self::from_v3_wire(wire);
+        }
+        if let Ok(wire) = ciborium::de::from_reader::<ManifestWireV2, _>(Cursor::new(bytes)) {
+            if wire.0 != MANIFEST_TAG {
+                return Err(ManifestError::WrongTag);
+            }
+            if wire.1 != 2 {
                 return Err(ManifestError::UnsupportedSchema(wire.1));
             }
             return Self::from_v2_wire(wire);
@@ -243,7 +263,8 @@ impl Manifest {
         let mut hasher = blake3::Hasher::new();
         hasher.update(match self.schema {
             1 => b"anchor:manifest:v1\0",
-            MANIFEST_SCHEMA => b"anchor:manifest:v2\0",
+            2 => b"anchor:manifest:v2\0",
+            MANIFEST_SCHEMA => b"anchor:manifest:v3\0",
             _ => return Err(ManifestError::UnsupportedSchema(self.schema)),
         });
         hasher.update(&encoded);
@@ -265,6 +286,20 @@ impl Manifest {
     }
 
     fn from_v2_wire(wire: ManifestWireV2) -> Result<Self, ManifestError> {
+        if wire.3.len() > MAX_ENTRIES {
+            return Err(ManifestError::TooManyEntries);
+        }
+        let encoding = decode_encoding(wire.2)?;
+        let entries = wire
+            .3
+            .into_iter()
+            .map(|entry| entry.into_entry(encoding))
+            .collect::<Result<Vec<_>, _>>()?;
+        let coverage = wire.4.into_coverage(encoding)?;
+        Self::from_decoded(2, encoding, entries, coverage)
+    }
+
+    fn from_v3_wire(wire: ManifestWireV3) -> Result<Self, ManifestError> {
         if wire.3.len() > MAX_ENTRIES {
             return Err(ManifestError::TooManyEntries);
         }
@@ -305,7 +340,7 @@ impl Manifest {
             entries,
             coverage,
         };
-        if schema == MANIFEST_SCHEMA {
+        if schema >= 2 {
             manifest.validate_platform_metadata()?;
         }
         Ok(manifest)
@@ -409,7 +444,23 @@ pub enum WindowsSymlinkKind {
 pub struct SafetyObservations {
     pub hardlink_group: Option<u64>,
     pub link_count: u64,
-    pub extended_metadata_present: bool,
+    pub extended_metadata: MetadataObservation,
+}
+
+/// Whether unmodeled ACL/xattr/resource-fork metadata was observable at capture time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MetadataObservation {
+    /// A legacy manifest did not make a trustworthy query.
+    #[default]
+    Unknown,
+    /// The platform query completed and found no extended metadata.
+    Absent,
+    /// The platform query found at least one unmodeled metadata record.
+    Present,
+    /// The platform or filesystem could not make a trustworthy query.
+    Unavailable,
+    /// Only platform-managed labeling metadata was present and can be compared before replace.
+    PlatformManaged,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -449,10 +500,16 @@ struct ManifestWireV1(u64, u16, u8, Vec<EntryWireV1>, CoverageWire);
 struct ManifestWireV2(u64, u16, u8, Vec<EntryWireV2>, CoverageWire);
 
 #[derive(Serialize, Deserialize)]
+struct ManifestWireV3(u64, u16, u8, Vec<EntryWireV3>, CoverageWire);
+
+#[derive(Serialize, Deserialize)]
 struct EntryWireV1(PathWire, NodeWireV1, SafetyWire);
 
 #[derive(Serialize, Deserialize)]
 struct EntryWireV2(PathWire, NodeWireV2, SafetyWire);
+
+#[derive(Serialize, Deserialize)]
+struct EntryWireV3(PathWire, NodeWireV2, SafetyWireV3);
 
 #[derive(Serialize, Deserialize)]
 struct PathWire(u8, Vec<ByteBuf>);
@@ -485,6 +542,9 @@ struct NodeWireV2(
 
 #[derive(Serialize, Deserialize)]
 struct SafetyWire(Option<u64>, u64, bool);
+
+#[derive(Serialize, Deserialize)]
+struct SafetyWireV3(Option<u64>, u64, u8);
 
 #[derive(Serialize, Deserialize)]
 struct CoverageWire(u8, Vec<OmissionWire>);
@@ -531,7 +591,7 @@ impl From<&ManifestEntry> for EntryWireV1 {
             SafetyWire(
                 entry.safety.hardlink_group,
                 entry.safety.link_count,
-                entry.safety.extended_metadata_present,
+                entry.safety.extended_metadata == MetadataObservation::Present,
             ),
         )
     }
@@ -590,7 +650,22 @@ impl From<&ManifestEntry> for EntryWireV2 {
             SafetyWire(
                 entry.safety.hardlink_group,
                 entry.safety.link_count,
-                entry.safety.extended_metadata_present,
+                entry.safety.extended_metadata == MetadataObservation::Present,
+            ),
+        )
+    }
+}
+
+impl From<&ManifestEntry> for EntryWireV3 {
+    fn from(entry: &ManifestEntry) -> Self {
+        let EntryWireV2(path, node, _) = EntryWireV2::from(entry);
+        Self(
+            path,
+            node,
+            SafetyWireV3(
+                entry.safety.hardlink_group,
+                entry.safety.link_count,
+                metadata_observation_tag(entry.safety.extended_metadata),
             ),
         )
     }
@@ -637,7 +712,11 @@ impl EntryWireV1 {
             safety: SafetyObservations {
                 hardlink_group: self.2.0,
                 link_count: self.2.1,
-                extended_metadata_present: self.2.2,
+                extended_metadata: if self.2.2 {
+                    MetadataObservation::Present
+                } else {
+                    MetadataObservation::Unknown
+                },
             },
         })
     }
@@ -719,9 +798,27 @@ impl EntryWireV2 {
             safety: SafetyObservations {
                 hardlink_group: self.2.0,
                 link_count: self.2.1,
-                extended_metadata_present: self.2.2,
+                extended_metadata: if self.2.2 {
+                    MetadataObservation::Present
+                } else {
+                    MetadataObservation::Unknown
+                },
             },
         })
+    }
+}
+
+impl EntryWireV3 {
+    fn into_entry(self, manifest_encoding: PathEncoding) -> Result<ManifestEntry, ManifestError> {
+        let Self(path, node, safety) = self;
+        let mut entry =
+            EntryWireV2(path, node, SafetyWire(None, 0, false)).into_entry(manifest_encoding)?;
+        entry.safety = SafetyObservations {
+            hardlink_group: safety.0,
+            link_count: safety.1,
+            extended_metadata: decode_metadata_observation(safety.2)?,
+        };
+        Ok(entry)
     }
 }
 
@@ -730,6 +827,27 @@ fn decode_windows_link_kind(value: u8) -> Result<WindowsSymlinkKind, ManifestErr
         1 => Ok(WindowsSymlinkKind::File),
         2 => Ok(WindowsSymlinkKind::Directory),
         _ => Err(ManifestError::InvalidWindowsLinkKind(value)),
+    }
+}
+
+const fn metadata_observation_tag(value: MetadataObservation) -> u8 {
+    match value {
+        MetadataObservation::Unknown => 0,
+        MetadataObservation::Absent => 1,
+        MetadataObservation::Present => 2,
+        MetadataObservation::Unavailable => 3,
+        MetadataObservation::PlatformManaged => 4,
+    }
+}
+
+fn decode_metadata_observation(value: u8) -> Result<MetadataObservation, ManifestError> {
+    match value {
+        0 => Ok(MetadataObservation::Unknown),
+        1 => Ok(MetadataObservation::Absent),
+        2 => Ok(MetadataObservation::Present),
+        3 => Ok(MetadataObservation::Unavailable),
+        4 => Ok(MetadataObservation::PlatformManaged),
+        value => Err(ManifestError::InvalidMetadataObservation(value)),
     }
 }
 
@@ -888,6 +1006,8 @@ pub enum ManifestError {
     InvalidPlatformMetadata,
     #[error("manifest contains invalid Windows symbolic-link kind {0}")]
     InvalidWindowsLinkKind(u8),
+    #[error("manifest contains invalid metadata-observation value {0}")]
+    InvalidMetadataObservation(u8),
     #[error("manifest contains invalid completeness value {0}")]
     InvalidCompleteness(u8),
     #[error("manifest contains unknown omission reason {0}")]
@@ -997,6 +1117,40 @@ mod tests {
     }
 
     #[test]
+    fn schema_v2_absence_bit_migrates_to_unknown_metadata() {
+        let legacy = Manifest {
+            schema: 2,
+            path_encoding: PathEncoding::UnixBytes,
+            entries: vec![ManifestEntry {
+                path: path(&[b"legacy"]),
+                node: ManifestNode::Regular {
+                    object: ObjectId::from_raw(b"legacy"),
+                    raw_size: 6,
+                    unix_exec_bits: Some(0),
+                    windows_readonly: None,
+                },
+                safety: SafetyObservations {
+                    hardlink_group: None,
+                    link_count: 1,
+                    extended_metadata: MetadataObservation::Unknown,
+                },
+            }],
+            coverage: Coverage {
+                completeness: Completeness::Complete,
+                omissions: Vec::new(),
+            },
+        };
+        let id = legacy.id().unwrap();
+        let decoded = Manifest::decode(&legacy.encode().unwrap()).unwrap();
+        assert_eq!(decoded.schema_version(), 2);
+        assert_eq!(decoded.id().unwrap(), id);
+        assert_eq!(
+            decoded.entries()[0].safety.extended_metadata,
+            MetadataObservation::Unknown
+        );
+    }
+
+    #[test]
     fn windows_manifest_preserves_readonly_and_symlink_payload() {
         fn windows(value: &str) -> Vec<u8> {
             value.encode_utf16().flat_map(u16::to_le_bytes).collect()
@@ -1049,7 +1203,7 @@ mod tests {
         .unwrap();
 
         let decoded = Manifest::decode(&manifest.encode().unwrap()).unwrap();
-        assert_eq!(decoded.schema_version(), 2);
+        assert_eq!(decoded.schema_version(), 3);
         assert_eq!(decoded, manifest);
     }
 

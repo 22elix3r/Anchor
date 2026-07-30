@@ -4,8 +4,8 @@ use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 
 use anchor_core::{
-    ManifestEntry, ManifestId, ManifestNode, NativeRelativePath, NativeString, ObjectId,
-    SafetyObservations, WindowsSymlinkKind,
+    ManifestEntry, ManifestId, ManifestNode, MetadataObservation, NativeRelativePath, NativeString,
+    ObjectId, SafetyObservations, WindowsSymlinkKind,
 };
 use anchor_git::{IndexCapture, RepositoryState};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::{SessionError, SessionId, SessionStore, bounded_read, private_directory};
 
 const PLAN_TAG: u64 = 0x4152_504c_414e_5631;
-const PLAN_SCHEMA: u16 = 1;
+const PLAN_SCHEMA: u16 = 2;
 const MAX_PLAN_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PLAN_ITEMS: usize = 250_000;
 
@@ -179,7 +179,11 @@ impl RestorePlanRecord {
     pub(crate) fn id(&self) -> Result<RestorePlanId, RestorePlanError> {
         let bytes = self.encode()?;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"anchor:restore-plan:v1\0");
+        hasher.update(match self.schema {
+            1 => b"anchor:restore-plan:v1\0",
+            PLAN_SCHEMA => b"anchor:restore-plan:v2\0",
+            schema => return Err(RestorePlanError::UnsupportedSchema(schema)),
+        });
         hasher.update(&bytes);
         Ok(RestorePlanId::from_bytes(*hasher.finalize().as_bytes()))
     }
@@ -188,7 +192,7 @@ impl RestorePlanRecord {
         if self.tag != PLAN_TAG {
             return Err(RestorePlanError::WrongTag);
         }
-        if self.schema != PLAN_SCHEMA {
+        if !matches!(self.schema, 1 | PLAN_SCHEMA) {
             return Err(RestorePlanError::UnsupportedSchema(self.schema));
         }
         if self.worktree_key.is_empty() {
@@ -429,23 +433,53 @@ impl PlanNode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PlanSafety(Option<u64>, u64, bool);
+pub(crate) struct PlanSafety(Option<u64>, u64, bool, #[serde(default)] Option<u8>);
 
 impl PlanSafety {
-    fn from_observations(value: &SafetyObservations) -> Self {
+    pub(crate) fn from_observations(value: &SafetyObservations) -> Self {
         Self(
             value.hardlink_group,
             value.link_count,
-            value.extended_metadata_present,
+            value.extended_metadata == MetadataObservation::Present,
+            Some(metadata_tag(value.extended_metadata)),
         )
     }
 
-    fn to_observations(&self) -> SafetyObservations {
+    pub(crate) fn to_observations(&self) -> SafetyObservations {
         SafetyObservations {
             hardlink_group: self.0,
             link_count: self.1,
-            extended_metadata_present: self.2,
+            extended_metadata: self.3.map_or_else(
+                || {
+                    if self.2 {
+                        MetadataObservation::Present
+                    } else {
+                        MetadataObservation::Unknown
+                    }
+                },
+                decode_metadata_tag,
+            ),
         }
+    }
+}
+
+const fn metadata_tag(value: MetadataObservation) -> u8 {
+    match value {
+        MetadataObservation::Unknown => 0,
+        MetadataObservation::Absent => 1,
+        MetadataObservation::Present => 2,
+        MetadataObservation::Unavailable => 3,
+        MetadataObservation::PlatformManaged => 4,
+    }
+}
+
+const fn decode_metadata_tag(value: u8) -> MetadataObservation {
+    match value {
+        1 => MetadataObservation::Absent,
+        2 => MetadataObservation::Present,
+        3 => MetadataObservation::Unavailable,
+        4 => MetadataObservation::PlatformManaged,
+        _ => MetadataObservation::Unknown,
     }
 }
 
@@ -676,5 +710,20 @@ mod tests {
             RestorePlanRecord::decode(&bytes),
             Err(RestorePlanError::TrailingBytes)
         ));
+    }
+
+    #[test]
+    fn legacy_three_field_safety_decodes_as_unknown() {
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&(None::<u64>, 1_u64, false), &mut bytes).unwrap();
+        let safety: PlanSafety = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(
+            safety.to_observations(),
+            SafetyObservations {
+                hardlink_group: None,
+                link_count: 1,
+                extended_metadata: MetadataObservation::Unknown,
+            }
+        );
     }
 }

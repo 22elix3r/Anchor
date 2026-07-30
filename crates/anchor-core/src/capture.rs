@@ -15,9 +15,11 @@ use thiserror::Error;
 
 use crate::{
     Completeness, Coverage, Manifest, ManifestEntry, ManifestError, ManifestNode,
-    NativeRelativePath, NativeString, ObjectStore, Omission, OmissionReason, PathEncoding,
-    PathError, SafetyObservations, StoreError,
+    MetadataObservation, NativeRelativePath, NativeString, ObjectStore, Omission, OmissionReason,
+    PathEncoding, PathError, SafetyObservations, StoreError,
 };
+#[cfg(unix)]
+use crate::{observe_directory_extended_metadata, observe_extended_metadata};
 
 const FILE_STABILITY_RETRIES: usize = 3;
 const NAMESPACE_RETRIES: usize = 2;
@@ -239,7 +241,10 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
             self.entries.push(ManifestEntry {
                 path: relative.clone(),
                 node: ManifestNode::EmptyDirectory,
-                safety: SafetyObservations::default(),
+                safety: SafetyObservations {
+                    extended_metadata: observe_directory_extended_metadata(directory),
+                    ..SafetyObservations::default()
+                },
             });
             self.statistics.empty_directories += 1;
         }
@@ -359,6 +364,7 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
             if !opened.is_file() || !same_identity(&before, &opened) {
                 continue;
             }
+            let extended_metadata_before = observe_extended_metadata(&file);
 
             let (object, raw_size) = self.store.put(&mut file)?;
             let after_open = file.metadata().map_err(|source| CaptureError::Io {
@@ -372,8 +378,18 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
                         path: path.clone(),
                         source,
                     })?;
-            if stable_file(&before, &opened, &after_open, &after_path) && raw_size == before.len() {
-                self.record_regular(path.clone(), object, raw_size, &before)?;
+            let extended_metadata_after = observe_extended_metadata(&file);
+            if stable_file(&before, &opened, &after_open, &after_path)
+                && raw_size == before.len()
+                && extended_metadata_before == extended_metadata_after
+            {
+                self.record_regular(
+                    path.clone(),
+                    object,
+                    raw_size,
+                    &before,
+                    extended_metadata_after,
+                )?;
                 return Ok(());
             }
         }
@@ -386,6 +402,7 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
         object: crate::ObjectId,
         raw_size: u64,
         metadata: &Metadata,
+        extended_metadata: MetadataObservation,
     ) -> Result<(), CaptureError> {
         let next_count = self
             .statistics
@@ -427,7 +444,7 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
             safety: SafetyObservations {
                 hardlink_group,
                 link_count: link_count(metadata),
-                extended_metadata_present: false,
+                extended_metadata,
             },
         });
         self.statistics.regular_files = next_count;
@@ -519,6 +536,11 @@ fn read_sorted_names(
             .cmp(NativeString::from_host(right).bytes())
     });
     Ok(names)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn observe_extended_metadata<T>(_file: &T) -> MetadataObservation {
+    MetadataObservation::Unavailable
 }
 
 #[cfg(not(windows))]

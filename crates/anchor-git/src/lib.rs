@@ -127,6 +127,50 @@ impl GitContext {
         self.store_location.clone()
     }
 
+    /// Return whether an untrusted manifest path could address Git metadata, Anchor's store,
+    /// or a frozen repository boundary.
+    ///
+    /// This is a mutation guard, not an inclusion rule. It intentionally rejects every
+    /// component spelling of `.git` under ASCII case folding, even on a case-sensitive
+    /// filesystem.
+    #[must_use]
+    pub fn is_protected_mutation_path(
+        &self,
+        policy: &FrozenGitPolicy,
+        path: &NativeRelativePath,
+    ) -> bool {
+        let dot_git = NativeRelativePath::from_host_path(Path::new(".git")).ok();
+        if dot_git.as_ref().is_some_and(|dot_git| {
+            let expected = &dot_git.components()[0];
+            path.components()
+                .iter()
+                .any(|component| component_ascii_eq(component, expected))
+        }) {
+            return true;
+        }
+        let fold_case = policy.ignore_case || cfg!(windows);
+        let frozen_boundaries = policy
+            .submodules
+            .iter()
+            .chain(&policy.nested_repositories)
+            .chain(policy.store_relative.iter());
+        if frozen_boundaries
+            .into_iter()
+            .any(|boundary| is_below_with_case(path, boundary, fold_case))
+        {
+            return true;
+        }
+        [
+            self.git_dir.as_path(),
+            self.common_dir.as_path(),
+            self.store_location.root.as_path(),
+        ]
+        .into_iter()
+        .filter_map(|protected| protected.strip_prefix(&self.worktree_root).ok())
+        .filter_map(|protected| NativeRelativePath::from_host_path(protected).ok())
+        .any(|protected| is_below_with_case(path, &protected, fold_case))
+    }
+
     /// Build a live Git-compatible inclusion classifier.
     ///
     /// # Errors
@@ -604,6 +648,36 @@ fn is_below(path: &NativeRelativePath, parent: &NativeRelativePath) -> bool {
     path == parent || is_strict_descendant(path, parent)
 }
 
+fn is_below_with_case(
+    path: &NativeRelativePath,
+    parent: &NativeRelativePath,
+    fold_ascii_case: bool,
+) -> bool {
+    if path.components().len() < parent.components().len() {
+        return false;
+    }
+    path.components()
+        .iter()
+        .zip(parent.components())
+        .all(|(left, right)| {
+            left == right
+                || (fold_ascii_case
+                    && left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| left.eq_ignore_ascii_case(right)))
+        })
+}
+
+fn component_ascii_eq(component: &[u8], expected: &[u8]) -> bool {
+    component.len() == expected.len()
+        && component
+            .iter()
+            .zip(expected)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
 fn is_strict_descendant(path: &NativeRelativePath, parent: &NativeRelativePath) -> bool {
     path.components().len() > parent.components().len()
         && path.components().starts_with(parent.components())
@@ -774,6 +848,27 @@ mod tests {
             scope.classify(&dot_git, ObservedKind::Directory).unwrap(),
             ScopeDecision::Exclude
         );
+    }
+
+    #[test]
+    fn mutation_guard_rejects_git_metadata_and_frozen_boundaries() {
+        let root = unborn_repository();
+        fs::create_dir(root.path().join("nested")).unwrap();
+        fs::create_dir(root.path().join("nested").join(".git")).unwrap();
+        let context = GitContext::discover(root.path()).unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(store_root.path()).unwrap();
+        let policy = context.capture_frozen_policy(&store).unwrap();
+
+        for path in [".git/config", ".GIT/config", "nested/file"] {
+            let path = NativeRelativePath::from_host_path(Path::new(path)).unwrap();
+            assert!(
+                context.is_protected_mutation_path(&policy, &path),
+                "{path:?}"
+            );
+        }
+        let ordinary = NativeRelativePath::from_host_path(Path::new("src/lib.rs")).unwrap();
+        assert!(!context.is_protected_mutation_path(&policy, &ordinary));
     }
 
     #[test]

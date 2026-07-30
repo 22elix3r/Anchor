@@ -6,9 +6,9 @@ use anchor_windows::{
 
 use super::{
     CaptureEngine, CaptureError, CaptureResult, CaptureStatistics, Completeness, Coverage,
-    FILE_STABILITY_RETRIES, Manifest, ManifestEntry, ManifestNode, NAMESPACE_RETRIES,
-    NativeRelativePath, NativeString, ObjectStore, ObservedKind, Omission, OmissionReason,
-    PathEncoding, SafetyObservations, ScopeClassifier, ScopeDecision,
+    FILE_STABILITY_RETRIES, Manifest, ManifestEntry, ManifestNode, MetadataObservation,
+    NAMESPACE_RETRIES, NativeRelativePath, NativeString, ObjectStore, ObservedKind, Omission,
+    OmissionReason, PathEncoding, SafetyObservations, ScopeClassifier, ScopeDecision,
 };
 use crate::WindowsSymlinkKind;
 
@@ -87,7 +87,10 @@ impl<C: ScopeClassifier> WindowsCapture<'_, C> {
             self.entries.push(ManifestEntry {
                 path: relative.clone(),
                 node: ManifestNode::EmptyDirectory,
-                safety: SafetyObservations::default(),
+                safety: SafetyObservations {
+                    extended_metadata: MetadataObservation::Unavailable,
+                    ..SafetyObservations::default()
+                },
             });
             self.statistics.empty_directories = self
                 .statistics
@@ -178,7 +181,7 @@ impl<C: ScopeClassifier> WindowsCapture<'_, C> {
                     safety: SafetyObservations {
                         hardlink_group: None,
                         link_count: u64::from(before.link_count),
-                        extended_metadata_present: false,
+                        extended_metadata: MetadataObservation::Unavailable,
                     },
                 });
                 self.statistics.regular_files = self
@@ -228,7 +231,10 @@ impl<C: ScopeClassifier> WindowsCapture<'_, C> {
                 windows_substitute_name: Some(NativeString::from_host(&link.substitute_name)),
                 windows_reparse_flags: Some(link.flags),
             },
-            safety: SafetyObservations::default(),
+            safety: SafetyObservations {
+                extended_metadata: MetadataObservation::Unavailable,
+                ..SafetyObservations::default()
+            },
         });
         self.statistics.symlinks = self
             .statistics

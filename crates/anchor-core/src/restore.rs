@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
-use crate::{Completeness, Manifest, ManifestEntry, ManifestNode, NativeRelativePath};
+use crate::{
+    Completeness, Manifest, ManifestEntry, ManifestNode, MetadataObservation, NativeRelativePath,
+};
 
 /// A fully calculated, side-effect-free restoration decision.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,9 +56,15 @@ impl RestorePlan {
                 let base_entry = base.get(&path).copied();
                 let session_entry = session.get(&path).copied();
                 let current_entry = current.get(&path).copied();
+                let outcome = decide(base_entry, session_entry, current_entry);
                 PathRestore {
                     path,
-                    outcome: decide(base_entry, session_entry, current_entry),
+                    outcome: refuse_unmodeled_metadata(
+                        outcome,
+                        base_entry,
+                        session_entry,
+                        current_entry,
+                    ),
                 }
             })
             .collect();
@@ -117,6 +125,51 @@ pub enum ConflictReason {
     TextMergeOverlaps,
     TextMergeUnsupported,
     TextMergeTooLarge,
+    HardlinkTopology,
+    UnmodeledMetadataPresent,
+    MetadataObservationUnavailable,
+}
+
+fn refuse_unmodeled_metadata(
+    outcome: RestoreOutcome,
+    base: Option<&ManifestEntry>,
+    session: Option<&ManifestEntry>,
+    current: Option<&ManifestEntry>,
+) -> RestoreOutcome {
+    if !matches!(outcome, RestoreOutcome::Write(_)) {
+        return outcome;
+    }
+    let reason = [base, session, current]
+        .into_iter()
+        .flatten()
+        .find_map(metadata_refusal);
+    reason.map_or(outcome, |reason| conflict(reason, base, session, current))
+}
+
+fn metadata_refusal(entry: &ManifestEntry) -> Option<ConflictReason> {
+    if matches!(entry.node, ManifestNode::Regular { .. })
+        && (entry.safety.link_count == 0
+            || entry.safety.link_count > 1
+            || entry.safety.hardlink_group.is_some())
+    {
+        return Some(
+            if entry.safety.link_count > 1 || entry.safety.hardlink_group.is_some() {
+                ConflictReason::HardlinkTopology
+            } else {
+                ConflictReason::MetadataObservationUnavailable
+            },
+        );
+    }
+    match entry.safety.extended_metadata {
+        MetadataObservation::Present => Some(ConflictReason::UnmodeledMetadataPresent),
+        MetadataObservation::Unavailable => Some(ConflictReason::MetadataObservationUnavailable),
+        MetadataObservation::Unknown if !matches!(entry.node, ManifestNode::Symlink { .. }) => {
+            Some(ConflictReason::MetadataObservationUnavailable)
+        }
+        MetadataObservation::Unknown
+        | MetadataObservation::Absent
+        | MetadataObservation::PlatformManaged => None,
+    }
 }
 
 fn decide(
@@ -359,7 +412,11 @@ mod tests {
                 unix_exec_bits: Some(mode),
                 windows_readonly: None,
             },
-            safety: SafetyObservations::default(),
+            safety: SafetyObservations {
+                link_count: 1,
+                extended_metadata: MetadataObservation::Absent,
+                ..SafetyObservations::default()
+            },
         }
     }
 
@@ -504,6 +561,45 @@ mod tests {
     }
 
     #[test]
+    fn hardlinked_session_residue_is_never_replaced() {
+        let base = file(b"before", 0);
+        let mut session = file(b"session", 0);
+        session.safety.link_count = 2;
+        session.safety.hardlink_group = Some(1);
+        let RestoreOutcome::Conflict(conflict) =
+            outcome(Some(base), Some(session.clone()), Some(session))
+        else {
+            panic!("expected conflict");
+        };
+        assert_eq!(conflict.reason, ConflictReason::HardlinkTopology);
+    }
+
+    #[test]
+    fn extended_metadata_and_unknown_legacy_observations_refuse_writes() {
+        let base = file(b"before", 0);
+        let mut session = file(b"session", 0);
+        session.safety.extended_metadata = MetadataObservation::Present;
+        let RestoreOutcome::Conflict(conflict) =
+            outcome(Some(base.clone()), Some(session.clone()), Some(session))
+        else {
+            panic!("expected conflict");
+        };
+        assert_eq!(conflict.reason, ConflictReason::UnmodeledMetadataPresent);
+
+        let mut unknown = file(b"session", 0);
+        unknown.safety.extended_metadata = MetadataObservation::Unknown;
+        let RestoreOutcome::Conflict(conflict) =
+            outcome(Some(base), Some(unknown.clone()), Some(unknown))
+        else {
+            panic!("expected conflict");
+        };
+        assert_eq!(
+            conflict.reason,
+            ConflictReason::MetadataObservationUnavailable
+        );
+    }
+
+    #[test]
     fn preserves_post_session_deletion() {
         assert_eq!(
             outcome(Some(file(b"before", 0)), Some(file(b"session", 0)), None),
@@ -551,7 +647,11 @@ mod tests {
                     unix_exec_bits: None,
                     windows_readonly: Some(readonly),
                 },
-                safety: SafetyObservations::default(),
+                safety: SafetyObservations {
+                    link_count: 1,
+                    extended_metadata: MetadataObservation::Absent,
+                    ..SafetyObservations::default()
+                },
             }
         }
         fn windows_manifest(entry: ManifestEntry) -> Manifest {
