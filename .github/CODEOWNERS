@@ -1,0 +1,9 @@
+# Fence's mutation and persisted-data boundaries require maintainer review.
+* @22elix3r
+
+/crates/fence-core/ @22elix3r
+/crates/fence-git/ @22elix3r
+/crates/fence-session/ @22elix3r
+/docs/safety.md @22elix3r
+/docs/storage.md @22elix3r
+/.github/workflows/ @22elix3r

@@ -13,10 +13,26 @@ jobs:
     name: Parser fuzz smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz run manifest_decode --target x86_64-unknown-linux-gnu -- -max_total_time=30
-      - run: cargo fuzz run native_path_decode --target x86_64-unknown-linux-gnu -- -max_total_time=30
+      - name: Run bounded fuzz targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in \
+            manifest_decode \
+            native_path_decode \
+            session_decode \
+            frozen_policy_decode \
+            restore_plan_decode \
+            journal_decode \
+            object_envelope_decode \
+            restore_plan_calculate \
+            diff_render
+          do
+            cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- \
+              -max_total_time=20
+          done
