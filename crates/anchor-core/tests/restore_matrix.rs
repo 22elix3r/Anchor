@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::path::Path;
 
 use anchor_core::{
     Completeness, ConflictReason, Coverage, Manifest, ManifestEntry, ManifestNode,
@@ -319,8 +321,7 @@ fn entry(state: &State) -> Option<ManifestEntry> {
         ),
         State::Symlink(target) => (
             ManifestNode::Symlink {
-                target: NativeString::new(PathEncoding::UnixBytes, target.as_bytes().to_vec())
-                    .unwrap(),
+                target: NativeString::from_host(OsStr::new(target)),
                 windows_link_kind: None,
                 windows_substitute_name: None,
                 windows_reparse_flags: None,
@@ -343,7 +344,7 @@ fn entry(state: &State) -> Option<ManifestEntry> {
 }
 
 fn path() -> NativeRelativePath {
-    NativeRelativePath::new(PathEncoding::UnixBytes, vec![b"node".to_vec()]).unwrap()
+    NativeRelativePath::from_host_path(Path::new("node")).unwrap()
 }
 
 fn assert_outcome(id: &str, actual: RestoreOutcome, expected: Expected) {
@@ -370,7 +371,11 @@ fn assert_outcome(id: &str, actual: RestoreOutcome, expected: Expected) {
             let ManifestNode::Symlink { target, .. } = entry.node else {
                 panic!("{id}: expected symlink write");
             };
-            assert_eq!(target.bytes(), expected_target.as_bytes(), "{id}");
+            assert_eq!(
+                target,
+                NativeString::from_host(OsStr::new(expected_target)),
+                "{id}"
+            );
         }
         (RestoreOutcome::Write(Some(entry)), Expected::WriteEmptyDirectory) => {
             assert!(
