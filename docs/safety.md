@@ -105,9 +105,21 @@ guessed at.
 Batch journals record every path, expected and desired node, sibling temporary
 name, and item state. `Verified` is the batch commit point: before it, recovery
 restores every pre-operation node in reverse order; after it, recovery preserves
-the verified inverse and only finishes cleanup. Multi-path mutation is therefore
-recoverable but is not claimed to be globally atomic to concurrent observers.
-Missing parent reconstruction is refused before target evacuation.
+the verified inverse and only finishes cleanup. Explicit `Cleaning` and
+`CleanupComplete` states keep that roll-forward decision stable while backups
+are removed. Multi-path mutation is therefore recoverable but is not claimed to
+be globally atomic to concurrent observers. Missing parent reconstruction is
+refused before target evacuation.
+
+The test suite kills a separate restore process with `SIGKILL` after each of
+twelve synchronized journal boundaries, then starts recovery in another
+process context. The fixture combines regular replacement, addition, deletion,
+symlink replacement, empty-directory addition/deletion, executable-bit change,
+exact rename, and multiple paths. Every pre-commit boundary must roll back to
+the session endpoint; the commit and cleanup boundaries must roll forward to
+the inverse. Tests verify bytes, node types, link targets, execute bits,
+absence, terminal journal state, and removal of sibling stage/backup names on
+Linux and macOS.
 
 Deleting a session is recoverable until explicit purge. Tombstoned sessions
 remain garbage-collection roots, so `anchor delete` cannot silently make their
@@ -227,6 +239,10 @@ as untrusted:
 - no process-level or prompt-level attribution;
 - no globally atomic snapshot;
 - no globally atomic multi-file visibility or filesystem-wide transaction;
+- no machine-power-loss guarantee: subprocess `SIGKILL` recovery is tested, but
+  directory-entry durability across power failure is not claimed until the
+  filesystem-specific file and parent-directory synchronization matrix is
+  proven;
 - no speculative binary merge or conflict-marker-only text merge;
 - no worktree-plus-index combined transaction;
 - no split-index restoration or Git history restoration;

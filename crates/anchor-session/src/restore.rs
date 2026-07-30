@@ -52,7 +52,7 @@ const BATCH_JOURNAL_TAG: u64 = 0x414e_4348_4f52_424a;
 #[cfg(unix)]
 const FILE_JOURNAL_SCHEMA: u16 = 5;
 #[cfg(unix)]
-const BATCH_JOURNAL_SCHEMA: u16 = 3;
+const BATCH_JOURNAL_SCHEMA: u16 = 4;
 
 #[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +85,23 @@ fn maybe_inject_batch_fault(point: BatchFaultPoint) -> Result<(), RestoreError> 
         return Err(RestoreError::InjectedBatchCrash);
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn pause_subprocess_at_boundary(boundary: &str) {
+    if std::env::var_os("ANCHOR_CRASH_BOUNDARY").as_deref() != Some(OsStr::new(boundary)) {
+        return;
+    }
+    let marker =
+        std::env::var_os("ANCHOR_CRASH_MARKER").expect("crash helper requires ANCHOR_CRASH_MARKER");
+    let mut file = fs::File::create(marker).expect("crash helper could not create marker");
+    file.write_all(boundary.as_bytes())
+        .expect("crash helper could not write marker");
+    file.sync_all()
+        .expect("crash helper could not synchronize marker");
+    loop {
+        std::thread::park_timeout(std::time::Duration::from_secs(1));
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -811,13 +828,20 @@ fn apply_batch(
     };
     save_batch_journal(&journal_path, &journal)?;
     #[cfg(test)]
+    pause_subprocess_at_boundary("journal-created");
+    #[cfg(test)]
     maybe_inject_batch_fault(BatchFaultPoint::Prepared)?;
     if let Err(error) = apply_batch_inner(store, worktree, writes, &mut journal, &journal_path) {
         #[cfg(test)]
         if matches!(error, RestoreError::InjectedBatchCrash) {
             return Err(error);
         }
-        if journal.state == BatchJournalState::Verified {
+        if matches!(
+            journal.state,
+            BatchJournalState::Verified
+                | BatchJournalState::Cleaning
+                | BatchJournalState::CleanupComplete
+        ) {
             // Verified is the transaction commit point. Some backups may already be gone, so
             // recovery must finish cleanup rather than attempting to reconstruct the old tree.
             return Err(error);
@@ -881,9 +905,12 @@ fn apply_batch_inner(
         save_batch_journal(journal_path, journal)?;
         #[cfg(test)]
         if index == 0 {
+            pause_subprocess_at_boundary("first-output-staged");
             maybe_inject_batch_fault(BatchFaultPoint::FirstStaged)?;
         }
     }
+    #[cfg(test)]
+    pause_subprocess_at_boundary("all-outputs-staged");
     #[cfg(test)]
     maybe_inject_batch_fault(BatchFaultPoint::Staged)?;
 
@@ -919,9 +946,12 @@ fn apply_batch_inner(
         save_batch_journal(journal_path, journal)?;
         #[cfg(test)]
         if index == 0 {
+            pause_subprocess_at_boundary("first-current-evacuated");
             maybe_inject_batch_fault(BatchFaultPoint::FirstEvacuated)?;
         }
     }
+    #[cfg(test)]
+    pause_subprocess_at_boundary("all-current-evacuated");
     #[cfg(test)]
     maybe_inject_batch_fault(BatchFaultPoint::Evacuated)?;
 
@@ -937,9 +967,12 @@ fn apply_batch_inner(
         save_batch_journal(journal_path, journal)?;
         #[cfg(test)]
         if index == 0 {
+            pause_subprocess_at_boundary("first-desired-installed");
             maybe_inject_batch_fault(BatchFaultPoint::FirstInstalled)?;
         }
     }
+    #[cfg(test)]
+    pause_subprocess_at_boundary("all-desired-installed");
     #[cfg(test)]
     maybe_inject_batch_fault(BatchFaultPoint::Installed)?;
 
@@ -952,11 +985,16 @@ fn apply_batch_inner(
         save_batch_journal(journal_path, journal)?;
         #[cfg(test)]
         if index == 0 {
+            pause_subprocess_at_boundary("first-desired-verified");
             maybe_inject_batch_fault(BatchFaultPoint::FirstVerified)?;
         }
     }
+    #[cfg(test)]
+    pause_subprocess_at_boundary("all-desired-verified");
     journal.state = BatchJournalState::Verified;
     save_batch_journal(journal_path, journal)?;
+    #[cfg(test)]
+    pause_subprocess_at_boundary("commit-recorded");
     #[cfg(test)]
     maybe_inject_batch_fault(BatchFaultPoint::Verified)?;
     finish_batch(store, worktree, journal, journal_path)
@@ -969,6 +1007,10 @@ fn finish_batch(
     journal: &mut BatchRestoreJournal,
     journal_path: &Path,
 ) -> Result<(), RestoreError> {
+    journal.state = BatchJournalState::Cleaning;
+    save_batch_journal(journal_path, journal)?;
+    #[cfg(test)]
+    pause_subprocess_at_boundary("backup-cleanup-started");
     for item in &journal.items {
         let desired = item.desired.to_entry(&item.path);
         let expected = item.expected.to_entry(&item.path);
@@ -993,6 +1035,10 @@ fn finish_batch(
             remove_node(&parent, &stage, desired.as_ref())?;
         }
     }
+    journal.state = BatchJournalState::CleanupComplete;
+    save_batch_journal(journal_path, journal)?;
+    #[cfg(test)]
+    pause_subprocess_at_boundary("cleanup-completed");
     journal.state = BatchJournalState::Complete;
     save_batch_journal(journal_path, journal)
 }
@@ -1692,6 +1738,8 @@ enum BatchJournalState {
     Evacuating,
     Installing,
     Verified,
+    Cleaning,
+    CleanupComplete,
     Complete,
     NeedsRecovery,
     RolledBack,
@@ -1862,7 +1910,7 @@ pub(crate) fn scan_transactions(root: &Path) -> Result<TransactionSummary, Resto
         if let Ok(journal) =
             ciborium::de::from_reader::<BatchRestoreJournal, _>(Cursor::new(&bytes))
         {
-            if journal.tag != BATCH_JOURNAL_TAG || !matches!(journal.schema, 1..=3) {
+            if journal.tag != BATCH_JOURNAL_TAG || !matches!(journal.schema, 1..=4) {
                 return Err(RestoreError::Journal(format!(
                     "transaction {} has an unsupported batch journal",
                     entry.file_name().to_string_lossy()
@@ -1878,7 +1926,9 @@ pub(crate) fn scan_transactions(root: &Path) -> Result<TransactionSummary, Resto
                 BatchJournalState::Prepared
                 | BatchJournalState::Evacuating
                 | BatchJournalState::Installing
-                | BatchJournalState::Verified => {
+                | BatchJournalState::Verified
+                | BatchJournalState::Cleaning
+                | BatchJournalState::CleanupComplete => {
                     summary.unfinished = summary.unfinished.saturating_add(1);
                 }
             }
@@ -1949,7 +1999,12 @@ fn recover_transactions(store: &SessionStore) -> Result<TransactionRecoveryRepor
                 report.skipped_other_worktrees = report.skipped_other_worktrees.saturating_add(1);
                 continue;
             }
-            let completed = journal.state == BatchJournalState::Verified;
+            let completed = matches!(
+                journal.state,
+                BatchJournalState::Verified
+                    | BatchJournalState::Cleaning
+                    | BatchJournalState::CleanupComplete
+            );
             recover_batch_journal(store, &mut journal, &journal_path)?;
             if completed {
                 report.completed.push(id);
@@ -2180,7 +2235,12 @@ fn recover_batch_journal(
             return Err(RestoreError::UnsafeJournalName);
         }
     }
-    if journal.state == BatchJournalState::Verified {
+    if matches!(
+        journal.state,
+        BatchJournalState::Verified
+            | BatchJournalState::Cleaning
+            | BatchJournalState::CleanupComplete
+    ) {
         finish_batch(store, &worktree, journal, journal_path)
     } else {
         rollback_batch(store, &worktree, journal)?;
@@ -2706,6 +2766,7 @@ pub enum RestoreError {
 #[cfg(all(test, unix))]
 mod tests {
     use std::ffi::OsString;
+    use std::process::{Command, Stdio};
 
     use anchor_core::PathEncoding;
 
@@ -2970,6 +3031,200 @@ mod tests {
                     !name.to_string_lossy().starts_with(".anchor-")
                 }),
                 "recovery left a sibling temporary node after {point:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "invoked only as the child of subprocess_crash_recovery_matrix"]
+    fn subprocess_restore_crash_helper() {
+        let root = PathBuf::from(
+            std::env::var_os("ANCHOR_CRASH_WORKTREE")
+                .expect("crash helper requires ANCHOR_CRASH_WORKTREE"),
+        );
+        let session = std::env::var("ANCHOR_CRASH_SESSION")
+            .expect("crash helper requires ANCHOR_CRASH_SESSION")
+            .parse()
+            .expect("invalid crash helper session ID");
+        let context = GitContext::discover(&root).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let WholeRestoreResult::Preview {
+            current_manifest, ..
+        } = RestoreService::restore_all(&store, session, WholeRestoreMode::Preview).unwrap()
+        else {
+            panic!("expected whole-restore preview");
+        };
+        RestoreService::restore_all(
+            &store,
+            session,
+            WholeRestoreMode::Apply {
+                expected_current: current_manifest,
+            },
+        )
+        .unwrap();
+        panic!("crash helper passed its requested boundary without pausing");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn subprocess_crash_recovery_matrix() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const BOUNDARIES: &[&str] = &[
+            "journal-created",
+            "first-output-staged",
+            "all-outputs-staged",
+            "first-current-evacuated",
+            "all-current-evacuated",
+            "first-desired-installed",
+            "all-desired-installed",
+            "first-desired-verified",
+            "all-desired-verified",
+            "commit-recorded",
+            "backup-cleanup-started",
+            "cleanup-completed",
+        ];
+
+        for boundary in BOUNDARIES {
+            let root = repository();
+            fs::write(root.path().join("alpha"), b"alpha-base").unwrap();
+            fs::write(root.path().join("removed"), b"removed-base").unwrap();
+            std::os::unix::fs::symlink("before-target", root.path().join("link")).unwrap();
+            fs::create_dir(root.path().join("empty-removed")).unwrap();
+            fs::write(root.path().join("mode"), b"mode-bytes").unwrap();
+            fs::write(root.path().join("old"), b"rename-bytes").unwrap();
+            let (store, session) = run_change(
+                root.path(),
+                "printf alpha-session > alpha; rm removed; printf added-session > added; \
+                 ln -sfn after-target link; rmdir empty-removed; mkdir empty-added; \
+                 chmod +x mode; mv old new",
+            );
+            let marker_dir = tempfile::tempdir().unwrap();
+            let marker = marker_dir.path().join("durable-boundary");
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "restore::tests::subprocess_restore_crash_helper",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("ANCHOR_CRASH_BOUNDARY", boundary)
+                .env("ANCHOR_CRASH_MARKER", &marker)
+                .env("ANCHOR_CRASH_WORKTREE", root.path())
+                .env("ANCHOR_CRASH_SESSION", session.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+
+            let mut reached = false;
+            for _ in 0..500 {
+                if marker.exists() {
+                    reached = true;
+                    break;
+                }
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("crash helper exited at {boundary} with {status}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(reached, "crash helper did not reach {boundary}");
+            child.kill().unwrap();
+            let status = child.wait().unwrap();
+            assert!(
+                !status.success(),
+                "crash helper was not killed at {boundary}"
+            );
+
+            let report = TransactionRecoveryService::recover(&store).unwrap();
+            let post_commit = matches!(
+                *boundary,
+                "commit-recorded" | "backup-cleanup-started" | "cleanup-completed"
+            );
+            if post_commit {
+                assert_eq!(report.completed.len(), 1, "{boundary}");
+                assert!(report.rolled_back.is_empty(), "{boundary}");
+                assert_eq!(
+                    fs::read(root.path().join("alpha")).unwrap(),
+                    b"alpha-base",
+                    "{boundary}"
+                );
+                assert_eq!(
+                    fs::read(root.path().join("removed")).unwrap(),
+                    b"removed-base",
+                    "{boundary}"
+                );
+                assert!(!root.path().join("added").exists(), "{boundary}");
+                assert_eq!(
+                    fs::read_link(root.path().join("link")).unwrap(),
+                    PathBuf::from("before-target"),
+                    "{boundary}"
+                );
+                assert!(root.path().join("empty-removed").is_dir(), "{boundary}");
+                assert!(!root.path().join("empty-added").exists(), "{boundary}");
+                assert_eq!(
+                    fs::metadata(root.path().join("mode"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o111,
+                    0,
+                    "{boundary}"
+                );
+                assert_eq!(
+                    fs::read(root.path().join("old")).unwrap(),
+                    b"rename-bytes",
+                    "{boundary}"
+                );
+                assert!(!root.path().join("new").exists(), "{boundary}");
+            } else {
+                assert_eq!(report.rolled_back.len(), 1, "{boundary}");
+                assert!(report.completed.is_empty(), "{boundary}");
+                assert_eq!(
+                    fs::read(root.path().join("alpha")).unwrap(),
+                    b"alpha-session",
+                    "{boundary}"
+                );
+                assert_eq!(
+                    fs::read(root.path().join("added")).unwrap(),
+                    b"added-session",
+                    "{boundary}"
+                );
+                assert!(!root.path().join("removed").exists(), "{boundary}");
+                assert_eq!(
+                    fs::read_link(root.path().join("link")).unwrap(),
+                    PathBuf::from("after-target"),
+                    "{boundary}"
+                );
+                assert!(!root.path().join("empty-removed").exists(), "{boundary}");
+                assert!(root.path().join("empty-added").is_dir(), "{boundary}");
+                assert_ne!(
+                    fs::metadata(root.path().join("mode"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o111,
+                    0,
+                    "{boundary}"
+                );
+                assert!(!root.path().join("old").exists(), "{boundary}");
+                assert_eq!(
+                    fs::read(root.path().join("new")).unwrap(),
+                    b"rename-bytes",
+                    "{boundary}"
+                );
+            }
+            let terminal = scan_transactions(store.root()).unwrap();
+            assert_eq!(terminal.total, terminal.complete, "{boundary}");
+            assert!(
+                fs::read_dir(root.path()).unwrap().all(|entry| {
+                    let name = entry.unwrap().file_name();
+                    !name.to_string_lossy().starts_with(".anchor-")
+                }),
+                "recovery left a sibling temporary node after {boundary}"
             );
         }
     }

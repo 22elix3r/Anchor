@@ -151,13 +151,14 @@ backend for the Unix alpha.
 Index journals additionally record the freshly validated index path and raw
 before/after captures.
 
-Unix batch-journal schema v3 stores the owning session/worktree, immutable
+Unix batch-journal schema v4 stores the owning session/worktree, immutable
 restore-plan ID, transaction ID, and an ordered list of validated relative
 paths, exact expected/desired nodes and safety observations, collision-resistant
 sibling stage/backup names, per-item progress, and a batch state. Journal input
 is capped at 256 MiB and duplicate paths or temporary names are rejected during
 recovery. `Verified` is the durable commit point: recovery rolls earlier states
-back and rolls this state forward by verifying targets and removing backups.
+back and rolls `Verified`, `Cleaning`, and `CleanupComplete` states forward by
+verifying targets and removing backups.
 
 Completed and safely rolled-back journals are terminal. Any other state blocks
 new sessions, restoration, and garbage collection. Recovery never trusts a
