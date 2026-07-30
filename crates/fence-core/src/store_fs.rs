@@ -401,10 +401,25 @@ impl StoreTempFile {
     /// Returns an I/O error if file or directory durability fails.
     pub fn replace(mut self, destination: impl AsRef<OsStr>) -> io::Result<()> {
         self.file_mut().sync_all()?;
-        self.directory
-            .rename(&self.name, &self.directory, Path::new(destination.as_ref()))?;
-        self.file.take();
-        sync_directory(&self.directory)
+        #[cfg(windows)]
+        {
+            self.file.take();
+            let directory = fence_windows::DirectoryHandle::from_directory_file(
+                self.directory.try_clone()?.into_std_file(),
+            )
+            .map_err(io::Error::other)?;
+            directory
+                .replace_child(&self.name, destination.as_ref())
+                .map_err(io::Error::other)?;
+            sync_directory(&self.directory)
+        }
+        #[cfg(not(windows))]
+        {
+            self.directory
+                .rename(&self.name, &self.directory, Path::new(destination.as_ref()))?;
+            self.file.take();
+            sync_directory(&self.directory)
+        }
     }
 }
 

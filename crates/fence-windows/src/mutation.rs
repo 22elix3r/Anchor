@@ -94,6 +94,28 @@ impl MutationRoot {
 }
 
 impl DirectoryHandle {
+    /// Adopt an already-open ordinary directory as a pinned mutation boundary.
+    ///
+    /// This is used by capability-based callers that have already resolved and retained the
+    /// directory. The final path is diagnostic only; subsequent operations remain handle-relative.
+    ///
+    /// # Errors
+    ///
+    /// Refuses non-directory and reparse-point handles or malformed final paths.
+    pub fn from_directory_file(file: File) -> Result<DirectoryHandle, WindowsError> {
+        let handle = OwnedHandle::from(file);
+        let path = crate::filesystem::final_path_for_mutation(&handle)?;
+        let metadata = metadata_for_system(&handle)?;
+        if metadata.kind != NodeKind::Directory {
+            return Err(WindowsError::NotDirectory);
+        }
+        Ok(DirectoryHandle {
+            handle,
+            path,
+            metadata,
+        })
+    }
+
     /// Duplicate this pinned mutation directory handle.
     ///
     /// # Errors
@@ -239,7 +261,17 @@ impl DirectoryHandle {
         destination: &OsStr,
     ) -> Result<(), WindowsError> {
         let source = self.open_named_for_delete(source)?;
-        rename_handle(&source, &self.handle, destination)
+        rename_handle(&source, &self.handle, destination, false)
+    }
+
+    /// Atomically replace one exact child with another child from this pinned directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the source changed, either name is unsafe, or Windows refuses replacement.
+    pub fn replace_child(&self, source: &OsStr, destination: &OsStr) -> Result<(), WindowsError> {
+        let source = self.open_named_for_delete(source)?;
+        rename_handle(&source, &self.handle, destination, true)
     }
 
     /// Delete an exact child through a no-follow handle.
@@ -362,6 +394,7 @@ fn rename_handle(
     source: &OwnedHandle,
     destination_directory: &OwnedHandle,
     destination: &OsStr,
+    replace: bool,
 ) -> Result<(), WindowsError> {
     let _validated = VerbatimPath::new(Path::new(r"C:\"))?.join_name(destination)?;
     let units = destination.encode_wide().collect::<Vec<_>>();
@@ -379,7 +412,7 @@ fn rename_handle(
     // SAFETY: The aligned buffer has room for the fixed header and every filename unit.
     unsafe {
         ptr::write(info, FILE_RENAME_INFORMATION::default());
-        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).Anonymous.ReplaceIfExists = replace;
         (*info).RootDirectory = raw_handle(destination_directory);
         (*info).FileNameLength =
             u32::try_from(name_bytes).map_err(|_| WindowsError::TooLarge("rename filename"))?;
@@ -504,6 +537,21 @@ mod tests {
             std::fs::read(root.path().join("target")).unwrap(),
             b"target"
         );
+    }
+
+    #[test]
+    fn atomically_replaces_an_existing_rename_target() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source"), b"new").unwrap();
+        std::fs::write(root.path().join("target"), b"old").unwrap();
+        let mutation = MutationRoot::open(root.path()).unwrap();
+        mutation
+            .directory()
+            .replace_child(OsStr::new("source"), OsStr::new("target"))
+            .unwrap();
+
+        assert!(!root.path().join("source").exists());
+        assert_eq!(std::fs::read(root.path().join("target")).unwrap(), b"new");
     }
 
     #[test]
