@@ -4,8 +4,6 @@ use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::fs;
 use std::io;
-#[cfg(unix)]
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -52,7 +50,8 @@ use journal::JournalNode;
 use journal::{
     BATCH_JOURNAL_SCHEMA, BATCH_JOURNAL_TAG, BatchItemState, BatchJournalItem, BatchJournalState,
     BatchRestoreJournal, FILE_JOURNAL_SCHEMA, IndexRestoreJournal, JournalPresence, JournalState,
-    MAX_JOURNAL_BYTES, RestoreJournal, save_batch_journal, save_index_journal, save_journal,
+    MAX_JOURNAL_BYTES, RestoreJournal, decode_exact, save_batch_journal, save_index_journal,
+    save_journal,
 };
 use planning::{
     BatchWrite, MergeResolution, SelectedScope, index_is_split, merge_regular_conflict, node_kind,
@@ -62,6 +61,16 @@ pub use types::{
     IndexRestoreResult, RestoreApplyResult, TextMergeMode, TransactionRecoveryReport,
     WholeRestoreConflict, WholeRestoreMode, WholeRestoreResult,
 };
+
+#[cfg(all(feature = "fuzzing", unix))]
+pub(crate) fn fuzz_decode_journals(bytes: &[u8]) {
+    let _ = decode_exact::<BatchRestoreJournal>(bytes);
+    let _ = decode_exact::<RestoreJournal>(bytes);
+    let _ = decode_exact::<IndexRestoreJournal>(bytes);
+}
+
+#[cfg(all(feature = "fuzzing", not(unix)))]
+pub(crate) fn fuzz_decode_journals(_bytes: &[u8]) {}
 
 #[derive(Debug, Default)]
 pub struct TransactionRecoveryService;
@@ -494,11 +503,7 @@ fn apply_batch(
         return Ok(());
     }
     let transaction_id = Uuid::now_v7();
-    let transaction_path = store
-        .root()
-        .join("transactions")
-        .join(format!("batch-{transaction_id}"));
-    private_transaction_dir(&transaction_path)?;
+    let transaction_path = create_transaction_directory(store, &format!("batch-{transaction_id}"))?;
     let journal_path = transaction_path.join("journal.cbor");
     let mut journal = BatchRestoreJournal {
         tag: BATCH_JOURNAL_TAG,
@@ -810,11 +815,7 @@ fn apply_one(
     };
 
     let transaction_id = Uuid::now_v7();
-    let transaction_path = store
-        .root()
-        .join("transactions")
-        .join(transaction_id.to_string());
-    private_transaction_dir(&transaction_path)?;
+    let transaction_path = create_transaction_directory(store, &transaction_id.to_string())?;
     let stage_name_text = format!(".fence-stage-{transaction_id}");
     let stage_name = OsString::from(&stage_name_text);
     let backup_name_text = format!(".fence-backup-{transaction_id}");
@@ -957,11 +958,7 @@ fn apply_index(
     drop(lock_file);
 
     let transaction_id = Uuid::now_v7();
-    let transaction_path = store
-        .root()
-        .join("transactions")
-        .join(format!("index-{transaction_id}"));
-    private_transaction_dir(&transaction_path)?;
+    let transaction_path = create_transaction_directory(store, &format!("index-{transaction_id}"))?;
     let backup_name_text = format!(".fence-index-backup-{transaction_id}");
     let backup_name = OsString::from(&backup_name_text);
     let journal_path = transaction_path.join("journal.cbor");
@@ -1308,6 +1305,13 @@ fn remove_node(
 }
 
 #[cfg(unix)]
+fn create_transaction_directory(store: &SessionStore, name: &str) -> Result<PathBuf, RestoreError> {
+    let relative = PathBuf::from("transactions").join(name);
+    store.filesystem().create_dir_exclusive(&relative)?;
+    Ok(store.root().join(relative))
+}
+
+#[cfg(all(test, unix))]
 fn private_transaction_dir(path: &Path) -> Result<(), RestoreError> {
     fs::create_dir(path)?;
     crate::private_directory(path)?;
@@ -1348,9 +1352,7 @@ pub(crate) fn scan_transactions(root: &Path) -> Result<TransactionSummary, Resto
             return Err(RestoreError::JournalTooLarge(journal_path));
         }
         let bytes = fs::read(&journal_path)?;
-        if let Ok(journal) =
-            ciborium::de::from_reader::<BatchRestoreJournal, _>(Cursor::new(&bytes))
-        {
+        if let Ok(journal) = decode_exact::<BatchRestoreJournal>(&bytes) {
             if journal.tag != BATCH_JOURNAL_TAG || !matches!(journal.schema, 1..=4) {
                 return Err(RestoreError::Journal(format!(
                     "transaction {} has an unsupported batch journal",
@@ -1373,13 +1375,9 @@ pub(crate) fn scan_transactions(root: &Path) -> Result<TransactionSummary, Resto
                     summary.unfinished = summary.unfinished.saturating_add(1);
                 }
             }
-        } else if let Ok(journal) =
-            ciborium::de::from_reader::<RestoreJournal, _>(Cursor::new(&bytes))
-        {
+        } else if let Ok(journal) = decode_exact::<RestoreJournal>(&bytes) {
             record_journal_state(&mut summary, journal.state);
-        } else if let Ok(journal) =
-            ciborium::de::from_reader::<IndexRestoreJournal, _>(Cursor::new(&bytes))
-        {
+        } else if let Ok(journal) = decode_exact::<IndexRestoreJournal>(&bytes) {
             record_journal_state(&mut summary, journal.state);
         } else {
             return Err(RestoreError::Journal(format!(
@@ -1427,9 +1425,7 @@ fn recover_transactions(store: &SessionStore) -> Result<TransactionRecoveryRepor
             .map_err(|_| RestoreError::UnsafeJournalName)?;
         let journal_path = entry.path().join("journal.cbor");
         let bytes = read_journal(&journal_path)?;
-        if let Ok(mut journal) =
-            ciborium::de::from_reader::<BatchRestoreJournal, _>(Cursor::new(&bytes))
-        {
+        if let Ok(mut journal) = decode_exact::<BatchRestoreJournal>(&bytes) {
             if matches!(
                 journal.state,
                 BatchJournalState::Complete | BatchJournalState::RolledBack
@@ -1454,8 +1450,7 @@ fn recover_transactions(store: &SessionStore) -> Result<TransactionRecoveryRepor
             }
             continue;
         }
-        if let Ok(mut journal) = ciborium::de::from_reader::<RestoreJournal, _>(Cursor::new(&bytes))
-        {
+        if let Ok(mut journal) = decode_exact::<RestoreJournal>(&bytes) {
             if matches!(
                 journal.state,
                 JournalState::Complete | JournalState::RolledBack
@@ -1473,9 +1468,7 @@ fn recover_transactions(store: &SessionStore) -> Result<TransactionRecoveryRepor
             report.rolled_back.push(id);
             continue;
         }
-        if let Ok(mut journal) =
-            ciborium::de::from_reader::<IndexRestoreJournal, _>(Cursor::new(&bytes))
-        {
+        if let Ok(mut journal) = decode_exact::<IndexRestoreJournal>(&bytes) {
             if matches!(
                 journal.state,
                 JournalState::Complete | JournalState::RolledBack
@@ -2199,6 +2192,8 @@ pub enum RestoreError {
     #[error(transparent)]
     Store(#[from] fence_core::StoreError),
     #[error(transparent)]
+    StoreFs(#[from] fence_core::StoreFsError),
+    #[error(transparent)]
     TextMerge(#[from] fence_core::TextMergeError),
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -2242,7 +2237,7 @@ mod tests {
         let context = GitContext::discover(root).unwrap();
         let location = context.store_location();
         (
-            SessionStore::open(location.root, location.worktree_key).unwrap(),
+            SessionStore::open_location(location).unwrap(),
             result.session_id,
         )
     }
@@ -2494,7 +2489,7 @@ mod tests {
             .expect("invalid crash helper session ID");
         let context = GitContext::discover(&root).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let WholeRestoreResult::Preview {
             current_manifest, ..
         } = RestoreService::restore_all(&store, session, WholeRestoreMode::Preview).unwrap()
@@ -2525,7 +2520,7 @@ mod tests {
         );
         let context = GitContext::discover(&root).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let report = TransactionRecoveryService::recover(&store).unwrap();
         fs::write(
             result_path,
@@ -3323,7 +3318,7 @@ mod tests {
         fs::write(&index_path, empty_v2_index()).unwrap();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let expected = context.capture_index(store.objects()).unwrap();
         let drifted = b"post-check index bytes";
         fs::write(&index_path, drifted).unwrap();
@@ -3394,10 +3389,8 @@ mod windows_tests {
     fn session_store(root: &Path) -> (SessionStore, PathBuf) {
         let context = GitContext::discover(root).unwrap();
         let location = context.store_location();
-        (
-            SessionStore::open(&location.root, location.worktree_key).unwrap(),
-            location.root,
-        )
+        let store_root = location.root.clone();
+        (SessionStore::open_location(location).unwrap(), store_root)
     }
 
     #[test]

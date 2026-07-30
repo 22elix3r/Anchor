@@ -1,9 +1,10 @@
-use std::io::Write as _;
+use std::io::{Cursor, Write as _};
 use std::path::Path;
 
 use atomic_write_file::AtomicWriteFile;
 use fence_core::{ManifestEntry, ManifestNode, NativeRelativePath, ObjectId};
 use fence_git::IndexCapture;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -15,6 +16,23 @@ pub(super) const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
 pub(super) const BATCH_JOURNAL_TAG: u64 = 0x414e_4348_4f52_424a;
 pub(super) const FILE_JOURNAL_SCHEMA: u16 = 5;
 pub(super) const BATCH_JOURNAL_SCHEMA: u16 = 4;
+
+pub(super) fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, RestoreError> {
+    if bytes.len() > usize::try_from(MAX_JOURNAL_BYTES).unwrap_or(usize::MAX) {
+        return Err(RestoreError::Journal(
+            "journal exceeds its decode limit".to_owned(),
+        ));
+    }
+    let mut cursor = Cursor::new(bytes);
+    let value = ciborium::de::from_reader(&mut cursor)
+        .map_err(|error| RestoreError::Journal(error.to_string()))?;
+    if usize::try_from(cursor.position()).ok() != Some(bytes.len()) {
+        return Err(RestoreError::Journal(
+            "journal has trailing bytes".to_owned(),
+        ));
+    }
+    Ok(value)
+}
 
 pub(super) fn save_journal(path: &Path, journal: &RestoreJournal) -> Result<(), RestoreError> {
     let mut bytes = Vec::new();

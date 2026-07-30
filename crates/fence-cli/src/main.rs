@@ -621,6 +621,7 @@ fn execute(cli: Cli) -> Result<i32> {
                         "unfinished_transactions": report.unfinished_transactions,
                         "repository_drift_from_latest": report.repository_drift_from_latest,
                         "store_private": report.store_private,
+                        "legacy_anchor_store_present": report.legacy_anchor_store_present,
                     }))
                     .into_diagnostic()?
                 );
@@ -664,13 +665,18 @@ fn execute(cli: Cli) -> Result<i32> {
                     report.repository_drift_from_latest
                 );
                 println!("store private: {}", report.store_private);
+                println!(
+                    "legacy Anchor store present: {}",
+                    report.legacy_anchor_store_present
+                );
             }
             Ok(i32::from(
                 report.incomplete_sessions > 0
                     || report.transactions_needing_recovery > 0
                     || report.unfinished_transactions > 0
                     || report.repository_drift_from_latest
-                    || !report.store_private,
+                    || !report.store_private
+                    || report.legacy_anchor_store_present,
             ))
         }
         Commands::Gc { dry_run, format } => {
@@ -823,7 +829,7 @@ fn current_context_and_store() -> Result<(GitContext, SessionStore)> {
         .into_diagnostic()
         .wrap_err("cannot discover a Git worktree")?;
     let location = context.store_location();
-    let store = SessionStore::open(location.root, location.worktree_key)
+    let store = SessionStore::open_location(location)
         .into_diagnostic()
         .wrap_err("cannot open Fence storage")?;
     Ok((context, store))

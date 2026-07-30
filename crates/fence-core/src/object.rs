@@ -1,13 +1,15 @@
 use std::fmt;
-use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 
+use crate::{StoreFs, StoreFsError};
+
 const OBJECT_MAGIC: &[u8; 8] = b"ANCHOBJ1";
+const STORE_MARKER_NAME: &str = "fence-store";
+const STORE_MARKER_BYTES: &[u8] = b"FENCE_STORE\n1\n";
 const OBJECT_CODEC_ZSTD: u8 = 1;
 const HEADER_LEN: usize = 56;
 const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
@@ -103,6 +105,7 @@ impl<'de> Deserialize<'de> for ObjectId {
 #[derive(Debug)]
 pub struct ObjectStore {
     root: PathBuf,
+    filesystem: StoreFs,
     compression_level: i32,
 }
 
@@ -127,12 +130,30 @@ impl ObjectStore {
         root: impl AsRef<Path>,
         compression_level: i32,
     ) -> Result<Self, StoreError> {
-        let root = root.as_ref().to_path_buf();
-        create_private_dir(&root)?;
-        create_private_dir(&root.join("objects"))?;
-        create_private_dir(&root.join("objects").join("b3"))?;
+        let filesystem = StoreFs::open_ambient(root)?;
+        Self::from_filesystem(filesystem, compression_level)
+    }
+
+    /// Open a store below an already trusted directory boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for unsafe components, ownership, permissions, or I/O failures.
+    pub fn open_beneath(
+        trusted_parent: impl AsRef<Path>,
+        relative_root: impl AsRef<Path>,
+    ) -> Result<Self, StoreError> {
+        let filesystem = StoreFs::open_beneath(trusted_parent, relative_root)?;
+        Self::from_filesystem(filesystem, DEFAULT_COMPRESSION_LEVEL)
+    }
+
+    fn from_filesystem(filesystem: StoreFs, compression_level: i32) -> Result<Self, StoreError> {
+        ensure_store_marker(&filesystem)?;
+        filesystem.ensure_dir("objects/b3")?;
+        let root = filesystem.root().to_path_buf();
         Ok(Self {
             root,
+            filesystem,
             compression_level,
         })
     }
@@ -142,21 +163,24 @@ impl ObjectStore {
         &self.root
     }
 
+    #[must_use]
+    pub const fn filesystem(&self) -> &StoreFs {
+        &self.filesystem
+    }
+
     /// Store all raw bytes from a reader.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] for input I/O, compression, durability, or collision failures.
     pub fn put(&self, mut reader: impl Read) -> Result<(ObjectId, u64), StoreError> {
-        let staging = self.root.join("objects").join("b3");
-        let mut temp = NamedTempFile::new_in(&staging)?;
-        temp.as_file_mut().write_all(&[0_u8; HEADER_LEN])?;
+        let mut temp = self.filesystem.temporary_file("objects/b3")?;
+        temp.write_all(&[0_u8; HEADER_LEN])?;
 
         let mut hasher = blake3::Hasher::new();
         let mut raw_len = 0_u64;
         {
-            let mut encoder =
-                zstd::stream::write::Encoder::new(temp.as_file_mut(), self.compression_level)?;
+            let mut encoder = zstd::stream::write::Encoder::new(&mut temp, self.compression_level)?;
             let mut buffer = vec![0_u8; 1024 * 1024];
             loop {
                 let read = reader.read(&mut buffer)?;
@@ -173,24 +197,25 @@ impl ObjectStore {
         }
 
         let id = ObjectId::from_bytes(*hasher.finalize().as_bytes());
-        temp.as_file_mut().seek(SeekFrom::Start(0))?;
-        temp.as_file_mut().write_all(&encode_header(id, raw_len))?;
-        temp.as_file_mut().sync_all()?;
+        temp.seek(SeekFrom::Start(0))?;
+        temp.write_all(&encode_header(id, raw_len))?;
+        temp.file_mut().sync_all()?;
 
-        let final_path = self.object_path(id);
-        let parent = final_path.parent().ok_or(StoreError::InvalidStoreLayout)?;
-        create_private_dir(parent)?;
+        let final_relative = Self::object_relative_path(id);
+        let parent = final_relative
+            .parent()
+            .ok_or(StoreError::InvalidStoreLayout)?;
+        let final_directory = self.filesystem.ensure_dir(parent)?;
+        let destination = final_relative
+            .file_name()
+            .ok_or(StoreError::InvalidStoreLayout)?;
 
-        match temp.persist_noclobber(&final_path) {
-            Ok(file) => {
-                file.sync_all()?;
-                sync_directory(parent)?;
-            }
-            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                drop(error.file);
+        match temp.persist_noclobber_in(&final_directory, destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 self.verify(id, raw_len)?;
             }
-            Err(error) => return Err(StoreError::Io(error.error)),
+            Err(error) => return Err(StoreError::Io(error)),
         }
         Ok((id, raw_len))
     }
@@ -228,7 +253,9 @@ impl ObjectStore {
         max_raw_len: u64,
         mut output: impl Write,
     ) -> Result<u64, StoreError> {
-        let mut file = open_store_file(&self.object_path(id))?;
+        let relative = Self::object_relative_path(id);
+        let mut file = self.filesystem.open_file(&relative)?;
+        let opened_metadata = file.metadata()?;
         let header = read_header(&mut file)?;
         if header.id != id {
             return Err(StoreError::IdentityMismatch {
@@ -277,6 +304,12 @@ impl ObjectStore {
                 actual: actual_id,
             });
         }
+        if !self
+            .filesystem
+            .file_identity_matches(relative, &opened_metadata)?
+        {
+            return Err(StoreError::UnsafeStoreFile(self.object_path(id)));
+        }
         Ok(actual_len)
     }
 
@@ -298,12 +331,41 @@ impl ObjectStore {
 
     #[must_use]
     pub fn object_path(&self, id: ObjectId) -> PathBuf {
+        self.root.join(Self::object_relative_path(id))
+    }
+
+    fn object_relative_path(id: ObjectId) -> PathBuf {
         let hex = id.to_hex();
-        self.root
-            .join("objects")
+        PathBuf::from("objects")
             .join("b3")
             .join(&hex[..2])
             .join(format!("{}.zst", &hex[2..]))
+    }
+}
+
+fn ensure_store_marker(filesystem: &StoreFs) -> Result<(), StoreError> {
+    match filesystem.read_bounded(STORE_MARKER_NAME, 64) {
+        Ok(bytes) if bytes == STORE_MARKER_BYTES => return Ok(()),
+        Ok(_) => return Err(StoreError::InvalidStoreMarker),
+        Err(StoreFsError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if filesystem.open_dir("")?.entries()?.next().is_some() {
+        return Err(StoreError::UnrecognizedStore);
+    }
+    let mut temporary = filesystem.temporary_file("")?;
+    temporary.write_all(STORE_MARKER_BYTES)?;
+    match temporary.persist_noclobber(STORE_MARKER_NAME) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let bytes = filesystem.read_bounded(STORE_MARKER_NAME, 64)?;
+            if bytes == STORE_MARKER_BYTES {
+                Ok(())
+            } else {
+                Err(StoreError::InvalidStoreMarker)
+            }
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -347,6 +409,59 @@ fn read_header(reader: &mut impl Read) -> Result<ObjectHeader, StoreError> {
     Ok(ObjectHeader { id, raw_len })
 }
 
+#[cfg(feature = "fuzzing")]
+/// Decode and verify one in-memory object envelope under a fixed raw-size limit.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] for malformed, oversized, corrupt, or mismatched input.
+pub fn decode_object_envelope_for_fuzzing(bytes: &[u8]) -> Result<(), StoreError> {
+    const FUZZ_RAW_LIMIT: u64 = 16 * 1024 * 1024;
+
+    let mut cursor = io::Cursor::new(bytes);
+    let header = read_header(&mut cursor)?;
+    if header.raw_len > FUZZ_RAW_LIMIT {
+        return Err(StoreError::LimitExceeded {
+            declared: header.raw_len,
+            maximum: FUZZ_RAW_LIMIT,
+        });
+    }
+    let mut decoder = zstd::stream::read::Decoder::new(cursor)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut actual = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = decoder.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        actual = actual
+            .checked_add(u64::try_from(read).map_err(|_| StoreError::ObjectTooLarge)?)
+            .ok_or(StoreError::ObjectTooLarge)?;
+        if actual > header.raw_len {
+            return Err(StoreError::LengthMismatch {
+                declared: header.raw_len,
+                actual,
+            });
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if actual != header.raw_len {
+        return Err(StoreError::LengthMismatch {
+            declared: header.raw_len,
+            actual,
+        });
+    }
+    let actual_id = ObjectId::from_bytes(*hasher.finalize().as_bytes());
+    if actual_id != header.id {
+        return Err(StoreError::IdentityMismatch {
+            expected: header.id,
+            actual: actual_id,
+        });
+    }
+    Ok(())
+}
+
 fn hex_nibble(byte: u8) -> Result<u8, StoreError> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -356,86 +471,12 @@ fn hex_nibble(byte: u8) -> Result<u8, StoreError> {
     }
 }
 
-fn create_private_dir(path: &Path) -> Result<(), StoreError> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(StoreError::UnsafeStoreDirectory(path.to_path_buf()));
-        }
-        let expected_uid = rustix::process::geteuid().as_raw();
-        if metadata.uid() != expected_uid {
-            return Err(StoreError::StoreOwnershipMismatch {
-                path: path.to_path_buf(),
-                expected_uid,
-                actual_uid: metadata.uid(),
-            });
-        }
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        if fs::symlink_metadata(path)?.permissions().mode() & 0o077 != 0 {
-            return Err(StoreError::UnsafeStorePermissions(path.to_path_buf()));
-        }
-    }
-    #[cfg(windows)]
-    fence_windows::harden_private_directory(path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_store_file(path: &Path) -> Result<File, StoreError> {
-    use std::os::fd::OwnedFd;
-    use std::os::unix::fs::MetadataExt as _;
-
-    let descriptor: OwnedFd = rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
-        rustix::fs::Mode::empty(),
-    )
-    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-    let file = File::from(descriptor);
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(StoreError::UnsafeStoreFile(path.to_path_buf()));
-    }
-    let expected_uid = rustix::process::geteuid().as_raw();
-    if metadata.uid() != expected_uid {
-        return Err(StoreError::StoreOwnershipMismatch {
-            path: path.to_path_buf(),
-            expected_uid,
-            actual_uid: metadata.uid(),
-        });
-    }
-    Ok(file)
-}
-
-#[cfg(not(unix))]
-fn open_store_file(path: &Path) -> Result<File, StoreError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() {
-        return Err(StoreError::UnsafeStoreFile(path.to_path_buf()));
-    }
-    Ok(File::open(path)?)
-}
-
-#[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
-fn sync_directory(path: &Path) -> Result<(), StoreError> {
-    #[cfg(unix)]
-    {
-        File::open(path)?.sync_all()?;
-    }
-    #[cfg(windows)]
-    {
-        let _ = path;
-    }
-    Ok(())
-}
-
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    StoreFs(#[from] StoreFsError),
     #[cfg(windows)]
     #[error(transparent)]
     Windows(#[from] fence_windows::WindowsError),
@@ -445,6 +486,10 @@ pub enum StoreError {
     ObjectTooLarge,
     #[error("invalid store directory layout")]
     InvalidStoreLayout,
+    #[error("store directory is nonempty but has no Fence product marker")]
+    UnrecognizedStore,
+    #[error("store has an invalid Fence product or layout marker")]
+    InvalidStoreMarker,
     #[error("Fence store directory is a symlink or non-directory: {0}")]
     UnsafeStoreDirectory(PathBuf),
     #[cfg(unix)]
@@ -530,9 +575,28 @@ mod tests {
         let link = parent.path().join("store");
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
 
+        assert!(ObjectStore::open(&link).is_err());
+    }
+
+    #[test]
+    fn nonempty_unmarked_store_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("legacy-record"), b"opaque").unwrap();
+
         assert!(matches!(
-            ObjectStore::open(&link),
-            Err(StoreError::UnsafeStoreDirectory(path)) if path == link
+            ObjectStore::open(root.path()),
+            Err(StoreError::UnrecognizedStore)
+        ));
+    }
+
+    #[test]
+    fn invalid_store_marker_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(STORE_MARKER_NAME), b"not-fence").unwrap();
+
+        assert!(matches!(
+            ObjectStore::open(root.path()),
+            Err(StoreError::InvalidStoreMarker)
         ));
     }
 
@@ -544,7 +608,7 @@ mod tests {
         let store = ObjectStore::open(root.path().join("store")).unwrap();
         let id = ObjectId::from_raw(b"outside");
         let path = store.object_path(id);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(outside.path(), &path).unwrap();
 
         assert!(store.get(id, 1024).is_err());

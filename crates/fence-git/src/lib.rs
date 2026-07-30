@@ -509,6 +509,9 @@ impl ScopeClassifier for FrozenGitScope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreLocation {
     pub root: PathBuf,
+    pub trusted_parent: PathBuf,
+    pub relative_root: PathBuf,
+    pub legacy_root: PathBuf,
     pub worktree_key: String,
 }
 
@@ -699,8 +702,13 @@ fn principal_key() -> String {
 #[cfg(not(windows))]
 #[allow(clippy::unnecessary_wraps)]
 fn default_store_location(git_dir: &Path, common_dir: &Path) -> Result<StoreLocation, GitError> {
-    let root = common_dir
-        .join("fence")
+    let relative_root = PathBuf::from("fence")
+        .join("users")
+        .join(principal_key())
+        .join("v1");
+    let root = common_dir.join(&relative_root);
+    let legacy_root = common_dir
+        .join("anchor")
         .join("users")
         .join(principal_key())
         .join("v1");
@@ -710,7 +718,13 @@ fn default_store_location(git_dir: &Path, common_dir: &Path) -> Result<StoreLoca
         let native = NativeString::from_host(git_dir.as_os_str());
         format!("wt-{}", short_hash(native.bytes()))
     };
-    Ok(StoreLocation { root, worktree_key })
+    Ok(StoreLocation {
+        root,
+        trusted_parent: common_dir.to_path_buf(),
+        relative_root,
+        legacy_root,
+        worktree_key,
+    })
 }
 
 #[cfg(windows)]
@@ -721,8 +735,14 @@ fn default_store_location(git_dir: &Path, common_dir: &Path) -> Result<StoreLoca
         .identity;
     let mut repository_identity = common_identity.volume_serial.to_le_bytes().to_vec();
     repository_identity.extend_from_slice(&common_identity.file_id);
-    let root = fence_windows::local_app_data()?
-        .join("Fence")
+    let trusted_parent = fence_windows::local_app_data()?;
+    let relative_root = PathBuf::from("Fence")
+        .join("stores")
+        .join("v1")
+        .join(format!("repo-{}", short_hash(&repository_identity)));
+    let root = trusted_parent.join(&relative_root);
+    let legacy_root = trusted_parent
+        .join("Anchor")
         .join("stores")
         .join("v1")
         .join(format!("repo-{}", short_hash(&repository_identity)));
@@ -737,7 +757,13 @@ fn default_store_location(git_dir: &Path, common_dir: &Path) -> Result<StoreLoca
         bytes.extend_from_slice(&identity.file_id);
         format!("wt-{}", short_hash(&bytes))
     };
-    Ok(StoreLocation { root, worktree_key })
+    Ok(StoreLocation {
+        root,
+        trusted_parent,
+        relative_root,
+        legacy_root,
+        worktree_key,
+    })
 }
 
 fn short_hash(bytes: &[u8]) -> String {

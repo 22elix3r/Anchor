@@ -1,9 +1,6 @@
 use std::fmt;
-use std::fs;
-#[cfg(unix)]
-use std::fs::File;
 use std::io::{self, Cursor, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fence_core::{
     ManifestEntry, ManifestId, ManifestNode, MetadataObservation, NativeRelativePath, NativeString,
@@ -11,10 +8,9 @@ use fence_core::{
 };
 use fence_git::{IndexCapture, RepositoryState};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::{SessionError, SessionId, SessionStore, bounded_read, private_directory};
+use crate::{SessionError, SessionId, SessionStore};
 
 const PLAN_TAG: u64 = 0x4152_504c_414e_5631;
 const PLAN_SCHEMA: u16 = 2;
@@ -510,26 +506,15 @@ impl SessionStore {
     ) -> Result<RestorePlanId, SessionError> {
         let id = plan.id()?;
         let bytes = plan.encode()?;
-        let path = self.restore_plan_path(id);
+        let path = Self::restore_plan_relative_path(id);
         let parent = path.parent().ok_or(SessionError::InvalidLayout)?;
-        private_directory(parent)?;
-        if path.exists() {
-            let existing = self.load_restore_plan(id)?;
-            if existing == *plan {
-                return Ok(id);
-            }
-            return Err(SessionError::RestorePlanCollision(id));
-        }
-        let mut file = NamedTempFile::new_in(parent)?;
+        let destination = path.file_name().ok_or(SessionError::InvalidLayout)?;
+        let directory = self.filesystem().ensure_dir(parent)?;
+        let mut file = self.filesystem().temporary_file(parent)?;
         file.write_all(&bytes)?;
-        file.as_file().sync_all()?;
-        match file.persist_noclobber(&path) {
-            Ok(file) => {
-                file.sync_all()?;
-                sync_parent(&path)?;
-                Ok(id)
-            }
-            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+        match file.persist_noclobber_in(&directory, destination) {
+            Ok(()) => Ok(id),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let existing = self.load_restore_plan(id)?;
                 if existing == *plan {
                     Ok(id)
@@ -537,7 +522,7 @@ impl SessionStore {
                     Err(SessionError::RestorePlanCollision(id))
                 }
             }
-            Err(error) => Err(error.error.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -545,8 +530,11 @@ impl SessionStore {
         &self,
         id: RestorePlanId,
     ) -> Result<RestorePlanRecord, SessionError> {
-        let plan =
-            RestorePlanRecord::decode(&bounded_read(&self.restore_plan_path(id), MAX_PLAN_BYTES)?)?;
+        let plan = RestorePlanRecord::decode(
+            &self
+                .filesystem()
+                .read_bounded(Self::restore_plan_relative_path(id), MAX_PLAN_BYTES)?,
+        )?;
         if plan.id()? != id {
             return Err(SessionError::RestorePlanIdentityMismatch(id));
         }
@@ -556,12 +544,9 @@ impl SessionStore {
     pub(crate) fn list_restore_plans(
         &self,
     ) -> Result<Vec<(RestorePlanId, RestorePlanRecord)>, SessionError> {
-        let root = self.root.join("plans").join("b3");
-        if !root.exists() {
-            return Ok(Vec::new());
-        }
+        let root = Path::new("plans").join("b3");
         let mut plans = Vec::new();
-        for prefix in fs::read_dir(root)? {
+        for prefix in self.filesystem().open_dir(&root)?.entries()? {
             let prefix = prefix?;
             if !prefix.file_type()?.is_dir() {
                 return Err(SessionError::InvalidLayout);
@@ -570,15 +555,18 @@ impl SessionStore {
                 .file_name()
                 .into_string()
                 .map_err(|_| SessionError::InvalidLayout)?;
-            for entry in fs::read_dir(prefix.path())? {
+            let prefix_path = root.join(&prefix_name);
+            for entry in self.filesystem().open_dir(&prefix_path)?.entries()? {
                 let entry = entry?;
+                let entry_name = entry.file_name();
                 if !entry.file_type()?.is_file()
-                    || entry.path().extension().is_none_or(|value| value != "cbor")
+                    || Path::new(&entry_name)
+                        .extension()
+                        .is_none_or(|value| value != "cbor")
                 {
                     return Err(SessionError::InvalidLayout);
                 }
-                let suffix = entry
-                    .path()
+                let suffix = Path::new(&entry_name)
                     .file_stem()
                     .and_then(|value| value.to_str())
                     .ok_or(SessionError::InvalidLayout)?
@@ -591,10 +579,9 @@ impl SessionStore {
         Ok(plans)
     }
 
-    fn restore_plan_path(&self, id: RestorePlanId) -> PathBuf {
+    fn restore_plan_relative_path(id: RestorePlanId) -> PathBuf {
         let hex = id.to_hex();
-        self.root
-            .join("plans")
+        PathBuf::from("plans")
             .join("b3")
             .join(&hex[..2])
             .join(format!("{}.cbor", &hex[2..]))
@@ -618,17 +605,6 @@ fn hex_nibble(value: u8) -> Result<u8, SessionError> {
         b'a'..=b'f' => Ok(value - b'a' + 10),
         _ => Err(SessionError::InvalidLayout),
     }
-}
-
-#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
-fn sync_parent(path: &std::path::Path) -> Result<(), SessionError> {
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
 }
 
 #[derive(Debug, Error)]

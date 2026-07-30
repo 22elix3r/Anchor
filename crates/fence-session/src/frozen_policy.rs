@@ -3,9 +3,8 @@ use std::io::{self, Cursor, Write};
 
 use fence_git::FrozenGitPolicy;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tempfile::NamedTempFile;
 
-use crate::{SessionError, SessionStore, bounded_read, private_directory};
+use crate::{SessionError, SessionStore};
 
 const MAX_POLICY_BYTES: usize = 32 * 1024 * 1024;
 
@@ -88,22 +87,18 @@ impl SessionStore {
             return Err(SessionError::FrozenPolicyTooLarge);
         }
         let id = FrozenPolicyId::from_bytes(*blake3::hash(&bytes).as_bytes());
-        let path = self.frozen_policy_path(id);
+        let path = Self::frozen_policy_relative_path(id);
         let parent = path.parent().ok_or(SessionError::InvalidLayout)?;
-        private_directory(parent)?;
-        if path.exists() {
-            self.load_frozen_policy(id)?;
-            return Ok(id);
-        }
-        let mut file = NamedTempFile::new_in(parent)?;
+        let destination = path.file_name().ok_or(SessionError::InvalidLayout)?;
+        let directory = self.filesystem().ensure_dir(parent)?;
+        let mut file = self.filesystem().temporary_file(parent)?;
         file.write_all(&bytes)?;
-        file.as_file().sync_all()?;
-        match file.persist_noclobber(&path) {
-            Ok(file) => file.sync_all()?,
-            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+        match file.persist_noclobber_in(&directory, destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 self.load_frozen_policy(id)?;
             }
-            Err(error) => return Err(error.error.into()),
+            Err(error) => return Err(error.into()),
         }
         Ok(id)
     }
@@ -112,7 +107,9 @@ impl SessionStore {
         &self,
         id: FrozenPolicyId,
     ) -> Result<FrozenGitPolicy, SessionError> {
-        let bytes = bounded_read(&self.frozen_policy_path(id), MAX_POLICY_BYTES)?;
+        let bytes = self
+            .filesystem()
+            .read_bounded(Self::frozen_policy_relative_path(id), MAX_POLICY_BYTES)?;
         if blake3::hash(&bytes).as_bytes() != id.as_bytes() {
             return Err(SessionError::FrozenPolicyIdentityMismatch(id));
         }
@@ -126,10 +123,9 @@ impl SessionStore {
         Ok(policy)
     }
 
-    pub(crate) fn frozen_policy_path(&self, id: FrozenPolicyId) -> std::path::PathBuf {
+    fn frozen_policy_relative_path(id: FrozenPolicyId) -> std::path::PathBuf {
         let hex = id.to_hex();
-        self.root
-            .join("policies")
+        std::path::PathBuf::from("policies")
             .join("b3")
             .join(&hex[..2])
             .join(format!("{}.cbor", &hex[2..]))

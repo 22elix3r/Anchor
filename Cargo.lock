@@ -15,106 +15,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
 
 [[package]]
-name = "fence-cli"
-version = "0.1.0-alpha.1"
-dependencies = [
- "fence-core",
- "fence-git",
- "fence-session",
- "fence-tui",
- "clap",
- "gix-imara-diff",
- "miette",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "fence-core"
-version = "0.1.0-alpha.1"
-dependencies = [
- "fence-unix",
- "fence-windows",
- "blake3",
- "cap-std",
- "ciborium",
- "gix-imara-diff",
- "proptest",
- "rustix 1.1.4",
- "serde",
- "serde_bytes",
- "tempfile",
- "thiserror",
- "zstd",
-]
-
-[[package]]
-name = "fence-git"
-version = "0.1.0-alpha.1"
-dependencies = [
- "fence-core",
- "fence-windows",
- "blake3",
- "cap-std",
- "gix",
- "rustix 1.1.4",
- "serde",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "fence-session"
-version = "0.1.0-alpha.1"
-dependencies = [
- "fence-core",
- "fence-git",
- "fence-windows",
- "atomic-write-file",
- "blake3",
- "cap-std",
- "ciborium",
- "command-fds",
- "fs4",
- "rustix 1.1.4",
- "serde",
- "serde_bytes",
- "signal-hook 0.4.4",
- "tempfile",
- "thiserror",
- "toml",
- "uuid",
-]
-
-[[package]]
-name = "fence-tui"
-version = "0.1.0-alpha.1"
-dependencies = [
- "fence-core",
- "crossterm",
- "ratatui",
- "thiserror",
-]
-
-[[package]]
-name = "fence-unix"
-version = "0.1.0-alpha.1"
-dependencies = [
- "libc",
- "tempfile",
-]
-
-[[package]]
-name = "fence-windows"
-version = "0.1.0-alpha.1"
-dependencies = [
- "tempfile",
- "thiserror",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -715,6 +615,107 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
+name = "fence-cli"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "clap",
+ "fence-core",
+ "fence-git",
+ "fence-session",
+ "fence-tui",
+ "gix-imara-diff",
+ "miette",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "fence-core"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "blake3",
+ "cap-std",
+ "ciborium",
+ "fence-unix",
+ "fence-windows",
+ "gix-imara-diff",
+ "proptest",
+ "rustix 1.1.4",
+ "serde",
+ "serde_bytes",
+ "tempfile",
+ "thiserror",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
+name = "fence-git"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "blake3",
+ "cap-std",
+ "fence-core",
+ "fence-windows",
+ "gix",
+ "rustix 1.1.4",
+ "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "fence-session"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "atomic-write-file",
+ "blake3",
+ "cap-std",
+ "ciborium",
+ "command-fds",
+ "fence-core",
+ "fence-git",
+ "fence-windows",
+ "fs4",
+ "rustix 1.1.4",
+ "serde",
+ "serde_bytes",
+ "signal-hook 0.4.4",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "uuid",
+]
+
+[[package]]
+name = "fence-tui"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "crossterm",
+ "fence-core",
+ "ratatui",
+ "thiserror",
+]
+
+[[package]]
+name = "fence-unix"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
+name = "fence-windows"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "tempfile",
+ "thiserror",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "filetime"

@@ -9,6 +9,7 @@ pub mod metadata;
 pub mod object;
 pub mod path;
 pub mod restore;
+pub mod store_fs;
 pub mod wire;
 
 pub use capture::{
@@ -35,3 +36,4 @@ pub use restore::{
     ConflictReason, NoChangeReason, PathRestore, RestoreConflict, RestoreOutcome, RestorePlan,
     RestorePlanError,
 };
+pub use store_fs::{StoreFs, StoreFsError, StoreTempFile};

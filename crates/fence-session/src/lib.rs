@@ -2,13 +2,15 @@
 
 mod config;
 mod frozen_policy;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 mod maintenance;
 mod restore;
 mod restore_plan;
 
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
@@ -20,16 +22,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use atomic_write_file::AtomicWriteFile;
 use fence_core::{
     CaptureEngine, CaptureOptions, CaptureStatistics, Manifest, ManifestError, ManifestId,
-    NativeString, ObjectStore, StoreError,
+    NativeString, ObjectStore, StoreError, StoreFs, StoreFsError,
 };
 use fence_git::{
     FrozenGitPolicy, GitContext, GitError, IndexCapture, PolicyDrift, RepositoryState,
+    StoreLocation,
 };
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -242,6 +243,8 @@ pub struct SessionStore {
     root: PathBuf,
     worktree_key: String,
     objects: ObjectStore,
+    filesystem: StoreFs,
+    legacy_root: Option<PathBuf>,
 }
 
 impl SessionStore {
@@ -254,30 +257,48 @@ impl SessionStore {
         root: impl AsRef<Path>,
         worktree_key: impl Into<String>,
     ) -> Result<Self, SessionError> {
-        let root = root.as_ref().to_path_buf();
-        let worktree_key = worktree_key.into();
-        validate_worktree_key(&worktree_key)?;
-        let objects = ObjectStore::open(&root)?;
-        for directory in [
-            root.join("manifests"),
-            root.join("manifests").join("b3"),
-            root.join("policies"),
-            root.join("policies").join("b3"),
-            root.join("plans"),
-            root.join("plans").join("b3"),
-            root.join("sessions"),
-            root.join("sessions").join(&worktree_key),
-            root.join("deleted-sessions"),
-            root.join("deleted-sessions").join(&worktree_key),
-            root.join("locks"),
-            root.join("transactions"),
-        ] {
-            private_directory(&directory)?;
+        let objects = ObjectStore::open(root)?;
+        Self::from_objects(objects, worktree_key.into(), None)
+    }
+
+    /// Open the production store through the trusted boundary discovered by `gix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] for unsafe components, legacy-store ambiguity, or layout errors.
+    pub fn open_location(location: StoreLocation) -> Result<Self, SessionError> {
+        let objects = ObjectStore::open_beneath(&location.trusted_parent, &location.relative_root)?;
+        if objects.root() != location.root {
+            return Err(SessionError::InvalidLayout);
         }
+        Self::from_objects(objects, location.worktree_key, Some(location.legacy_root))
+    }
+
+    fn from_objects(
+        objects: ObjectStore,
+        worktree_key: String,
+        legacy_root: Option<PathBuf>,
+    ) -> Result<Self, SessionError> {
+        let root = objects.root().to_path_buf();
+        validate_worktree_key(&worktree_key)?;
+        for directory in [
+            PathBuf::from("manifests/b3"),
+            PathBuf::from("policies/b3"),
+            PathBuf::from("plans/b3"),
+            PathBuf::from("sessions").join(&worktree_key),
+            PathBuf::from("deleted-sessions").join(&worktree_key),
+            PathBuf::from("locks"),
+            PathBuf::from("transactions"),
+        ] {
+            objects.filesystem().ensure_dir(directory)?;
+        }
+        let filesystem = objects.filesystem().clone();
         Ok(Self {
             root,
             worktree_key,
             objects,
+            filesystem,
+            legacy_root,
         })
     }
 
@@ -291,6 +312,10 @@ impl SessionStore {
         &self.root
     }
 
+    pub(crate) const fn filesystem(&self) -> &StoreFs {
+        &self.filesystem
+    }
+
     /// Publish and verify an immutable manifest.
     ///
     /// # Errors
@@ -299,25 +324,15 @@ impl SessionStore {
     pub fn put_manifest(&self, manifest: &Manifest) -> Result<ManifestId, SessionError> {
         let id = manifest.id()?;
         let bytes = manifest.encode()?;
-        let path = self.manifest_path(id);
+        let path = Self::manifest_relative_path(id);
         let parent = path.parent().ok_or(SessionError::InvalidLayout)?;
-        private_directory(parent)?;
-        if path.exists() {
-            let existing = self.load_manifest(id)?;
-            if existing == *manifest {
-                return Ok(id);
-            }
-            return Err(SessionError::ManifestCollision(id));
-        }
-        let mut file = NamedTempFile::new_in(parent)?;
+        let destination = path.file_name().ok_or(SessionError::InvalidLayout)?;
+        let directory = self.filesystem.ensure_dir(parent)?;
+        let mut file = self.filesystem.temporary_file(parent)?;
         file.write_all(&bytes)?;
-        file.as_file().sync_all()?;
-        match file.persist_noclobber(&path) {
-            Ok(file) => {
-                file.sync_all()?;
-                Ok(id)
-            }
-            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+        match file.persist_noclobber_in(&directory, destination) {
+            Ok(()) => Ok(id),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let existing = self.load_manifest(id)?;
                 if existing == *manifest {
                     Ok(id)
@@ -325,7 +340,7 @@ impl SessionStore {
                     Err(SessionError::ManifestCollision(id))
                 }
             }
-            Err(error) => Err(error.error.into()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -335,7 +350,9 @@ impl SessionStore {
     ///
     /// Returns [`SessionError`] for malformed, missing, oversized, or corrupt data.
     pub fn load_manifest(&self, id: ManifestId) -> Result<Manifest, SessionError> {
-        let bytes = bounded_read(&self.manifest_path(id), 256 * 1024 * 1024)?;
+        let bytes = self
+            .filesystem
+            .read_bounded(Self::manifest_relative_path(id), 256 * 1024 * 1024)?;
         let manifest = Manifest::decode(&bytes)?;
         if manifest.id()? != id {
             return Err(SessionError::ManifestIdentityMismatch(id));
@@ -360,9 +377,12 @@ impl SessionStore {
         if bytes.len() > MAX_SESSION_BYTES {
             return Err(SessionError::SessionTooLarge);
         }
-        let mut file = AtomicWriteFile::open(self.session_path(session.id))?;
+        let relative = self.session_relative_path(session.id);
+        let parent = relative.parent().ok_or(SessionError::InvalidLayout)?;
+        let destination = relative.file_name().ok_or(SessionError::InvalidLayout)?;
+        let mut file = self.filesystem.temporary_file(parent)?;
         file.write_all(&bytes)?;
-        file.commit()?;
+        file.replace(destination)?;
         Ok(())
     }
 
@@ -372,7 +392,9 @@ impl SessionStore {
     ///
     /// Returns [`SessionError`] for malformed, missing, oversized, or unsupported data.
     pub fn load_session(&self, id: SessionId) -> Result<Session, SessionError> {
-        let bytes = bounded_read(&self.session_path(id), MAX_SESSION_BYTES)?;
+        let bytes = self
+            .filesystem
+            .read_bounded(self.session_relative_path(id), MAX_SESSION_BYTES)?;
         let session = decode_session(&bytes)?;
         validate_session_policy_binding(&session)?;
         Ok(session)
@@ -384,8 +406,8 @@ impl SessionStore {
     ///
     /// Returns [`SessionError`] if any retained session cannot be read safely.
     pub fn list_sessions(&self) -> Result<Vec<Session>, SessionError> {
-        let directory = self.root.join("sessions").join(&self.worktree_key);
-        let mut sessions = Self::list_sessions_in(&directory, &self.worktree_key)?;
+        let directory = PathBuf::from("sessions").join(&self.worktree_key);
+        let mut sessions = self.list_sessions_in(&directory, &self.worktree_key)?;
         sessions.sort_by_key(|session| session.started_at.seconds);
         sessions.reverse();
         Ok(sessions)
@@ -397,8 +419,8 @@ impl SessionStore {
     ///
     /// Returns [`SessionError`] if any tombstoned record is corrupt.
     pub fn list_deleted_sessions(&self) -> Result<Vec<Session>, SessionError> {
-        let directory = self.root.join("deleted-sessions").join(&self.worktree_key);
-        let mut sessions = Self::list_sessions_in(&directory, &self.worktree_key)?;
+        let directory = PathBuf::from("deleted-sessions").join(&self.worktree_key);
+        let mut sessions = self.list_sessions_in(&directory, &self.worktree_key)?;
         sessions.sort_by_key(|session| session.started_at.seconds);
         sessions.reverse();
         Ok(sessions)
@@ -416,7 +438,10 @@ impl SessionStore {
         if !session.state.is_terminal() {
             return Err(SessionError::NonterminalDeletion);
         }
-        move_session_noclobber(&self.session_path(id), &self.deleted_session_path(id))
+        self.move_session_noclobber(
+            &self.session_relative_path(id),
+            &self.deleted_session_relative_path(id),
+        )
     }
 
     /// Restore a recoverably deleted session to the active namespace.
@@ -428,7 +453,10 @@ impl SessionStore {
     pub fn undelete_session(&self, id: SessionId) -> Result<(), SessionError> {
         let _lease = self.acquire_store_read_lease()?;
         let _active = self.acquire_active_lock()?;
-        move_session_noclobber(&self.deleted_session_path(id), &self.session_path(id))
+        self.move_session_noclobber(
+            &self.deleted_session_relative_path(id),
+            &self.session_relative_path(id),
+        )
     }
 
     /// Permanently remove a tombstoned session record.
@@ -441,7 +469,10 @@ impl SessionStore {
     pub fn purge_deleted_session(&self, id: SessionId) -> Result<(), SessionError> {
         let _lease = self.acquire_store_read_lease()?;
         let _active = self.acquire_active_lock()?;
-        fs::remove_file(self.deleted_session_path(id))?;
+        let relative = self.deleted_session_relative_path(id);
+        let parent = relative.parent().ok_or(SessionError::InvalidLayout)?;
+        let name = relative.file_name().ok_or(SessionError::InvalidLayout)?;
+        self.filesystem.open_dir(parent)?.remove_file(name)?;
         Ok(())
     }
 
@@ -462,11 +493,8 @@ impl SessionStore {
 
     pub(crate) fn list_all_retained_sessions(&self) -> Result<Vec<Session>, SessionError> {
         let mut sessions = Vec::new();
-        for root in [
-            self.root.join("sessions"),
-            self.root.join("deleted-sessions"),
-        ] {
-            for namespace in fs::read_dir(root)? {
+        for root in [Path::new("sessions"), Path::new("deleted-sessions")] {
+            for namespace in self.filesystem.open_dir(root)?.entries()? {
                 let namespace = namespace?;
                 if !namespace.file_type()?.is_dir() {
                     continue;
@@ -475,26 +503,28 @@ impl SessionStore {
                     .file_name()
                     .into_string()
                     .map_err(|_| SessionError::InvalidWorktreeNamespace)?;
-                sessions.extend(Self::list_sessions_in(&namespace.path(), &key)?);
+                sessions.extend(self.list_sessions_in(&root.join(&key), &key)?);
             }
         }
         Ok(sessions)
     }
 
     fn list_sessions_in(
+        &self,
         directory: &Path,
         expected_worktree_key: &str,
     ) -> Result<Vec<Session>, SessionError> {
         let mut sessions = Vec::new();
-        for entry in fs::read_dir(directory)? {
+        for entry in self.filesystem.open_dir(directory)?.entries()? {
             let entry = entry?;
             if entry.file_type()?.is_file()
-                && entry
-                    .path()
+                && Path::new(&entry.file_name())
                     .extension()
                     .is_some_and(|extension| extension == "cbor")
             {
-                let bytes = bounded_read(&entry.path(), MAX_SESSION_BYTES)?;
+                let bytes = self
+                    .filesystem
+                    .read_bounded(directory.join(entry.file_name()), MAX_SESSION_BYTES)?;
                 let session = decode_session(&bytes)?;
                 validate_session_policy_binding(&session)?;
                 if session.worktree_key != expected_worktree_key {
@@ -507,39 +537,57 @@ impl SessionStore {
     }
 
     fn manifest_path(&self, id: ManifestId) -> PathBuf {
+        self.root.join(Self::manifest_relative_path(id))
+    }
+
+    fn manifest_relative_path(id: ManifestId) -> PathBuf {
         let hex = id.to_string();
-        self.root
-            .join("manifests")
+        PathBuf::from("manifests")
             .join("b3")
             .join(&hex[..2])
             .join(format!("{}.cbor", &hex[2..]))
     }
 
-    fn session_path(&self, id: SessionId) -> PathBuf {
-        self.root
-            .join("sessions")
+    fn session_relative_path(&self, id: SessionId) -> PathBuf {
+        PathBuf::from("sessions")
             .join(&self.worktree_key)
             .join(format!("{id}.cbor"))
     }
 
-    fn deleted_session_path(&self, id: SessionId) -> PathBuf {
-        self.root
-            .join("deleted-sessions")
+    fn deleted_session_relative_path(&self, id: SessionId) -> PathBuf {
+        PathBuf::from("deleted-sessions")
             .join(&self.worktree_key)
             .join(format!("{id}.cbor"))
+    }
+
+    fn move_session_noclobber(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), SessionError> {
+        let source_parent = source.parent().ok_or(SessionError::InvalidLayout)?;
+        let destination_parent = destination.parent().ok_or(SessionError::InvalidLayout)?;
+        let source_name = source.file_name().ok_or(SessionError::InvalidLayout)?;
+        let destination_name = destination.file_name().ok_or(SessionError::InvalidLayout)?;
+        let source_directory = self.filesystem.open_dir(source_parent)?;
+        let destination_directory = self.filesystem.open_dir(destination_parent)?;
+        source_directory.hard_link(source_name, &destination_directory, destination_name)?;
+        if let Err(error) = source_directory.remove_file(source_name) {
+            let _ = destination_directory.remove_file(destination_name);
+            return Err(error.into());
+        }
+        source_directory.try_clone()?.into_std_file().sync_all()?;
+        destination_directory
+            .try_clone()?
+            .into_std_file()
+            .sync_all()?;
+        Ok(())
     }
 
     pub(crate) fn acquire_active_lock(&self) -> Result<ActiveLock, SessionError> {
-        let path = self
-            .root
-            .join("locks")
-            .join(format!("{}.active.lock", self.worktree_key));
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)?;
+        self.refuse_legacy_store()?;
+        let path = PathBuf::from("locks").join(format!("{}.active.lock", self.worktree_key));
+        let file = self.filesystem.open_lock(path)?;
         fs4::FileExt::try_lock(&file)
             .map_err(|error| SessionError::ActiveSession(error.to_string()))?;
         Ok(ActiveLock {
@@ -556,12 +604,29 @@ impl SessionStore {
     }
 
     fn open_store_lock(&self) -> Result<File, SessionError> {
-        Ok(OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.root.join("locks").join("store.activity.lock"))?)
+        Ok(self.filesystem.open_lock("locks/store.activity.lock")?)
+    }
+
+    pub(crate) fn legacy_store_present(&self) -> Result<bool, SessionError> {
+        let Some(path) = &self.legacy_root else {
+            return Ok(false);
+        };
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn refuse_legacy_store(&self) -> Result<(), SessionError> {
+        if self.legacy_store_present()? {
+            return Err(SessionError::LegacyAnchorStore(
+                self.legacy_root
+                    .clone()
+                    .ok_or(SessionError::InvalidLayout)?,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -715,7 +780,7 @@ impl SessionRunner {
         let before_context = GitContext::discover(&request.invocation_directory)?;
         reject_unsupported_repository(&before_context.repository_state()?)?;
         let location = before_context.store_location();
-        let store = SessionStore::open(&location.root, location.worktree_key)?;
+        let store = SessionStore::open_location(location)?;
         let _store_lease = store.acquire_store_read_lease()?;
         let mut active_lock = store.acquire_active_lock()?;
         restore::ensure_no_unresolved_transactions(store.root())
@@ -1096,74 +1161,7 @@ impl SignalForwarder {
     }
 }
 
-fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>, SessionError> {
-    let mut file = open_store_file(path)?;
-    let metadata = file.metadata()?;
-    let length = usize::try_from(metadata.len()).map_err(|_| SessionError::SessionTooLarge)?;
-    if length > maximum {
-        return Err(SessionError::SessionTooLarge);
-    }
-    let mut bytes = Vec::with_capacity(length);
-    Read::by_ref(&mut file)
-        .take(u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() != length {
-        return Err(SessionError::UnstableMetadata(path.to_path_buf()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let after = file.metadata()?;
-        let path_metadata = fs::symlink_metadata(path)?;
-        if path_metadata.file_type().is_symlink()
-            || metadata.dev() != after.dev()
-            || metadata.ino() != after.ino()
-            || metadata.len() != after.len()
-            || after.dev() != path_metadata.dev()
-            || after.ino() != path_metadata.ino()
-        {
-            return Err(SessionError::UnstableMetadata(path.to_path_buf()));
-        }
-    }
-    Ok(bytes)
-}
-
-#[cfg(unix)]
-fn open_store_file(path: &Path) -> Result<File, SessionError> {
-    use std::os::fd::OwnedFd;
-    use std::os::unix::fs::MetadataExt as _;
-
-    let descriptor: OwnedFd = rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
-        rustix::fs::Mode::empty(),
-    )
-    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-    let file = File::from(descriptor);
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(SessionError::UnsafeStoreFile(path.to_path_buf()));
-    }
-    let expected_uid = rustix::process::geteuid().as_raw();
-    if metadata.uid() != expected_uid {
-        return Err(SessionError::StoreOwnershipMismatch {
-            path: path.to_path_buf(),
-            expected_uid,
-            actual_uid: metadata.uid(),
-        });
-    }
-    Ok(file)
-}
-
-#[cfg(not(unix))]
-fn open_store_file(path: &Path) -> Result<File, SessionError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() {
-        return Err(SessionError::UnsafeStoreFile(path.to_path_buf()));
-    }
-    Ok(File::open(path)?)
-}
-
+#[cfg(all(test, unix))]
 fn private_directory(path: &Path) -> Result<(), SessionError> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
@@ -1184,26 +1182,6 @@ fn private_directory(path: &Path) -> Result<(), SessionError> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
         if fs::symlink_metadata(path)?.permissions().mode() & 0o077 != 0 {
             return Err(SessionError::UnsafeStorePermissions(path.to_path_buf()));
-        }
-    }
-    #[cfg(windows)]
-    fence_windows::harden_private_directory(path)?;
-    Ok(())
-}
-
-fn move_session_noclobber(source: &Path, destination: &Path) -> Result<(), SessionError> {
-    fs::hard_link(source, destination)?;
-    if let Err(error) = fs::remove_file(source) {
-        let _rollback = fs::remove_file(destination);
-        return Err(error.into());
-    }
-    #[cfg(unix)]
-    {
-        if let Some(parent) = source.parent() {
-            File::open(parent)?.sync_all()?;
-        }
-        if let Some(parent) = destination.parent() {
-            File::open(parent)?.sync_all()?;
         }
     }
     Ok(())
@@ -1395,15 +1373,26 @@ impl SessionWireV3 {
 }
 
 fn decode_session(bytes: &[u8]) -> Result<Session, SessionError> {
-    if let Ok(wire) = ciborium::de::from_reader::<SessionWireV3, _>(Cursor::new(bytes)) {
+    if bytes.len() > MAX_SESSION_BYTES {
+        return Err(SessionError::SessionTooLarge);
+    }
+    if let Ok(wire) = decode_session_wire::<SessionWireV3>(bytes) {
         return wire.into_session();
     }
-    if let Ok(wire) = ciborium::de::from_reader::<SessionWireV2, _>(Cursor::new(bytes)) {
+    if let Ok(wire) = decode_session_wire::<SessionWireV2>(bytes) {
         return wire.into_session();
     }
-    let wire: SessionWireV1 = ciborium::de::from_reader(Cursor::new(bytes))
-        .map_err(|error| SessionError::Decode(error.to_string()))?;
+    let wire: SessionWireV1 = decode_session_wire(bytes).map_err(SessionError::Decode)?;
     wire.into_session()
+}
+
+fn decode_session_wire<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    let mut cursor = Cursor::new(bytes);
+    let wire = ciborium::de::from_reader(&mut cursor).map_err(|error| error.to_string())?;
+    if usize::try_from(cursor.position()).ok() != Some(bytes.len()) {
+        return Err("session record has trailing bytes".to_owned());
+    }
+    Ok(wire)
 }
 
 fn validate_session_policy_binding(session: &Session) -> Result<(), SessionError> {
@@ -1506,6 +1495,10 @@ pub enum SessionError {
     UnsafeStorePermissions(PathBuf),
     #[error("Fence store record is a symlink or non-file: {0}")]
     UnsafeStoreFile(PathBuf),
+    #[error(
+        "legacy Anchor store detected at {0}; Fence will not import or mutate pre-alpha Anchor data"
+    )]
+    LegacyAnchorStore(PathBuf),
     #[error("worktree namespace is not valid UTF-8")]
     InvalidWorktreeNamespace,
     #[error("session belongs to a different worktree namespace")]
@@ -1558,6 +1551,8 @@ pub enum SessionError {
     Manifest(#[from] ManifestError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    StoreFs(#[from] StoreFsError),
     #[cfg(windows)]
     #[error(transparent)]
     Windows(#[from] fence_windows::WindowsError),
@@ -1618,7 +1613,7 @@ mod tests {
 
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let session = store.load_session(result.session_id).unwrap();
         assert_eq!(session.command.len(), 1);
         assert_eq!(session.redacted_argument_count, 1);
@@ -1638,7 +1633,7 @@ mod tests {
         let root = repository();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let endpoint = capture_live_endpoint(&context, &store, CaptureOptions::default()).unwrap();
         #[cfg(unix)]
         let argument = {
@@ -1671,6 +1666,11 @@ mod tests {
         };
         store.save_session(&session).unwrap();
         assert_eq!(store.load_session(session.id).unwrap(), session);
+
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&SessionWireV3::from_session(&session), &mut encoded).unwrap();
+        encoded.push(0);
+        assert!(decode_session(&encoded).is_err());
     }
 
     #[test]
@@ -1678,7 +1678,7 @@ mod tests {
         let root = repository();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let endpoint = capture_live_endpoint(&context, &store, CaptureOptions::default()).unwrap();
         let mut session = Session {
             id: SessionId::new(),
@@ -1716,7 +1716,7 @@ mod tests {
         let root = repository();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let mut endpoint =
             capture_live_endpoint(&context, &store, CaptureOptions::default()).unwrap();
         endpoint.policy_observation = None;
@@ -1805,14 +1805,34 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store_root = root.path().join("store");
         let outside = tempfile::tempdir().unwrap();
-        fs::create_dir(&store_root).unwrap();
+        ObjectStore::open(&store_root).unwrap();
         std::os::unix::fs::symlink(outside.path(), store_root.join("manifests")).unwrap();
 
-        assert!(matches!(
-            SessionStore::open(&store_root, "main"),
-            Err(SessionError::UnsafeStoreDirectory(path))
-                if path == store_root.join("manifests")
-        ));
+        assert!(SessionStore::open(&store_root, "main").is_err());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn legacy_anchor_store_blocks_new_session_mutation() {
+        let root = repository();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        fs::create_dir_all(&location.legacy_root).unwrap();
+
+        let error = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from("true"),
+            ],
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, SessionError::LegacyAnchorStore(path) if path == location.legacy_root)
+        );
     }
 
     #[test]
@@ -1831,7 +1851,7 @@ mod tests {
         .unwrap();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let mut session = store.load_session(result.session_id).unwrap();
         session.state = SessionState::ChildRunning;
         session.after = None;
@@ -1872,7 +1892,7 @@ mod tests {
         fs::write(root.path().join("file"), b"current").unwrap();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let session = store.load_session(result.session_id).unwrap();
         let after = store
             .load_manifest(session.after.as_ref().unwrap().manifest)
@@ -1920,7 +1940,7 @@ mod tests {
 
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let session = store.load_session(result.session_id).unwrap();
         let after = session.after.as_ref().unwrap();
         let names = store
@@ -1972,7 +1992,7 @@ mod tests {
         .unwrap();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let session = store.load_session(result.session_id).unwrap();
         let after = session.after.as_ref().unwrap();
         let names = store
@@ -2020,7 +2040,7 @@ mod tests {
         .unwrap();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let session = store.load_session(result.session_id).unwrap();
         let after = session.after.as_ref().unwrap();
         let names = store
@@ -2070,7 +2090,7 @@ mod tests {
         let root = repository();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let mut endpoint =
             capture_live_endpoint(&context, &store, CaptureOptions::default()).unwrap();
         endpoint.policy_observation = None;
@@ -2115,7 +2135,7 @@ mod tests {
         .unwrap();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let session = store.load_session(result.session_id).unwrap();
         let before = session.before.manifest;
 

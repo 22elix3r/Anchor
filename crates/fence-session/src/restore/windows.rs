@@ -126,11 +126,7 @@ pub(super) fn apply_batch(
         return Ok(());
     }
     let id = Uuid::now_v7();
-    let transaction = store
-        .root()
-        .join("transactions")
-        .join(format!("windows-batch-{id}"));
-    private_transaction_dir(&transaction)?;
+    let transaction = create_transaction_directory(store, &format!("windows-batch-{id}"))?;
     let journal_path = transaction.join("journal.cbor");
     let items = writes
         .iter()
@@ -192,11 +188,7 @@ pub(super) fn apply_index(
     let lock_path = index_path.with_extension("lock");
     let lock_name = lock_path.file_name().ok_or(RestoreError::UnsafeIndexPath)?;
     let id = Uuid::now_v7();
-    let transaction = store
-        .root()
-        .join("transactions")
-        .join(format!("windows-index-{id}"));
-    private_transaction_dir(&transaction)?;
+    let transaction = create_transaction_directory(store, &format!("windows-index-{id}"))?;
     let journal_path = transaction.join("journal.cbor");
     let mut journal = IndexJournal {
         tag: JOURNAL_TAG,
@@ -943,10 +935,10 @@ impl Presence {
     }
 }
 
-fn private_transaction_dir(path: &Path) -> Result<(), RestoreError> {
-    fs::create_dir_all(path)?;
-    fence_windows::harden_private_directory(path)?;
-    Ok(())
+fn create_transaction_directory(store: &SessionStore, name: &str) -> Result<PathBuf, RestoreError> {
+    let relative = PathBuf::from("transactions").join(name);
+    store.filesystem().create_dir_exclusive(&relative)?;
+    Ok(store.root().join(relative))
 }
 
 fn save_journal(path: &Path, journal: &Journal) -> Result<(), RestoreError> {

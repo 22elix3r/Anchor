@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
+#[cfg(test)]
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fence_core::{Manifest, ManifestNode, MetadataObservation, ObjectId};
 use fence_git::{GitContext, IndexCapture};
@@ -26,6 +27,7 @@ pub struct DoctorReport {
     pub unfinished_transactions: u64,
     pub repository_drift_from_latest: bool,
     pub store_private: bool,
+    pub legacy_anchor_store_present: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,7 +146,8 @@ impl MaintenanceService {
             transactions_needing_recovery: transactions.needs_recovery,
             unfinished_transactions: transactions.unfinished,
             repository_drift_from_latest,
-            store_private: store_is_private(store.root())?,
+            store_private: store.filesystem().root_is_private()?,
+            legacy_anchor_store_present: store.legacy_store_present()?,
         })
     }
 
@@ -201,24 +204,26 @@ impl MaintenanceService {
             bytes_reclaimed: 0,
         };
         sweep_files(
-            &store.root().join("manifests").join("b3"),
+            store,
+            Path::new("manifests/b3"),
             "cbor",
             |path| {
                 !reachable_manifests
                     .iter()
-                    .any(|id| store.manifest_path(*id) == path)
+                    .any(|id| store.manifest_path(*id) == store.root().join(path))
             },
             dry_run,
             &mut report.manifests_removed,
             &mut report.bytes_reclaimed,
         )?;
         sweep_files(
-            &store.root().join("objects").join("b3"),
+            store,
+            Path::new("objects/b3"),
             "zst",
             |path| {
                 !reachable_objects
                     .iter()
-                    .any(|(id, _)| store.objects().object_path(*id) == path)
+                    .any(|(id, _)| store.objects().object_path(*id) == store.root().join(path))
             },
             dry_run,
             &mut report.objects_removed,
@@ -272,6 +277,7 @@ fn collect_manifest_objects(manifest: &Manifest, objects: &mut BTreeSet<(ObjectI
 }
 
 fn sweep_files(
+    store: &SessionStore,
     root: &Path,
     extension: &str,
     unreachable: impl Fn(&Path) -> bool,
@@ -279,46 +285,34 @@ fn sweep_files(
     count: &mut u64,
     bytes: &mut u64,
 ) -> Result<(), MaintenanceError> {
-    if !root.exists() {
-        return Ok(());
-    }
     let mut directories = vec![root.to_path_buf()];
     while let Some(directory) = directories.pop() {
-        for entry in fs::read_dir(&directory)? {
+        let opened = store.filesystem().open_dir(&directory)?;
+        for entry in opened.entries()? {
             let entry = entry?;
             let file_type = entry.file_type()?;
+            let relative = directory.join(entry.file_name());
             if file_type.is_dir() {
-                directories.push(entry.path());
+                directories.push(relative);
             } else if file_type.is_file()
-                && entry
-                    .path()
+                && Path::new(&entry.file_name())
                     .extension()
                     .is_some_and(|value| value == extension)
-                && unreachable(&entry.path())
             {
-                let size = entry.metadata()?.len();
-                *count = count.saturating_add(1);
-                *bytes = bytes.saturating_add(size);
-                if !dry_run {
-                    fs::remove_file(entry.path())?;
+                if unreachable(&relative) {
+                    let size = entry.metadata()?.len();
+                    *count = count.saturating_add(1);
+                    *bytes = bytes.saturating_add(size);
+                    if !dry_run {
+                        opened.remove_file(entry.file_name())?;
+                    }
                 }
+            } else {
+                return Err(MaintenanceError::UnsafeStoreEntry(relative));
             }
         }
     }
     Ok(())
-}
-
-#[cfg(unix)]
-#[allow(clippy::verbose_bit_mask)]
-fn store_is_private(root: &Path) -> Result<bool, MaintenanceError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    Ok(fs::metadata(root)?.permissions().mode() & 0o077 == 0)
-}
-
-#[cfg(windows)]
-fn store_is_private(root: &Path) -> Result<bool, MaintenanceError> {
-    fence_windows::private_directory_is_hardened(root)
-        .map_err(|error| MaintenanceError::PrivateStore(error.to_string()))
 }
 
 #[derive(Debug, Error)]
@@ -332,6 +326,8 @@ pub enum MaintenanceError {
     },
     #[error("session {0} contains a policy observation that does not match retained policy bytes")]
     PolicyObservationMismatch(crate::SessionId),
+    #[error("unsafe or unexpected entry in the private Fence store: {0}")]
+    UnsafeStoreEntry(PathBuf),
     #[error(transparent)]
     Session(#[from] SessionError),
     #[error(transparent)]
@@ -340,9 +336,8 @@ pub enum MaintenanceError {
     Store(#[from] fence_core::StoreError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[cfg(windows)]
-    #[error("could not verify the Windows store DACL: {0}")]
-    PrivateStore(String),
+    #[error(transparent)]
+    StoreFs(#[from] fence_core::StoreFsError),
 }
 
 #[cfg(test)]
@@ -387,7 +382,7 @@ mod tests {
         .unwrap();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let doctor = MaintenanceService::doctor(&store, &context).unwrap();
         assert_eq!(doctor.sessions, 1);
         assert!(doctor.objects_verified >= 2);
@@ -403,7 +398,7 @@ mod tests {
         let root = repository();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
         let object = store.objects().put_bytes(b"orphan").unwrap();
         assert!(store.objects().object_path(object).exists());
         let preview = MaintenanceService::gc(&store, true).unwrap();
@@ -436,7 +431,7 @@ mod tests {
         .unwrap();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location).unwrap();
 
         let report = MaintenanceService::doctor(&store, &context).unwrap();
 
@@ -457,7 +452,7 @@ mod tests {
         .unwrap();
         let context = GitContext::discover(root.path()).unwrap();
         let location = context.store_location();
-        let store = SessionStore::open(&location.root, &location.worktree_key).unwrap();
+        let store = SessionStore::open_location(location.clone()).unwrap();
         let other = SessionStore::open(&location.root, "wt-other").unwrap();
         let object = other.objects().put_bytes(b"only-other-worktree").unwrap();
         let manifest = Manifest::new(
