@@ -17,7 +17,10 @@ path = "src/main.rs"
 anchor-core.workspace = true
 anchor-git.workspace = true
 anchor-session.workspace = true
+clap.workspace = true
+miette.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
-

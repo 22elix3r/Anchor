@@ -23,6 +23,7 @@ dependencies = [
  "anchor-session",
  "clap",
  "miette",
+ "serde",
  "serde_json",
 ]
 
