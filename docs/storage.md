@@ -25,6 +25,20 @@ linked-worktree keys derive from volume serial plus the 128-bit filesystem file
 ID, so path spelling and repository renames do not change identity. Every
 created store directory has a protected current-user/SYSTEM DACL.
 
+On Unix every Anchor-controlled directory is checked with `symlink_metadata`
+before permissions are changed or content is used. A symlink, non-directory, or
+effective-UID ownership mismatch is a hard refusal; owner-controlled weak mode
+bits are repaired to `0700` and verified. Worktree namespace keys accept only a
+bounded ASCII identifier and cannot introduce separators or traversal.
+Transaction directories are created with an exclusive single-directory create,
+so a hostile pre-existing name is never reused. Immutable object and metadata
+record reads use `O_NOFOLLOW`; session metadata reads additionally compare the
+opened inode with the final path after the bounded read.
+
+These checks harden Anchor-controlled final components. They are not yet a
+claim that every ancestor of the common Git directory is capability-rooted; the
+audit roadmap retains that as a focused `cap-std`/`openat2` design spike.
+
 Bare repositories are refused. Non-Git directories are not supported in the
 current release.
 

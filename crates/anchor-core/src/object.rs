@@ -228,7 +228,7 @@ impl ObjectStore {
         max_raw_len: u64,
         mut output: impl Write,
     ) -> Result<u64, StoreError> {
-        let mut file = File::open(self.object_path(id))?;
+        let mut file = open_store_file(&self.object_path(id))?;
         let header = read_header(&mut file)?;
         if header.id != id {
             return Err(StoreError::IdentityMismatch {
@@ -360,12 +360,63 @@ fn create_private_dir(path: &Path) -> Result<(), StoreError> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StoreError::UnsafeStoreDirectory(path.to_path_buf()));
+        }
+        let expected_uid = rustix::process::geteuid().as_raw();
+        if metadata.uid() != expected_uid {
+            return Err(StoreError::StoreOwnershipMismatch {
+                path: path.to_path_buf(),
+                expected_uid,
+                actual_uid: metadata.uid(),
+            });
+        }
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        if fs::symlink_metadata(path)?.permissions().mode() & 0o077 != 0 {
+            return Err(StoreError::UnsafeStorePermissions(path.to_path_buf()));
+        }
     }
     #[cfg(windows)]
     anchor_windows::harden_private_directory(path)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_store_file(path: &Path) -> Result<File, StoreError> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let descriptor: OwnedFd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(StoreError::UnsafeStoreFile(path.to_path_buf()));
+    }
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if metadata.uid() != expected_uid {
+        return Err(StoreError::StoreOwnershipMismatch {
+            path: path.to_path_buf(),
+            expected_uid,
+            actual_uid: metadata.uid(),
+        });
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_store_file(path: &Path) -> Result<File, StoreError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(StoreError::UnsafeStoreFile(path.to_path_buf()));
+    }
+    Ok(File::open(path)?)
 }
 
 #[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
@@ -394,6 +445,21 @@ pub enum StoreError {
     ObjectTooLarge,
     #[error("invalid store directory layout")]
     InvalidStoreLayout,
+    #[error("Anchor store directory is a symlink or non-directory: {0}")]
+    UnsafeStoreDirectory(PathBuf),
+    #[cfg(unix)]
+    #[error(
+        "Anchor store directory {path} belongs to uid {actual_uid}, expected effective uid {expected_uid}"
+    )]
+    StoreOwnershipMismatch {
+        path: PathBuf,
+        expected_uid: u32,
+        actual_uid: u32,
+    },
+    #[error("Anchor store directory permissions could not be restricted: {0}")]
+    UnsafeStorePermissions(PathBuf),
+    #[error("Anchor store object is a symlink or non-file: {0}")]
+    UnsafeStoreFile(PathBuf),
     #[error("object has an invalid magic header")]
     BadMagic,
     #[error("object uses unknown codec {0}")]
@@ -454,5 +520,33 @@ mod tests {
             store.get(id, 100),
             Err(StoreError::LimitExceeded { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_root_symlink_is_refused() {
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = parent.path().join("store");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        assert!(matches!(
+            ObjectStore::open(&link),
+            Err(StoreError::UnsafeStoreDirectory(path)) if path == link
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn object_symlink_is_not_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let store = ObjectStore::open(root.path().join("store")).unwrap();
+        let id = ObjectId::from_raw(b"outside");
+        let path = store.object_path(id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &path).unwrap();
+
+        assert!(store.get(id, 1024).is_err());
     }
 }

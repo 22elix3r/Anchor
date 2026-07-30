@@ -231,6 +231,9 @@ as untrusted:
 - restore targets are rejected if they address Git metadata, Anchor storage,
   submodules, or nested repositories, even if a corrupt manifest contains such
   a path;
+- Unix store directories reject symlink/non-directory components and foreign
+  ownership, transaction directories are no-clobber, and immutable record
+  reads use `O_NOFOLLOW`;
 - garbage collection aborts if retained metadata cannot be decoded and all
   reachable objects cannot be verified.
 

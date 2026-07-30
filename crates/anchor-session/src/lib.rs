@@ -8,7 +8,7 @@ mod restore_plan;
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
@@ -256,13 +256,24 @@ impl SessionStore {
     ) -> Result<Self, SessionError> {
         let root = root.as_ref().to_path_buf();
         let worktree_key = worktree_key.into();
+        validate_worktree_key(&worktree_key)?;
         let objects = ObjectStore::open(&root)?;
-        private_directory(&root.join("manifests").join("b3"))?;
-        private_directory(&root.join("policies").join("b3"))?;
-        private_directory(&root.join("plans").join("b3"))?;
-        private_directory(&root.join("sessions").join(&worktree_key))?;
-        private_directory(&root.join("deleted-sessions").join(&worktree_key))?;
-        private_directory(&root.join("locks"))?;
+        for directory in [
+            root.join("manifests"),
+            root.join("manifests").join("b3"),
+            root.join("policies"),
+            root.join("policies").join("b3"),
+            root.join("plans"),
+            root.join("plans").join("b3"),
+            root.join("sessions"),
+            root.join("sessions").join(&worktree_key),
+            root.join("deleted-sessions"),
+            root.join("deleted-sessions").join(&worktree_key),
+            root.join("locks"),
+            root.join("transactions"),
+        ] {
+            private_directory(&directory)?;
+        }
         Ok(Self {
             root,
             worktree_key,
@@ -552,6 +563,19 @@ impl SessionStore {
             .write(true)
             .open(self.root.join("locks").join("store.activity.lock"))?)
     }
+}
+
+fn validate_worktree_key(value: &str) -> Result<(), SessionError> {
+    if value.is_empty()
+        || value.len() > 128
+        || matches!(value, "." | "..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(SessionError::InvalidWorktreeNamespace);
+    }
+    Ok(())
 }
 
 /// RAII lease preventing common-store garbage collection.
@@ -1073,24 +1097,94 @@ impl SignalForwarder {
 }
 
 fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>, SessionError> {
-    let metadata = fs::metadata(path)?;
+    let mut file = open_store_file(path)?;
+    let metadata = file.metadata()?;
     let length = usize::try_from(metadata.len()).map_err(|_| SessionError::SessionTooLarge)?;
     if length > maximum {
         return Err(SessionError::SessionTooLarge);
     }
-    let bytes = fs::read(path)?;
+    let mut bytes = Vec::with_capacity(length);
+    Read::by_ref(&mut file)
+        .take(u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)?;
     if bytes.len() != length {
         return Err(SessionError::UnstableMetadata(path.to_path_buf()));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let after = file.metadata()?;
+        let path_metadata = fs::symlink_metadata(path)?;
+        if path_metadata.file_type().is_symlink()
+            || metadata.dev() != after.dev()
+            || metadata.ino() != after.ino()
+            || metadata.len() != after.len()
+            || after.dev() != path_metadata.dev()
+            || after.ino() != path_metadata.ino()
+        {
+            return Err(SessionError::UnstableMetadata(path.to_path_buf()));
+        }
+    }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_store_file(path: &Path) -> Result<File, SessionError> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let descriptor: OwnedFd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(SessionError::UnsafeStoreFile(path.to_path_buf()));
+    }
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if metadata.uid() != expected_uid {
+        return Err(SessionError::StoreOwnershipMismatch {
+            path: path.to_path_buf(),
+            expected_uid,
+            actual_uid: metadata.uid(),
+        });
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_store_file(path: &Path) -> Result<File, SessionError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(SessionError::UnsafeStoreFile(path.to_path_buf()));
+    }
+    Ok(File::open(path)?)
 }
 
 fn private_directory(path: &Path) -> Result<(), SessionError> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(SessionError::UnsafeStoreDirectory(path.to_path_buf()));
+        }
+        let expected_uid = rustix::process::geteuid().as_raw();
+        if metadata.uid() != expected_uid {
+            return Err(SessionError::StoreOwnershipMismatch {
+                path: path.to_path_buf(),
+                expected_uid,
+                actual_uid: metadata.uid(),
+            });
+        }
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        if fs::symlink_metadata(path)?.permissions().mode() & 0o077 != 0 {
+            return Err(SessionError::UnsafeStorePermissions(path.to_path_buf()));
+        }
     }
     #[cfg(windows)]
     anchor_windows::harden_private_directory(path)?;
@@ -1397,6 +1491,21 @@ pub enum SessionError {
     ClockBeforeEpoch,
     #[error("invalid storage layout")]
     InvalidLayout,
+    #[error("Anchor store directory is a symlink or non-directory: {0}")]
+    UnsafeStoreDirectory(PathBuf),
+    #[cfg(unix)]
+    #[error(
+        "Anchor store directory {path} belongs to uid {actual_uid}, expected effective uid {expected_uid}"
+    )]
+    StoreOwnershipMismatch {
+        path: PathBuf,
+        expected_uid: u32,
+        actual_uid: u32,
+    },
+    #[error("Anchor store directory permissions could not be restricted: {0}")]
+    UnsafeStorePermissions(PathBuf),
+    #[error("Anchor store record is a symlink or non-file: {0}")]
+    UnsafeStoreFile(PathBuf),
     #[error("worktree namespace is not valid UTF-8")]
     InvalidWorktreeNamespace,
     #[error("session belongs to a different worktree namespace")]
@@ -1679,6 +1788,31 @@ mod tests {
         ));
         drop(read);
         assert!(store.acquire_store_write_lease().is_ok());
+    }
+
+    #[test]
+    fn worktree_namespace_cannot_escape_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            SessionStore::open(root.path(), "../outside"),
+            Err(SessionError::InvalidWorktreeNamespace)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_store_component_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = root.path().join("store");
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(&store_root).unwrap();
+        std::os::unix::fs::symlink(outside.path(), store_root.join("manifests")).unwrap();
+
+        assert!(matches!(
+            SessionStore::open(&store_root, "main"),
+            Err(SessionError::UnsafeStoreDirectory(path))
+                if path == store_root.join("manifests")
+        ));
     }
 
     #[test]

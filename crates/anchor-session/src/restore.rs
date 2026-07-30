@@ -1613,12 +1613,8 @@ fn remove_node(
 
 #[cfg(unix)]
 fn private_transaction_dir(path: &Path) -> Result<(), RestoreError> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
+    fs::create_dir(path)?;
+    crate::private_directory(path)?;
     Ok(())
 }
 
@@ -2658,7 +2654,12 @@ mod tests {
             fs::read(root.path().join("beta")).unwrap(),
             b"beta-post-session"
         );
-        assert!(!store.root().join("transactions").exists());
+        assert!(
+            fs::read_dir(store.root().join("transactions"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3585,6 +3586,7 @@ mod tests {
     #[test]
     fn unfinished_transaction_blocks_new_mutations() {
         let root = tempfile::tempdir().unwrap();
+        crate::private_directory(&root.path().join("transactions")).unwrap();
         private_transaction_dir(&root.path().join("transactions").join("unfinished")).unwrap();
         let error = ensure_no_unresolved_transactions(root.path()).unwrap_err();
         assert!(matches!(
