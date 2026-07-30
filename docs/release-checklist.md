@@ -1,6 +1,6 @@
 # Unix alpha release checklist
 
-Anchor mutates source trees, so a tag is not a release gate by itself. The
+Fence mutates source trees, so a tag is not a release gate by itself. The
 release owner must record each item below in the release pull request or tag
 preparation notes.
 
@@ -47,10 +47,10 @@ cargo deny check advisories bans licenses sources
 
 - [ ] The release workflow builds Linux x86-64, macOS x86-64, and macOS arm64
   from the annotated release tag.
-- [ ] Every archive contains only the `anchor` binary, licenses, changelog, and
+- [ ] Every archive contains only the `fence` binary, licenses, changelog, and
   user-facing safety/configuration/storage documentation.
 - [ ] SHA-256 checksum files verify after downloading the artifacts.
-- [ ] `gh attestation verify <archive> -R 22elix3r/Anchor` succeeds for each
+- [ ] `gh attestation verify <archive> -R 22elix3r/fence` succeeds for each
   archive.
 - [ ] The GitHub release is marked prerelease and says that Unix mutation is
   experimental and Windows mutation is unsupported.
@@ -63,7 +63,7 @@ cargo deny check advisories bans licenses sources
    recommended installation path. Do not reuse or move the released tag.
 2. Publish a security advisory if integrity, path containment, or data loss may
    be involved.
-3. Tell users not to delete the Anchor store. A newer recovery binary may need
+3. Tell users not to delete the Fence store. A newer recovery binary may need
    its journals and immutable objects.
 4. Reproduce against a copy of the worktree and store. Never ask a reporter to
    retry mutation on their only copy.

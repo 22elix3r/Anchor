@@ -1,0 +1,19 @@
+[package]
+name = "fence-tui"
+description = "Terminal reviewer for Fence sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+fence-core.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

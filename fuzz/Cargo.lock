@@ -9,7 +9,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
 
 [[package]]
-name = "anchor-core"
+name = "fence-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
@@ -24,10 +24,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "anchor-fuzz"
+name = "fence-fuzz"
 version = "0.0.0"
 dependencies = [
- "anchor-core",
+ "fence-core",
  "libfuzzer-sys",
 ]
 

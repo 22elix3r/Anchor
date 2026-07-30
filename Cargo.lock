@@ -15,13 +15,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
 
 [[package]]
-name = "anchor-cli"
+name = "fence-cli"
 version = "0.1.0-alpha.1"
 dependencies = [
- "anchor-core",
- "anchor-git",
- "anchor-session",
- "anchor-tui",
+ "fence-core",
+ "fence-git",
+ "fence-session",
+ "fence-tui",
  "clap",
  "gix-imara-diff",
  "miette",
@@ -31,11 +31,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "anchor-core"
+name = "fence-core"
 version = "0.1.0-alpha.1"
 dependencies = [
- "anchor-unix",
- "anchor-windows",
+ "fence-unix",
+ "fence-windows",
  "blake3",
  "cap-std",
  "ciborium",
@@ -50,11 +50,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "anchor-git"
+name = "fence-git"
 version = "0.1.0-alpha.1"
 dependencies = [
- "anchor-core",
- "anchor-windows",
+ "fence-core",
+ "fence-windows",
  "blake3",
  "cap-std",
  "gix",
@@ -65,12 +65,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "anchor-session"
+name = "fence-session"
 version = "0.1.0-alpha.1"
 dependencies = [
- "anchor-core",
- "anchor-git",
- "anchor-windows",
+ "fence-core",
+ "fence-git",
+ "fence-windows",
  "atomic-write-file",
  "blake3",
  "cap-std",
@@ -88,17 +88,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "anchor-tui"
+name = "fence-tui"
 version = "0.1.0-alpha.1"
 dependencies = [
- "anchor-core",
+ "fence-core",
  "crossterm",
  "ratatui",
  "thiserror",
 ]
 
 [[package]]
-name = "anchor-unix"
+name = "fence-unix"
 version = "0.1.0-alpha.1"
 dependencies = [
  "libc",
@@ -106,7 +106,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "anchor-windows"
+name = "fence-windows"
 version = "0.1.0-alpha.1"
 dependencies = [
  "tempfile",

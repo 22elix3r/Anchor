@@ -2,7 +2,7 @@
 
 ## Mental model
 
-For each path, Anchor reasons about three observable states:
+For each path, Fence reasons about three observable states:
 
 - `base`: raw filesystem state immediately before the wrapped command;
 - `session`: raw filesystem state captured when the command ended;
@@ -11,13 +11,13 @@ For each path, Anchor reasons about three observable states:
 The desired operation removes the `base → session` transformation from
 `current`; it does not blindly write `base`.
 
-The strongest guarantee Anchor can make is state-based:
+The strongest guarantee Fence can make is state-based:
 
-> Anchor does not replace or remove an observed current path unless it proved
+> Fence does not replace or remove an observed current path unless it proved
 > that state is unchanged session-end residue, or a future merge engine has
 > incorporated the current edit into a verified result.
 
-Three snapshots cannot prove causal authorship or semantic intent. Anchor calls
+Three snapshots cannot prove causal authorship or semantic intent. Fence calls
 changes “session-window changes,” never “changes made by the agent.”
 
 ## Enforced invariants
@@ -51,10 +51,10 @@ changes “session-window changes,” never “changes made by the agent.”
     but does not redefine the session scope.
 13. Worktree mutation refuses every `.git` path component (under conservative
     ASCII case folding), every frozen submodule or nested-repository boundary,
-    and every worktree-relative Git or Anchor-store location. The same check is
+    and every worktree-relative Git or Fence-store location. The same check is
     repeated when an untrusted recovery plan is loaded.
 14. A regular file with more than one hard link is never replaced. On Linux and
-    macOS, regular files and empty directories are replaced only after Anchor
+    macOS, regular files and empty directories are replaced only after Fence
     proves through open-descriptor xattr and ACL queries that unmodeled extended
     metadata is absent. Query failure is a refusal, not an assumed absence.
 
@@ -73,8 +73,8 @@ changes “session-window changes,” never “changes made by the agent.”
 | present | present | third opaque state | Conflict |
 
 Executable bits are reasoned about independently. If the session changed only
-the executable bits, Anchor can invert them while retaining later content.
-Anchor does not restore ownership, timestamps, ACLs, extended attributes, or
+the executable bits, Fence can invert them while retaining later content.
+Fence does not restore ownership, timestamps, ACLs, extended attributes, or
 general permission bits. Instead, Unix mutation refuses hard-linked regular
 files and nodes on which ACL/xattr observation reports unmodeled metadata or is
 unavailable. Linux SELinux labels are treated as platform-managed metadata only:
@@ -88,12 +88,12 @@ ancestor, `base` as the inverse side, and `current` as the post-session side.
 Only valid UTF-8, NUL-free inputs up to 8 MiB each are considered. Different
 line edits must not overlap, and output is capped at 16 MiB. A clean result is
 shown as `current → merged` and is not installed until `--yes` is supplied.
-Confirmation also supplies the previewed BLAKE3 object ID; Anchor recalculates
-under the worktree lock and refuses if the result changed. Anchor returns a
+Confirmation also supplies the previewed BLAKE3 object ID; Fence recalculates
+under the worktree lock and refuses if the result changed. Fence returns a
 structured conflict instead of writing conflict markers.
 
 Current plan-bound restore journals retain the verified pre-restore node,
-intended node, worktree identity, and sibling staging names. `anchor recover-transactions
+intended node, worktree identity, and sibling staging names. `fence recover-transactions
 --yes` loads a content-addressed restore plan and independently recalculates its
 transformation from retained base/session/current manifests before trusting
 journal-authored paths. It then validates those paths against the retained
@@ -122,13 +122,13 @@ absence, terminal journal state, and removal of sibling stage/backup names on
 Linux and macOS.
 
 Deleting a session is recoverable until explicit purge. Tombstoned sessions
-remain garbage-collection roots, so `anchor delete` cannot silently make their
-objects collectible. `anchor purge --yes` removes the recovery record and is
+remain garbage-collection roots, so `fence delete` cannot silently make their
+objects collectible. `fence purge --yes` removes the recovery record and is
 the deliberate retention boundary.
 
 ## Capture consistency
 
-Anchor does not claim a globally atomic filesystem snapshot. For each regular
+Fence does not claim a globally atomic filesystem snapshot. For each regular
 file it:
 
 1. reads no-follow metadata;
@@ -154,22 +154,22 @@ On Unix the active-session lock's open file description is inherited by the
 wrapped child. If the wrapper crashes but the child keeps running, a second
 session remains blocked until the child (and any descendant that retained the
 descriptor) exits. A deliberately adversarial command can close inherited file
-descriptors; Anchor does not claim containment of the wrapped command.
+descriptors; Fence does not claim containment of the wrapped command.
 
 `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` received by the Unix wrapper are
-recorded and forwarded to the direct child. Anchor still waits for child exit
+recorded and forwarded to the direct child. Fence still waits for child exit
 and attempts the after-snapshot. Terminal-generated signals may already reach
 both processes through their shared foreground process group; signal delivery
 is therefore not an authorship or containment mechanism.
 
 When the wrapper disappears before a terminal session state is persisted, the
-record remains nonterminal. A later `anchor recover` or new run first proves the
+record remains nonterminal. A later `fence recover` or new run first proves the
 inherited worktree lock is free, then marks such records `Abandoned` without
 inventing an after-snapshot. Abandoned records are not restorable.
 
 ## Repository drift
 
-Anchor records HEAD attachment/target, recognized operation state, object hash
+Fence records HEAD attachment/target, recognized operation state, object hash
 format, sparse mode, and raw index bytes at both endpoints. It reports drift but
 does not move refs or rewrite history.
 
@@ -187,20 +187,20 @@ only invert half of the rename.
 ## Included and excluded data
 
 Tracked paths are included even when an ignore rule matches. Nonignored
-untracked paths are included. Git metadata, Anchor storage, ignored paths,
+untracked paths are included. Git metadata, Fence storage, ignored paths,
 submodule contents, and explicit repository boundaries are excluded.
 
-`.anchorignore` is a monotonic exclusion layer: its negation rules can cancel
-earlier `.anchorignore` rules but cannot re-include a Git-ignored path.
+`.fenceignore` is a monotonic exclusion layer: its negation rules can cancel
+earlier `.fenceignore` rules but cannot re-include a Git-ignored path.
 
 The selected global exclude path, explicit absence, common
-`.git/info/exclude`, nested `.gitignore` files, and root `.anchorignore` are
+`.git/info/exclude`, nested `.gitignore` files, and root `.fenceignore` are
 part of the immutable session policy. Paths newly tracked at a later endpoint
 are included as a tracked overlay without changing ignore-rule bytes or
 precedence. `core.ignoreCase` is retained in the policy and repository state;
 changing it during or after a session makes automatic restoration ineligible.
 
-Sensitive nonignored files are included. Anchor is local-only and performs no
+Sensitive nonignored files are included. Fence is local-only and performs no
 telemetry or network I/O, but local users or malware able to read the store may
 read captured contents. Unix store directories are forced to mode `0700`.
 Windows store directories receive a protected DACL granting full access only to
@@ -228,7 +228,7 @@ as untrusted:
 - object IDs and manifest IDs are recomputed on read;
 - frozen-policy and restore-plan IDs are recomputed before their records are
   used;
-- restore targets are rejected if they address Git metadata, Anchor storage,
+- restore targets are rejected if they address Git metadata, Fence storage,
   submodules, or nested repositories, even if a corrupt manifest contains such
   a path;
 - Unix store directories reject symlink/non-directory components and foreign

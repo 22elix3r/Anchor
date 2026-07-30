@@ -1,6 +1,6 @@
 #![no_main]
 
-use anchor_core::wire::decode_path;
+use fence_core::wire::decode_path;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|bytes: &[u8]| {

@@ -16,8 +16,8 @@ For a non-confidential synthetic reproduction, provide:
 
 - [ ] Pre-session modeled state changed or disappeared.
 - [ ] Post-session modeled state changed or disappeared.
-- [ ] Anchor wrote a protected Git/store path.
-- [ ] Anchor presented degraded state as safely restorable.
+- [ ] Fence wrote a protected Git/store path.
+- [ ] Fence presented degraded state as safely restorable.
 - [ ] Recovery chose a direction despite ambiguity.
 
 ### Exact three-state fixture
@@ -30,9 +30,9 @@ For a non-confidential synthetic reproduction, provide:
 
 ### Environment
 
-- Anchor revision:
+- Fence revision:
 - OS/filesystem:
-- `anchor doctor --format json` (redacted):
+- `fence doctor --format json` (redacted):
 - Relevant journal schema/state:
 
 ### Reproduction

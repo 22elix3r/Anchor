@@ -1,6 +1,6 @@
 #![no_main]
 
-use anchor_core::Manifest;
+use fence_core::Manifest;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|bytes: &[u8]| {

@@ -1,5 +1,5 @@
 [package]
-name = "anchor-fuzz"
+name = "fence-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 cargo-fuzz = true
 
 [dependencies]
-anchor-core = { path = "../crates/anchor-core" }
+fence-core = { path = "../crates/fence-core" }
 libfuzzer-sys = "0.4.10"
 
 [[bin]]

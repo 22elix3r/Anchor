@@ -1,9 +1,9 @@
 # Storage format and data location
 
-On Unix, Anchor stores data beneath the resolved Git common directory:
+On Unix, Fence stores data beneath the resolved Git common directory:
 
 ```text
-$GIT_COMMON_DIR/anchor/users/<principal>/v1/
+$GIT_COMMON_DIR/fence/users/<principal>/v1/
 ├── objects/b3/<prefix>/<suffix>.zst
 ├── manifests/b3/<prefix>/<suffix>.cbor
 ├── policies/b3/<prefix>/<suffix>.cbor
@@ -20,12 +20,12 @@ session lock are namespaced by worktree. The main worktree uses `main`; linked
 worktrees use a BLAKE3-derived key from the native private Git-directory path.
 
 On Windows the equivalent layout is under
-`FOLDERID_LocalAppData/Anchor/stores/v1/repo-<identity>/`. The repository and
+`FOLDERID_LocalAppData/Fence/stores/v1/repo-<identity>/`. The repository and
 linked-worktree keys derive from volume serial plus the 128-bit filesystem file
 ID, so path spelling and repository renames do not change identity. Every
 created store directory has a protected current-user/SYSTEM DACL.
 
-On Unix every Anchor-controlled directory is checked with `symlink_metadata`
+On Unix every Fence-controlled directory is checked with `symlink_metadata`
 before permissions are changed or content is used. A symlink, non-directory, or
 effective-UID ownership mismatch is a hard refusal; owner-controlled weak mode
 bits are repaired to `0700` and verified. Worktree namespace keys accept only a
@@ -35,7 +35,7 @@ so a hostile pre-existing name is never reused. Immutable object and metadata
 record reads use `O_NOFOLLOW`; session metadata reads additionally compare the
 opened inode with the final path after the bounded read.
 
-These checks harden Anchor-controlled final components. They are not yet a
+These checks harden Fence-controlled final components. They are not yet a
 claim that every ancestor of the common Git directory is capability-rooted; the
 audit roadmap retains that as a focused `cap-std`/`openat2` design spike.
 
@@ -118,15 +118,15 @@ was the v1 behavior.
 
 ## Frozen inclusion policies
 
-Before the initial worktree capture, Anchor reads and content-addresses the
+Before the initial worktree capture, Fence reads and content-addresses the
 selected `core.excludesFile` (including explicit absence), the common Git
 directory's `info/exclude`, every reachable in-tree `.gitignore`, and the root
-`.anchorignore`. The policy record also stores source ordering,
+`.fenceignore`. The policy record also stores source ordering,
 `core.ignoreCase`, the base tracked set, submodule boundaries,
-nested-repository boundaries, and the worktree-relative Anchor-store exclusion
+nested-repository boundaries, and the worktree-relative Fence-store exclusion
 when applicable.
 
-The before capture is made with that compiled immutable record. Anchor repeats
+The before capture is made with that compiled immutable record. Fence repeats
 policy discovery after the capture and does not launch the child unless the two
 records are equal. Session-end and current captures compile the retained policy
 and add only endpoint tracked paths. They separately observe live policy
@@ -134,19 +134,19 @@ sources and record drift; changed ignore bytes do not alter the frozen scope. A
 changed submodule or nested-repository boundary makes the endpoint incomplete
 instead of allowing a different tree meaning.
 
-Policy source contents are ordinary immutable Anchor objects. Garbage
+Policy source contents are ordinary immutable Fence objects. Garbage
 collection marks objects referenced by both the frozen policy and endpoint
 observations before sweeping.
 
 ## Garbage collection
 
-`anchor gc` acquires an exclusive lease on the common store, decodes sessions
+`fence gc` acquires an exclusive lease on the common store, decodes sessions
 from every linked-worktree namespace, loads every referenced manifest, and
 verifies every reachable object before sweeping anything. Normal readers,
 session capture, and restoration hold shared leases. Any corrupt retained
 record or unresolved restore transaction aborts collection.
 
-`anchor gc --dry-run` reports the same reachability result without deletion.
+`fence gc --dry-run` reports the same reachability result without deletion.
 Objects published by a crashed capture but never referenced by a session are
 eligible for collection once no active session holds the lock.
 
@@ -194,11 +194,11 @@ refused.
 
 ## Session retention
 
-`anchor delete` moves a terminal session record into `deleted-sessions` using a
+`fence delete` moves a terminal session record into `deleted-sessions` using a
 no-clobber same-filesystem hard link followed by source removal. A crash can
 leave duplicate links but cannot leave no record. Tombstoned sessions remain GC
-roots and can be restored with `anchor undelete`.
+roots and can be restored with `fence undelete`.
 
-`anchor purge --yes` permanently removes a tombstoned record. It does not
+`fence purge --yes` permanently removes a tombstoned record. It does not
 directly delete immutable data; the next GC verifies all remaining active and
 tombstoned sessions before reclaiming anything newly unreachable.

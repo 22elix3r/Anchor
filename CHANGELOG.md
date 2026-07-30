@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Anchor are recorded here. Versions follow Semantic
+All notable changes to Fence are recorded here. Versions follow Semantic
 Versioning; persisted-data compatibility has its own policy because this
 project stores safety-critical snapshots and recovery journals.
 

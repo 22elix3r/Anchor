@@ -56,8 +56,8 @@ Acceptance:
 - property tests cover arbitrary small path-state batches;
 - no test invokes the `git` executable.
 
-Likely files: `crates/anchor-session/src/restore.rs`,
-`crates/anchor-session/tests/restore_faults.rs`, and a small test-only fault
+Likely files: `crates/fence-session/src/restore.rs`,
+`crates/fence-session/tests/restore_faults.rs`, and a small test-only fault
 module.
 
 ### R2. Complete restoration plan
@@ -201,8 +201,8 @@ insufficient.
 These features fit the architecture but do not block the first trustworthy
 release:
 
-- **Capture scope preview:** `anchor scope` explains tracked, ignored,
-  Anchor-excluded, boundary, sensitive-name, and limit decisions before a
+- **Capture scope preview:** `fence scope` explains tracked, ignored,
+  Fence-excluded, boundary, sensitive-name, and limit decisions before a
   command runs.
 - **Sensitive-file preflight:** warn on configurable credential-name patterns
   without reading or uploading content; explicit policy decides abort versus
@@ -231,7 +231,7 @@ restoration remain explicit non-goals.
 
 ## Immediate next task
 
-Refactor `anchor-session/src/restore.rs` into audit-oriented internal modules
+Refactor `fence-session/src/restore.rs` into audit-oriented internal modules
 without changing behavior. Move public service/outcome types first, then journal
 schemas and validation, Unix mutation, batch state transitions, and recovery in
 separate commits. The existing unit, formal matrix, and subprocess-crash suites

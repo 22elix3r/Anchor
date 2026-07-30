@@ -1,6 +1,6 @@
 # Contributing
 
-Anchor's restoration code is safety-critical. Changes should prefer a visible
+Fence's restoration code is safety-critical. Changes should prefer a visible
 refusal over an inferred overwrite.
 
 ## Development checks
@@ -17,16 +17,16 @@ an architecture discussion.
 
 ## Boundaries
 
-- `anchor-core` must remain independent of the CLI, terminal UI, and Git.
-- `anchor-unix` and `anchor-windows` quarantine reviewed native FFI. Their
+- `fence-core` must remain independent of the CLI, terminal UI, and Git.
+- `fence-unix` and `fence-windows` quarantine reviewed native FFI. Their
   public APIs must accept already-open handles where a path lookup would create
   a race, and every unsafe block requires a local safety argument.
-- `anchor-git` is read-only. Do not add calls that mutate refs, the index,
+- `fence-git` is read-only. Do not add calls that mutate refs, the index,
   configuration, worktree, or Git object storage.
-- `anchor-session` owns persistence, process execution, locking, restoration,
+- `fence-session` owns persistence, process execution, locking, restoration,
   and maintenance orchestration.
-- `anchor-cli` presents stable human and machine output.
-- `anchor-tui` must consume core/session APIs rather than embedding restore
+- `fence-cli` presents stable human and machine output.
+- `fence-tui` must consume core/session APIs rather than embedding restore
   decisions.
 
 Every restoration change needs state-matrix tests proving pre-session and

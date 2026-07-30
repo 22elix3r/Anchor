@@ -1,0 +1,31 @@
+[package]
+name = "fence-cli"
+description = "Local-first filesystem isolation for coding-agent sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "fence"
+path = "src/main.rs"
+
+[dependencies]
+fence-core.workspace = true
+fence-git.workspace = true
+fence-session.workspace = true
+fence-tui.workspace = true
+clap.workspace = true
+miette.workspace = true
+imara-diff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,12 +1,12 @@
 [workspace]
 members = [
-    "crates/anchor-unix",
-    "crates/anchor-windows",
-    "crates/anchor-core",
-    "crates/anchor-git",
-    "crates/anchor-session",
-    "crates/anchor-cli",
-    "crates/anchor-tui",
+    "crates/fence-unix",
+    "crates/fence-windows",
+    "crates/fence-core",
+    "crates/fence-git",
+    "crates/fence-session",
+    "crates/fence-cli",
+    "crates/fence-tui",
 ]
 resolver = "3"
 
@@ -15,17 +15,17 @@ version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/22elix3r/Anchor"
-homepage = "https://github.com/22elix3r/Anchor"
-authors = ["Anchor contributors"]
+repository = "https://github.com/22elix3r/fence"
+homepage = "https://github.com/22elix3r/fence"
+authors = ["Fence contributors"]
 
 [workspace.dependencies]
-anchor-unix = { version = "0.1.0-alpha.1", path = "crates/anchor-unix" }
-anchor-windows = { version = "0.1.0-alpha.1", path = "crates/anchor-windows" }
-anchor-core = { version = "0.1.0-alpha.1", path = "crates/anchor-core" }
-anchor-git = { version = "0.1.0-alpha.1", path = "crates/anchor-git" }
-anchor-session = { version = "0.1.0-alpha.1", path = "crates/anchor-session" }
-anchor-tui = { version = "0.1.0-alpha.1", path = "crates/anchor-tui" }
+fence-unix = { version = "0.1.0-alpha.1", path = "crates/fence-unix" }
+fence-windows = { version = "0.1.0-alpha.1", path = "crates/fence-windows" }
+fence-core = { version = "0.1.0-alpha.1", path = "crates/fence-core" }
+fence-git = { version = "0.1.0-alpha.1", path = "crates/fence-git" }
+fence-session = { version = "0.1.0-alpha.1", path = "crates/fence-session" }
+fence-tui = { version = "0.1.0-alpha.1", path = "crates/fence-tui" }
 
 base64 = "0.23.0"
 atomic-write-file = "0.3.0"

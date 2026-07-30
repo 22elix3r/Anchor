@@ -37,25 +37,25 @@ jobs:
         run: |
           set -euo pipefail
           version="$(cargo metadata --locked --no-deps --format-version 1 |
-            jq -r '.packages[] | select(.name == "anchor-cli") | .version')"
+            jq -r '.packages[] | select(.name == "fence-cli") | .version')"
           test "${GITHUB_REF_NAME}" = "v${version}"
           test "$(grep -c "^## \\[${version}\\]" CHANGELOG.md)" = "1"
       - name: Test workspace
         run: cargo test --workspace --locked
       - name: Build release binary
-        run: cargo build --locked --release --target "${{ matrix.target }}" -p anchor-cli
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p fence-cli
       - name: Exercise release binary without git
         shell: bash
-        run: scripts/release-smoke.sh "target/${{ matrix.target }}/release/anchor"
+        run: scripts/release-smoke.sh "target/${{ matrix.target }}/release/fence"
       - name: Package release
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          package="anchor-${GITHUB_REF_NAME#v}-${TARGET}"
+          package="fence-${GITHUB_REF_NAME#v}-${TARGET}"
           mkdir -p "dist/${package}/docs"
-          cp "target/${TARGET}/release/anchor" "dist/${package}/anchor"
+          cp "target/${TARGET}/release/fence" "dist/${package}/fence"
           cp README.md LICENSE-APACHE LICENSE-MIT CHANGELOG.md "dist/${package}/"
           cp docs/safety.md docs/storage.md docs/configuration.md \
             "dist/${package}/docs/"
@@ -103,7 +103,7 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" release-assets/* \
             --prerelease \
             --verify-tag \
-            --title "Anchor ${GITHUB_REF_NAME#v}" \
+            --title "Fence ${GITHUB_REF_NAME#v}" \
             --notes-file <(awk \
               "/^## \\[${GITHUB_REF_NAME#v}\\]/{emit=1; next} \
                /^## \\[/{if (emit) exit} emit" CHANGELOG.md)

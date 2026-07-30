@@ -6,13 +6,13 @@ labels: "recovery"
 assignees: ""
 ---
 
-Do not attach a real Anchor store or proprietary snapshot contents. For a
+Do not attach a real Fence store or proprietary snapshot contents. For a
 suspected confidential vulnerability or data-loss path, use the private
 security-advisory process described in `SECURITY.md`.
 
 ### Revision and environment
 
-- Anchor revision:
+- Fence revision:
 - OS and version:
 - Filesystem:
 - Mount options, containers or user namespace:
@@ -30,11 +30,11 @@ security-advisory process described in `SECURITY.md`.
 - Journal kind/schema/state:
 - Process crash, machine-power loss, or neither:
 - Was `SIGKILL` used:
-- Did `anchor recover-transactions --yes` roll back, roll forward, or refuse:
+- Did `fence recover-transactions --yes` roll back, roll forward, or refuse:
 
 ### Integrity report
 
-Paste redacted `anchor doctor --format json` output. Include filenames and
+Paste redacted `fence doctor --format json` output. Include filenames and
 hashes only when they contain no sensitive information.
 
 ### Minimal reproduction
