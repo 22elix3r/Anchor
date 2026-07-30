@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::Path;
 
+#[cfg(windows)]
+use anchor_core::WindowsSymlinkKind;
 use anchor_core::{
     Completeness, ConflictReason, Coverage, Manifest, ManifestEntry, ManifestNode,
     MetadataObservation, NativeRelativePath, NativeString, NoChangeReason, ObjectId, PathEncoding,
@@ -37,7 +39,7 @@ struct Case {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn base_session_current_decision_matrix() {
-    let mut cases = vec![
+    let cases = vec![
         case(
             "regular_modified_unchanged_after",
             file(b"base", 0),
@@ -246,13 +248,17 @@ fn base_session_current_decision_matrix() {
     // Unix executable bits have more than two states. Windows readonly metadata
     // is boolean, so it cannot represent an opaque third metadata state.
     #[cfg(unix)]
-    cases.push(case(
-        "regular_third_mode_conflicts",
-        file(b"same", 0),
-        file(b"same", 1),
-        file(b"same", 2),
-        Expected::Conflict(ConflictReason::ModeDrifted),
-    ));
+    let cases = {
+        let mut cases = cases;
+        cases.push(case(
+            "regular_third_mode_conflicts",
+            file(b"same", 0),
+            file(b"same", 1),
+            file(b"same", 2),
+            Expected::Conflict(ConflictReason::ModeDrifted),
+        ));
+        cases
+    };
 
     assert_eq!(
         cases.len(),
@@ -330,15 +336,7 @@ fn entry(state: &State) -> Option<ManifestEntry> {
                 },
             )
         }
-        State::Symlink(target) => (
-            ManifestNode::Symlink {
-                target: NativeString::from_host(OsStr::new(target)),
-                windows_link_kind: None,
-                windows_substitute_name: None,
-                windows_reparse_flags: None,
-            },
-            SafetyObservations::default(),
-        ),
+        State::Symlink(target) => (symlink_node(target), SafetyObservations::default()),
         State::EmptyDirectory => (
             ManifestNode::EmptyDirectory,
             SafetyObservations {
@@ -416,4 +414,25 @@ const fn platform_metadata(mode: u8) -> (Option<u8>, Option<bool>) {
 #[cfg(windows)]
 const fn platform_metadata(mode: u8) -> (Option<u8>, Option<bool>) {
     (None, Some(mode != 0))
+}
+
+#[cfg(unix)]
+fn symlink_node(target: &str) -> ManifestNode {
+    ManifestNode::Symlink {
+        target: NativeString::from_host(OsStr::new(target)),
+        windows_link_kind: None,
+        windows_substitute_name: None,
+        windows_reparse_flags: None,
+    }
+}
+
+#[cfg(windows)]
+fn symlink_node(target: &str) -> ManifestNode {
+    let target = NativeString::from_host(OsStr::new(target));
+    ManifestNode::Symlink {
+        target: target.clone(),
+        windows_link_kind: Some(WindowsSymlinkKind::File),
+        windows_substitute_name: Some(target),
+        windows_reparse_flags: Some(0),
+    }
 }
