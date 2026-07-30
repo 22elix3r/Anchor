@@ -29,7 +29,7 @@ Anchor is pre-release software. The implemented safety-first subset is:
 - frozen per-session capture policy with schema-v1 migration support;
 - read-only Git discovery, index capture, tracked-path and ignore awareness via
   `gix`;
-- stable before/after capture around inherited interactive terminal streams;
+- stable before/after capture around inherited interactive terminal or console streams;
 - Unix signal forwarding with an after-capture attempt after interruption;
 - stale-session abandonment after the inherited child lock is free;
 - path-level diffs with unique exact-content rename detection;
@@ -38,21 +38,22 @@ Anchor is pre-release software. The implemented safety-first subset is:
   file-level restore actions;
 - structured three-state restoration planning;
 - bounded inverse three-way text merge with structured overlap conflicts;
-- single-path regular-file and symlink restore on Unix when safety is proven;
-- byte-verified empty-directory restore on Unix;
+- single-path regular-file, symlink, and empty-directory restore when safety is proven;
 - preview-token-bound whole-session restore of all unambiguous included paths,
-  with staged outputs and a recoverable multi-path journal on Unix;
-- exact raw-index restore on Unix when the current index still equals the
+  with staged outputs and a recoverable multi-path journal;
+- exact raw-index restore when the current index still equals the
   session-end index (split indexes are refused);
 - byte-verified rollback of interrupted file, index, and pre-commit batch
   transactions, plus roll-forward cleanup after a verified batch commit point;
 - refusal when current bytes, type, symlink target, mode, HEAD, or repository
   operation state is ambiguous;
 - storage integrity checking and reachability-based garbage collection.
+- experimental native Windows support with handle-relative no-follow capture,
+  protected per-user storage, kill-on-close child containment, and
+  crash-recoverable no-replace restoration.
 
 Not yet implemented: combining index restoration into the worktree batch,
-hunk-level restore, and Windows filesystem mutation. Those cases are refused
-rather than approximated.
+and hunk-level restore. Those cases are refused rather than approximated.
 
 ## Build
 
@@ -181,11 +182,17 @@ Implemented and remaining work is tracked in the
 |---|---|---|
 | Linux | Supported | Experimental single-path and batch |
 | macOS | Supported | Experimental single-path and batch |
-| Windows | Wire-format and core tests only | Refused |
+| Windows | Experimental native support | Experimental single-path and batch |
 
-Windows paths are represented losslessly from the start. Session capture and
-mutation are refused until reparse-point containment, private ACL creation,
-no-replace replacement, and console behavior have dedicated tests.
+Windows paths and command arguments retain exact WTF-16. Capture uses pinned
+directory handles, 128-bit file identities, reparse-point inspection, and
+alternate-stream detection. Restore uses handle-relative NT creation plus
+no-replace handle renames and durable recovery journals. Stores live under the
+current user's Local AppData and receive a protected current-user/SYSTEM DACL.
+The wrapped process tree is assigned to a kill-on-close Job object. Windows
+remains experimental while its real-runner compatibility matrix grows,
+especially for non-NTFS volumes, antivirus sharing interference, unusual
+case-sensitive directories, and third-party console applications.
 
 ## Contributing
 

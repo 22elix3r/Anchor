@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted for implementation. Windows session capture and mutation remain gated until the native
-backend's integration tests pass on Windows.
+Implemented; Windows support remains experimental while the real-filesystem
+compatibility matrix grows.
 
 ## Decision
 
@@ -30,6 +30,9 @@ The Win32 APIs expose the required primitives:
 - `GetFileInformationByHandleEx(FileIdInfo)` for post-open identity validation;
 - `FSCTL_GET_REPARSE_POINT` for bounded reparse payload inspection;
 - `GetFileInformationByHandleEx(FileStreamInfo)` for alternate-stream detection.
+- `NtCreateFile` with a pinned `RootDirectory` for handle-relative staging;
+- `SetFileInformationByHandle(FileRenameInfo)` for no-replace evacuation and install;
+- a kill-on-close Job object for wrapper-crash child containment.
 
 ## Consequences
 
@@ -37,4 +40,7 @@ The Win32 APIs expose the required primitives:
   `unsafe_code = "forbid"`.
 - Unknown or malformed reparse data fails closed.
 - An entry replaced between enumeration and open is reported as unstable.
-- Windows capture is not enabled merely by introducing these primitives.
+- Unknown reparse tags, hard-link topology, EFS content, cloud placeholders,
+  and named streams fail complete capture before child launch.
+- Restore uses a separate durable Windows journal and retains backups until all
+  desired endpoints verify.

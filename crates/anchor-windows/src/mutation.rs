@@ -20,7 +20,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_INFO_EX,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
     FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_WRITE_ATTRIBUTES, FileDispositionInfoEx, FileRenameInfo, SetFileInformationByHandle,
+    FILE_WRITE_ATTRIBUTES, FileDispositionInfoEx, FileRenameInfo, SYNCHRONIZE,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
@@ -331,7 +332,7 @@ fn nt_create_relative(
     let result = unsafe {
         NtCreateFile(
             ptr::from_mut(&mut handle),
-            access,
+            access | SYNCHRONIZE,
             ptr::from_ref(&object),
             ptr::from_mut(&mut status),
             ptr::null(),

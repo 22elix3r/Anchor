@@ -230,10 +230,10 @@ fn store_is_private(root: &Path) -> Result<bool, MaintenanceError> {
     Ok(fs::metadata(root)?.permissions().mode() & 0o077 == 0)
 }
 
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-fn store_is_private(_root: &Path) -> Result<bool, MaintenanceError> {
-    Ok(false)
+#[cfg(windows)]
+fn store_is_private(root: &Path) -> Result<bool, MaintenanceError> {
+    anchor_windows::private_directory_is_hardened(root)
+        .map_err(|error| MaintenanceError::PrivateStore(error.to_string()))
 }
 
 #[derive(Debug, Error)]
@@ -253,6 +253,9 @@ pub enum MaintenanceError {
     Store(#[from] anchor_core::StoreError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[cfg(windows)]
+    #[error("could not verify the Windows store DACL: {0}")]
+    PrivateStore(String),
 }
 
 #[cfg(test)]

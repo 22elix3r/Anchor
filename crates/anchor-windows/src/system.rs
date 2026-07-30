@@ -8,11 +8,13 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
-    SetKernelObjectSecurity, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    DACL_SECURITY_INFORMATION, GetKernelObjectSecurity, GetTokenInformation,
+    PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -73,16 +75,7 @@ pub fn local_app_data() -> Result<PathBuf, WindowsError> {
 ///
 /// Returns an error for reparse points, non-directories, token failures, or ACL failures.
 pub fn harden_private_directory(path: &Path) -> Result<(), WindowsError> {
-    let path = VerbatimPath::new(path)?;
-    let handle = open_raw(
-        &path,
-        READ_CONTROL | WRITE_DAC,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-    )?;
-    if crate::filesystem::metadata_for_system(&handle)?.kind != NodeKind::Directory {
-        return Err(WindowsError::PrivateDirectoryReparse);
-    }
+    let handle = open_private_directory(path, READ_CONTROL | WRITE_DAC)?;
 
     let sid = current_user_sid_string()?;
     let sddl = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{sid})");
@@ -120,6 +113,86 @@ pub fn harden_private_directory(path: &Path) -> Result<(), WindowsError> {
         return Err(io_error("SetKernelObjectSecurity"));
     }
     Ok(())
+}
+
+/// Check that a directory has Anchor's exact protected current-user-and-SYSTEM DACL.
+///
+/// # Errors
+///
+/// Returns an error if the path is a reparse point or its security descriptor cannot be read.
+pub fn private_directory_is_hardened(path: &Path) -> Result<bool, WindowsError> {
+    let handle = open_private_directory(path, READ_CONTROL)?;
+    let mut required = 0_u32;
+    // SAFETY: This is the documented sizing call with a null descriptor destination.
+    unsafe {
+        GetKernelObjectSecurity(
+            handle.as_raw_handle().cast(),
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            0,
+            ptr::from_mut(&mut required),
+        );
+    }
+    if required == 0 {
+        return Err(io_error("GetKernelObjectSecurity"));
+    }
+    let words = usize::try_from(required)
+        .map_err(|_| WindowsError::TooLarge("security descriptor"))?
+        .div_ceil(size_of::<usize>());
+    let mut descriptor = vec![0_usize; words];
+    // SAFETY: The aligned output buffer is writable for at least `required` bytes.
+    if unsafe {
+        GetKernelObjectSecurity(
+            handle.as_raw_handle().cast(),
+            DACL_SECURITY_INFORMATION,
+            descriptor.as_mut_ptr().cast::<c_void>(),
+            required,
+            ptr::from_mut(&mut required),
+        )
+    } == 0
+    {
+        return Err(io_error("GetKernelObjectSecurity"));
+    }
+    let mut sddl = ptr::null_mut();
+    // SAFETY: The query initialized a self-relative descriptor in the live aligned buffer.
+    if unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor.as_mut_ptr().cast::<c_void>(),
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            ptr::from_mut(&mut sddl),
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io_error(
+            "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+        ));
+    }
+    let actual = bounded_wide(sddl.cast_const(), "security descriptor string");
+    // SAFETY: The conversion API returned this LocalAlloc string.
+    unsafe { LocalFree(sddl.cast()) };
+    let actual = String::from_utf16(&actual?)
+        .map_err(|_| WindowsError::Malformed("security descriptor string"))?;
+    let expected = format!(
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{})",
+        current_user_sid_string()?
+    );
+    Ok(actual == expected)
+}
+
+fn open_private_directory(path: &Path, access: u32) -> Result<OwnedHandle, WindowsError> {
+    let path = VerbatimPath::new(path)?;
+    let handle = open_raw(
+        &path,
+        access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    )?;
+    if crate::filesystem::metadata_for_system(&handle)?.kind != NodeKind::Directory {
+        return Err(WindowsError::PrivateDirectoryReparse);
+    }
+    Ok(handle)
 }
 
 fn current_user_sid_string() -> Result<String, WindowsError> {
@@ -263,6 +336,7 @@ mod tests {
         let private = root.path().join("private");
         fs::create_dir(&private).unwrap();
         harden_private_directory(&private).unwrap();
+        assert!(private_directory_is_hardened(&private).unwrap());
         fs::write(private.join("probe"), b"private").unwrap();
         assert_eq!(fs::read(private.join("probe")).unwrap(), b"private");
     }

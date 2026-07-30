@@ -36,6 +36,16 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  windows-quality:
+    name: Windows Clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   msrv:
     name: MSRV (1.85)
     runs-on: ubuntu-latest

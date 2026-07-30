@@ -16,7 +16,9 @@ pub use filesystem::{
 };
 pub use mutation::MutationRoot;
 pub use path::{VerbatimPath, VerbatimPathError};
-pub use system::{KillOnCloseJob, harden_private_directory, local_app_data};
+pub use system::{
+    KillOnCloseJob, harden_private_directory, local_app_data, private_directory_is_hardened,
+};
 
 use std::io;
 

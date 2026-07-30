@@ -21,7 +21,7 @@ thiserror.workspace = true
 zstd.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-anchor-windows = { path = "../anchor-windows" }
+anchor-windows.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

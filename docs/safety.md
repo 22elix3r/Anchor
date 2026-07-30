@@ -156,8 +156,9 @@ earlier `.anchorignore` rules but cannot re-include a Git-ignored path.
 Sensitive nonignored files are included. Anchor is local-only and performs no
 telemetry or network I/O, but local users or malware able to read the store may
 read captured contents. Unix store directories are forced to mode `0700`.
-Windows ACL hardening is not yet implemented, and `doctor` reports the store as
-not private there.
+Windows store directories receive a protected DACL granting full access only to
+the current user and Local System; `doctor` reads back and validates that exact
+DACL.
 
 Only the command program is recorded by default. Arguments are represented by a
 count unless `--record-arguments` is explicitly enabled. The process environment
@@ -190,9 +191,10 @@ Manifests and sessions are treated as untrusted:
 - no split-index restoration or Git history restoration;
 - no recursive dirty-submodule capture or restoration;
 - no preservation of hard-link topology, ACLs, xattrs, ownership, or timestamps;
-- no Windows session capture or mutation yet;
 - `SIGKILL`, power loss, or machine failure can leave an incomplete session
   that must be marked abandoned after its child lock is free;
+- Windows support is experimental on non-NTFS filesystems, case-sensitive
+  directories, and systems where security software denies delete sharing;
 - no automatic reconstruction of missing uncaptured parent directories.
 
 These cases must remain visible limitations, not silent fallbacks.

@@ -1,6 +1,6 @@
 # Storage format and data location
 
-Anchor stores data beneath the resolved Git common directory:
+On Unix, Anchor stores data beneath the resolved Git common directory:
 
 ```text
 $GIT_COMMON_DIR/anchor/users/<principal>/v1/
@@ -16,6 +16,12 @@ $GIT_COMMON_DIR/anchor/users/<principal>/v1/
 Objects and manifests are shared by linked worktrees. Sessions and the active
 session lock are namespaced by worktree. The main worktree uses `main`; linked
 worktrees use a BLAKE3-derived key from the native private Git-directory path.
+
+On Windows the equivalent layout is under
+`FOLDERID_LocalAppData/Anchor/stores/v1/repo-<identity>/`. The repository and
+linked-worktree keys derive from volume serial plus the 128-bit filesystem file
+ID, so path spelling and repository renames do not change identity. Every
+created store directory has a protected current-user/SYSTEM DACL.
 
 Bare repositories are refused. Non-Git directories are not supported in the
 current release.
@@ -37,7 +43,8 @@ object is fully verified instead of overwritten.
 ## Manifests
 
 Manifest identity is a domain-separated BLAKE3 hash of deterministic CBOR.
-Schema v1 is an explicit tuple containing:
+Writers emit schema v2; schema v1 remains byte-identical and readable. The
+explicit tuple contains:
 
 - record tag and schema version;
 - path-encoding family;
@@ -50,9 +57,11 @@ Components cannot be empty, `.`, `..`, rooted, prefixed, contain NUL, or contain
 native separators.
 
 Entries represent regular files, symlinks, and empty directories. Regular files
-reference an object and store raw size plus Unix executable bits. Symlinks store
-the opaque native target. Sockets, FIFOs, devices, and unsupported reparse points
-are never encoded as regular files.
+reference an object and store raw size plus either Unix executable bits or the
+Windows read-only attribute. Windows symlinks additionally retain link kind,
+substitute name, print name, and reparse flags. Sockets, FIFOs, devices,
+junctions, cloud placeholders, EFS files, alternate streams, and unsupported
+reparse points are never silently encoded as ordinary files.
 
 ## Sessions
 

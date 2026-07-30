@@ -13,13 +13,13 @@ tested and documented.
 | Manifests | Versioned CBOR, lossless Unix/WTF-16 paths, coverage and omission records | Migration fixture corpus and parser fuzzing |
 | Git awareness | `gix` discovery, tracked paths, ignores, raw index and repository state | Sparse/split-index proof, broader linked-worktree fixtures |
 | Capture | No-follow traversal, per-file and directory stability checks, limits | Incremental reuse and bounded parallel I/O |
-| Sessions | Crash-visible lifecycle, inherited TTY, Unix signals, stale recovery | Windows console control handling and PTY opt-in spike |
+| Sessions | Crash-visible lifecycle, inherited TTY/console, Unix signal forwarding, Windows Job containment, stale recovery | PTY opt-in spike only if inherited handles prove insufficient |
 | Diff | Structured path changes, exact rename detection, bounded unified text | Lazy large-session rendering and optional fuzzy rename |
 | Restore | Exact path inverse, bounded text inverse merge, recoverable worktree batch | Batch text merge, safe parent reconstruction, index composition |
 | Index | Exact raw restore after no-drift proof | Split index and combined worktree/index transaction |
 | TUI | Side-by-side/unified review and confirmed file restore | Conflicts, batch selection, hunk restore, very-large-file paging |
 | Maintenance | Doctor, shared-store GC, tombstones, transaction recovery | Retention policy and terminal-journal pruning |
-| Windows | Lossless persisted paths and core wire tests | Native capture, ACL hardening, reparse containment, mutation |
+| Windows | Native no-follow capture, ACL hardening, Job containment, journaled worktree/index restore | Broader filesystem, antivirus, console, and crash-fault matrix |
 
 ## Release-critical phases
 
@@ -164,23 +164,22 @@ Acceptance:
 
 ## Windows enablement
 
-Windows remains experimental until all of these land together:
+Windows capture and restoration are enabled as experimental. Implemented:
 
-1. Classify every reparse tag encountered during no-follow traversal. Preserve
-   supported symlinks; treat junctions and unknown tags as explicit boundaries.
-2. Create store directories and temporary files with user-only ACLs, then make
-   `doctor` verify the effective access policy.
-3. Implement replace/no-replace operations with documented sharing-mode
-   behavior and antivirus retry limits. Never fall back to overwrite.
-4. Persist and validate case-folding collision observations before mutation.
-5. Test long paths, reserved names, trailing dots/spaces, unpaired surrogates,
-   open-file replacement, executable-bit non-semantics, and console control
-   forwarding on real Windows CI runners.
+1. handle-relative enumeration/open with 128-bit identity checks;
+2. standard symlink preservation and explicit refusal of unknown reparse tags,
+   junctions, ADS, hard links, EFS, and cloud placeholders;
+3. Local AppData storage with protected current-user/SYSTEM DACL verification;
+4. kill-on-close Job containment for the wrapped process tree;
+5. `NtCreateFile` staging, no-replace handle rename/delete, endpoint
+   verification, and durable worktree/index recovery journals.
 
-Success means native capture and review can be enabled first. Mutation remains
-separately gated until recovery tests pass. A PTY crate such as `portable-pty`
-should be added only if real agent smoke tests demonstrate that inherited
-console handles are insufficient.
+Remaining hardening is a real-runner matrix for ReFS/network volumes, long and
+reserved paths, case-sensitive directories, antivirus sharing failures,
+open-file replacement, console control behavior, and fault injection at every
+Windows journal boundary. A PTY crate such as `portable-pty` should be added
+only if real agent smoke tests demonstrate inherited console handles are
+insufficient.
 
 ## Post-v1 feature scopes
 

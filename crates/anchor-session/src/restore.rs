@@ -2980,10 +2980,11 @@ mod windows_tests {
         .unwrap();
         let (store, store_root) = session_store(root.path());
         let path = NativeRelativePath::from_host_path(Path::new("file.txt")).unwrap();
-        assert!(matches!(
-            RestoreService::restore_file(&store, result.session_id, path),
-            Ok(RestoreApplyResult::Applied { .. })
-        ));
+        let restored = RestoreService::restore_file(&store, result.session_id, path);
+        assert!(
+            matches!(restored, Ok(RestoreApplyResult::Applied { .. })),
+            "{restored:?}"
+        );
         assert_eq!(fs::read(root.path().join("file.txt")).unwrap(), b"before");
         drop(store);
         fs::remove_dir_all(store_root).unwrap();
