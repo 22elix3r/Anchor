@@ -37,7 +37,7 @@ struct Case {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn base_session_current_decision_matrix() {
-    let cases = vec![
+    let mut cases = vec![
         case(
             "regular_modified_unchanged_after",
             file(b"base", 0),
@@ -128,13 +128,6 @@ fn base_session_current_decision_matrix() {
             file(b"same", 1),
             file(b"later", 1),
             Expected::WriteFile(b"later", 0),
-        ),
-        case(
-            "regular_third_mode_conflicts",
-            file(b"same", 0),
-            file(b"same", 1),
-            file(b"same", 2),
-            Expected::Conflict(ConflictReason::ModeDrifted),
         ),
         case(
             "regular_binary_is_exact_when_endpoint_matches",
@@ -250,7 +243,22 @@ fn base_session_current_decision_matrix() {
         ),
     ];
 
-    assert_eq!(cases.len(), 30, "update the declared matrix size");
+    // Unix executable bits have more than two states. Windows readonly metadata
+    // is boolean, so it cannot represent an opaque third metadata state.
+    #[cfg(unix)]
+    cases.push(case(
+        "regular_third_mode_conflicts",
+        file(b"same", 0),
+        file(b"same", 1),
+        file(b"same", 2),
+        Expected::Conflict(ConflictReason::ModeDrifted),
+    ));
+
+    assert_eq!(
+        cases.len(),
+        if cfg!(unix) { 30 } else { 29 },
+        "update the declared matrix size"
+    );
     let mut seen = BTreeSet::new();
     for case in cases {
         assert!(seen.insert(case.id), "duplicate matrix case {}", case.id);
@@ -306,19 +314,22 @@ fn manifest(state: &State) -> Manifest {
 fn entry(state: &State) -> Option<ManifestEntry> {
     let (node, safety) = match state {
         State::Absent => return None,
-        State::File(bytes, mode) => (
-            ManifestNode::Regular {
-                object: ObjectId::from_raw(bytes),
-                raw_size: u64::try_from(bytes.len()).unwrap(),
-                unix_exec_bits: Some(*mode),
-                windows_readonly: None,
-            },
-            SafetyObservations {
-                hardlink_group: None,
-                link_count: 1,
-                extended_metadata: MetadataObservation::Absent,
-            },
-        ),
+        State::File(bytes, mode) => {
+            let (unix_exec_bits, windows_readonly) = platform_metadata(*mode);
+            (
+                ManifestNode::Regular {
+                    object: ObjectId::from_raw(bytes),
+                    raw_size: u64::try_from(bytes.len()).unwrap(),
+                    unix_exec_bits,
+                    windows_readonly,
+                },
+                SafetyObservations {
+                    hardlink_group: None,
+                    link_count: 1,
+                    extended_metadata: MetadataObservation::Absent,
+                },
+            )
+        }
         State::Symlink(target) => (
             ManifestNode::Symlink {
                 target: NativeString::from_host(OsStr::new(target)),
@@ -357,7 +368,8 @@ fn assert_outcome(id: &str, actual: RestoreOutcome, expected: Expected) {
             let ManifestNode::Regular {
                 object,
                 raw_size,
-                unix_exec_bits,
+                unix_exec_bits: actual_unix_exec_bits,
+                windows_readonly: actual_windows_readonly,
                 ..
             } = entry.node
             else {
@@ -365,7 +377,10 @@ fn assert_outcome(id: &str, actual: RestoreOutcome, expected: Expected) {
             };
             assert_eq!(object, ObjectId::from_raw(expected_bytes), "{id}");
             assert_eq!(raw_size, expected_bytes.len() as u64, "{id}");
-            assert_eq!(unix_exec_bits, Some(expected_mode), "{id}");
+            let (expected_unix_exec_bits, expected_windows_readonly) =
+                platform_metadata(expected_mode);
+            assert_eq!(actual_unix_exec_bits, expected_unix_exec_bits, "{id}");
+            assert_eq!(actual_windows_readonly, expected_windows_readonly, "{id}");
         }
         (RestoreOutcome::Write(Some(entry)), Expected::WriteSymlink(expected_target)) => {
             let ManifestNode::Symlink { target, .. } = entry.node else {
@@ -391,4 +406,14 @@ fn assert_outcome(id: &str, actual: RestoreOutcome, expected: Expected) {
         }
         (actual, expected) => panic!("{id}: got {actual:?}, expected {expected:?}"),
     }
+}
+
+#[cfg(unix)]
+const fn platform_metadata(mode: u8) -> (Option<u8>, Option<bool>) {
+    (Some(mode), None)
+}
+
+#[cfg(windows)]
+const fn platform_metadata(mode: u8) -> (Option<u8>, Option<bool>) {
+    (None, Some(mode != 0))
 }
