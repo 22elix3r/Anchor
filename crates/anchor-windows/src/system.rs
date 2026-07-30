@@ -153,11 +153,42 @@ pub fn private_directory_is_hardened(path: &Path) -> Result<bool, WindowsError> 
     {
         return Err(io_error("GetKernelObjectSecurity"));
     }
+    let actual = canonical_dacl_sddl(descriptor.as_mut_ptr().cast::<c_void>())?;
+    let expected_input = format!(
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{})",
+        current_user_sid_string()?
+    );
+    let wide = expected_input
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut expected_descriptor = ptr::null_mut();
+    // SAFETY: `wide` is NUL terminated and the returned descriptor is released below.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            SDDL_REVISION_1,
+            ptr::from_mut(&mut expected_descriptor),
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io_error(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+        ));
+    }
+    let expected = canonical_dacl_sddl(expected_descriptor);
+    // SAFETY: The conversion API returned this LocalAlloc allocation.
+    unsafe { LocalFree(expected_descriptor.cast()) };
+    Ok(actual == expected?)
+}
+
+fn canonical_dacl_sddl(descriptor: *mut c_void) -> Result<String, WindowsError> {
     let mut sddl = ptr::null_mut();
-    // SAFETY: The query initialized a self-relative descriptor in the live aligned buffer.
+    // SAFETY: The caller provides a live security descriptor and the output is released below.
     if unsafe {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            descriptor.as_mut_ptr().cast::<c_void>(),
+            descriptor,
             SDDL_REVISION_1,
             DACL_SECURITY_INFORMATION,
             ptr::from_mut(&mut sddl),
@@ -169,16 +200,10 @@ pub fn private_directory_is_hardened(path: &Path) -> Result<bool, WindowsError> 
             "ConvertSecurityDescriptorToStringSecurityDescriptorW",
         ));
     }
-    let actual = bounded_wide(sddl.cast_const(), "security descriptor string");
+    let units = bounded_wide(sddl.cast_const(), "security descriptor string");
     // SAFETY: The conversion API returned this LocalAlloc string.
     unsafe { LocalFree(sddl.cast()) };
-    let actual = String::from_utf16(&actual?)
-        .map_err(|_| WindowsError::Malformed("security descriptor string"))?;
-    let expected = format!(
-        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{})",
-        current_user_sid_string()?
-    );
-    Ok(actual == expected)
+    String::from_utf16(&units?).map_err(|_| WindowsError::Malformed("security descriptor string"))
 }
 
 fn open_private_directory(path: &Path, access: u32) -> Result<OwnedHandle, WindowsError> {
