@@ -30,6 +30,8 @@ Anchor is pre-release software. The implemented safety-first subset is:
 - read-only Git discovery, index capture, tracked-path and ignore awareness via
   `gix`;
 - stable before/after capture around inherited interactive terminal streams;
+- Unix signal forwarding with an after-capture attempt after interruption;
+- stale-session abandonment after the inherited child lock is free;
 - path-level diffs with unique exact-content rename detection;
 - bounded, control-character-sanitized unified text diffs;
 - a read-only side-by-side terminal reviewer with narrow-layout fallback;
@@ -66,6 +68,8 @@ anchor run -- codex
 anchor sessions
 anchor show <session-id>
 anchor diff <session-id>
+anchor diff <session-id> --current
+anchor diff <session-id> --drift
 anchor diff <session-id> --format json
 anchor review <session-id>
 ```
@@ -87,11 +91,17 @@ Verify retained data and preview garbage collection:
 anchor doctor
 anchor gc --dry-run
 anchor gc
+anchor recover
 ```
 
 `anchor diff` returns `1` when differences exist. Restore conflicts return `4`.
 The `run` command returns the wrapped child’s exit code (or `128 + signal` on
 Unix) after attempting the after-snapshot.
+
+The default diff is `before → session end`. `--current` is `before → current`;
+`--drift` is `session end → current` and separately reports repository and raw
+index drift. `anchor recover` never guesses a missing session end: after it can
+acquire the worktree lock, it marks stale nonterminal records `Abandoned`.
 
 ## Inclusion and limits
 

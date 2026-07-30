@@ -10,8 +10,8 @@ use anchor_core::{
 use anchor_git::GitContext;
 use anchor_session::{
     CapturePolicy, ConfigLoader, IndexRestoreResult, MaintenanceService, PolicyOverrides,
-    RestoreApplyResult, RestoreService, RunRequest, Session, SessionId, SessionRunner,
-    SessionStore,
+    RecoveryService, RestoreApplyResult, RestoreService, RunRequest, Session, SessionId,
+    SessionInspection, SessionRunner, SessionStore,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
@@ -72,6 +72,12 @@ enum Commands {
     /// Compare the before and session-end manifests.
     Diff {
         session: String,
+        /// Compare the session's before-state with the current worktree.
+        #[arg(long, conflicts_with = "drift")]
+        current: bool,
+        /// Compare the session-end state with the current worktree.
+        #[arg(long, conflicts_with = "current")]
+        drift: bool,
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
     },
@@ -95,6 +101,11 @@ enum Commands {
     Gc {
         #[arg(long)]
         dry_run: bool,
+        #[arg(long, value_enum, default_value_t)]
+        format: OutputFormat,
+    },
+    /// Mark stale nonterminal sessions abandoned after proving their child lock is free.
+    Recover {
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
     },
@@ -207,30 +218,102 @@ fn execute(cli: Cli) -> Result<i32> {
             print_sessions(std::slice::from_ref(&session), format)?;
             Ok(0)
         }
-        Commands::Diff { session, format } => {
+        Commands::Diff {
+            session,
+            current,
+            drift,
+            format,
+        } => {
             let store = current_store()?;
             let _lease = store
                 .acquire_store_read_lease()
                 .into_diagnostic()
                 .wrap_err("Anchor storage is busy")?;
             let session = load_session(&store, &session)?;
-            let Some(after) = &session.after else {
-                miette::bail!(
-                    "session {} has no complete after-snapshot ({:?})",
-                    session.id,
-                    session.state
-                );
-            };
             let before = store
                 .load_manifest(session.before.manifest)
                 .into_diagnostic()
                 .wrap_err("cannot load before manifest")?;
-            let after = store
-                .load_manifest(after.manifest)
-                .into_diagnostic()
-                .wrap_err("cannot load after manifest")?;
-            let diff = ManifestDiff::between(&before, &after);
-            print_diff(&diff, format, store.objects())?;
+            let mut repository_drift = None;
+            let mut index_drift = None;
+            let current_snapshot = if current || drift {
+                let snapshot = SessionInspection::capture_current(&store, session.id)
+                    .into_diagnostic()
+                    .wrap_err("cannot capture current worktree state")?;
+                let reference = if drift {
+                    session.after.as_ref().ok_or_else(|| {
+                        miette::miette!(
+                            "session {} has no complete after-snapshot ({:?})",
+                            session.id,
+                            session.state
+                        )
+                    })?
+                } else {
+                    &session.before
+                };
+                repository_drift = Some(snapshot.repository != reference.repository);
+                index_drift = Some(snapshot.index != reference.index);
+                Some(snapshot)
+            } else {
+                None
+            };
+            let (left, right, view) = if drift {
+                let after = session.after.as_ref().ok_or_else(|| {
+                    miette::miette!(
+                        "session {} has no complete after-snapshot ({:?})",
+                        session.id,
+                        session.state
+                    )
+                })?;
+                let after = store
+                    .load_manifest(after.manifest)
+                    .into_diagnostic()
+                    .wrap_err("cannot load after manifest")?;
+                (
+                    after,
+                    current_snapshot
+                        .as_ref()
+                        .ok_or_else(|| miette::miette!("current snapshot was not constructed"))?
+                        .manifest
+                        .clone(),
+                    "drift",
+                )
+            } else if current {
+                (
+                    before.clone(),
+                    current_snapshot
+                        .as_ref()
+                        .ok_or_else(|| miette::miette!("current snapshot was not constructed"))?
+                        .manifest
+                        .clone(),
+                    "current",
+                )
+            } else {
+                let after = session.after.as_ref().ok_or_else(|| {
+                    miette::miette!(
+                        "session {} has no complete after-snapshot ({:?})",
+                        session.id,
+                        session.state
+                    )
+                })?;
+                (
+                    before.clone(),
+                    store
+                        .load_manifest(after.manifest)
+                        .into_diagnostic()
+                        .wrap_err("cannot load after manifest")?,
+                    "session-end",
+                )
+            };
+            let diff = ManifestDiff::between(&left, &right);
+            print_diff(
+                &diff,
+                format,
+                store.objects(),
+                view,
+                repository_drift,
+                index_drift,
+            )?;
             Ok(i32::from(!diff.is_empty()))
         }
         Commands::Review { session } => {
@@ -389,6 +472,31 @@ fn execute(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Commands::Recover { format } => {
+            let store = current_store()?;
+            let abandoned = RecoveryService::mark_abandoned(&store)
+                .into_diagnostic()
+                .wrap_err("cannot recover stale session metadata")?;
+            if format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "abandoned_sessions": abandoned
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>(),
+                    }))
+                    .into_diagnostic()?
+                );
+            } else if abandoned.is_empty() {
+                println!("No stale nonterminal sessions.");
+            } else {
+                for session in &abandoned {
+                    println!("marked {session} abandoned");
+                }
+            }
+            Ok(0)
+        }
     }
 }
 
@@ -457,7 +565,14 @@ fn print_sessions(sessions: &[Session], format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn print_diff(diff: &ManifestDiff, format: OutputFormat, objects: &ObjectStore) -> Result<()> {
+fn print_diff(
+    diff: &ManifestDiff,
+    format: OutputFormat,
+    objects: &ObjectStore,
+    view: &'static str,
+    repository_drift: Option<bool>,
+    index_drift: Option<bool>,
+) -> Result<()> {
     if format == OutputFormat::Json {
         let changes = diff
             .changes
@@ -470,11 +585,22 @@ fn print_diff(diff: &ManifestDiff, format: OutputFormat, objects: &ObjectStore) 
             .collect::<Vec<_>>();
         println!(
             "{}",
-            serde_json::to_string_pretty(&changes)
-                .into_diagnostic()
-                .wrap_err("cannot encode JSON output")?
+            serde_json::to_string_pretty(&DiffJson {
+                view,
+                repository_drift,
+                index_drift,
+                changes,
+            })
+            .into_diagnostic()
+            .wrap_err("cannot encode JSON output")?
         );
         return Ok(());
+    }
+    if repository_drift == Some(true) {
+        eprintln!("warning: repository state differs from the selected comparison endpoint");
+    }
+    if index_drift == Some(true) {
+        eprintln!("warning: Git index bytes differ from the selected comparison endpoint");
     }
     for change in &diff.changes {
         if let Some(previous) = &change.previous_path {
@@ -494,6 +620,14 @@ fn print_diff(diff: &ManifestDiff, format: OutputFormat, objects: &ObjectStore) 
         print_content_diff(change, objects)?;
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct DiffJson {
+    view: &'static str,
+    repository_drift: Option<bool>,
+    index_drift: Option<bool>,
+    changes: Vec<ChangeJson>,
 }
 
 fn display_native(value: &NativeString) -> String {

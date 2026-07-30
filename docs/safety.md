@@ -83,6 +83,17 @@ session remains blocked until the child (and any descendant that retained the
 descriptor) exits. A deliberately adversarial command can close inherited file
 descriptors; Anchor does not claim containment of the wrapped command.
 
+`SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` received by the Unix wrapper are
+recorded and forwarded to the direct child. Anchor still waits for child exit
+and attempts the after-snapshot. Terminal-generated signals may already reach
+both processes through their shared foreground process group; signal delivery
+is therefore not an authorship or containment mechanism.
+
+When the wrapper disappears before a terminal session state is persisted, the
+record remains nonterminal. A later `anchor recover` or new run first proves the
+inherited worktree lock is free, then marks such records `Abandoned` without
+inventing an after-snapshot. Abandoned records are not restorable.
+
 ## Repository drift
 
 Anchor records HEAD attachment/target, recognized operation state, object hash
@@ -140,7 +151,8 @@ Manifests and sessions are treated as untrusted:
 - no recursive dirty-submodule capture or restoration;
 - no preservation of hard-link topology, ACLs, xattrs, ownership, or timestamps;
 - no Windows session capture or mutation yet;
-- `SIGKILL`, power loss, or machine failure can leave an incomplete session;
+- `SIGKILL`, power loss, or machine failure can leave an incomplete session
+  that must be marked abandoned after its child lock is free;
 - crash-journal automatic recovery is not yet exposed as a command.
 
 These cases must remain visible limitations, not silent fallbacks.

@@ -73,6 +73,12 @@ impl RestoreService {
         let _lock = store.acquire_active_lock()?;
         ensure_no_unresolved_transactions(store.root())?;
         let session = store.load_session(session_id)?;
+        if !matches!(
+            session.state,
+            crate::SessionState::Completed | crate::SessionState::Interrupted
+        ) {
+            return Err(RestoreError::IncompleteSession);
+        }
         let after = session
             .after
             .as_ref()
@@ -151,6 +157,12 @@ impl RestoreService {
         let _lock = store.acquire_active_lock()?;
         ensure_no_unresolved_transactions(store.root())?;
         let session = store.load_session(session_id)?;
+        if !matches!(
+            session.state,
+            crate::SessionState::Completed | crate::SessionState::Interrupted
+        ) {
+            return Err(RestoreError::IncompleteSession);
+        }
         let after = session
             .after
             .as_ref()

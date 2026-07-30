@@ -11,7 +11,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anchor_core::{
@@ -167,6 +171,7 @@ pub enum SessionState {
     Interrupted,
     LaunchFailed,
     AfterSnapshotFailed,
+    Abandoned,
 }
 
 impl SessionState {
@@ -174,7 +179,11 @@ impl SessionState {
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Interrupted | Self::LaunchFailed | Self::AfterSnapshotFailed
+            Self::Completed
+                | Self::Interrupted
+                | Self::LaunchFailed
+                | Self::AfterSnapshotFailed
+                | Self::Abandoned
         )
     }
 }
@@ -456,6 +465,76 @@ pub struct StoreLease {
     _file: File,
 }
 
+#[derive(Debug)]
+pub struct CurrentSnapshot {
+    pub manifest: Manifest,
+    pub index: IndexCapture,
+    pub repository: RepositoryState,
+    pub statistics: SnapshotStatistics,
+    _lease: StoreLease,
+}
+
+#[derive(Debug, Default)]
+pub struct SessionInspection;
+
+impl SessionInspection {
+    /// Capture current state using the immutable inclusion policy from a retained session.
+    ///
+    /// The returned value retains a shared store lease so its manifest objects remain reachable
+    /// while the caller calculates and renders a diff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] for incomplete policy reconstruction, repository instability,
+    /// corrupt retained data, or capture failure.
+    pub fn capture_current(
+        store: &SessionStore,
+        session_id: SessionId,
+    ) -> Result<CurrentSnapshot, SessionError> {
+        let lease = store.acquire_store_read_lease()?;
+        let session = store.load_session(session_id)?;
+        let before = store.load_manifest(session.before.manifest)?;
+        let worktree = PathBuf::from(session.worktree_root.to_host()?);
+        let context = GitContext::discover(&worktree)?;
+        let frozen_scope =
+            context.frozen_scope(&before, store.objects(), context.tracked_paths())?;
+        let endpoint = capture_frozen_endpoint(
+            &context,
+            store,
+            session.capture_policy.capture_options(),
+            frozen_scope,
+        )?;
+        let manifest = store.load_manifest(endpoint.manifest)?;
+        Ok(CurrentSnapshot {
+            manifest,
+            index: endpoint.index,
+            repository: endpoint.repository,
+            statistics: endpoint.statistics,
+            _lease: lease,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RecoveryService;
+
+impl RecoveryService {
+    /// Mark stale nonterminal records abandoned after proving the worktree lock is free.
+    ///
+    /// This never manufactures an after-snapshot. Abandoned sessions remain ineligible for
+    /// rollback because their session-end state is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when an active child still holds the worktree lock or metadata
+    /// cannot be read and atomically updated.
+    pub fn mark_abandoned(store: &SessionStore) -> Result<Vec<SessionId>, SessionError> {
+        let _lease = store.acquire_store_read_lease()?;
+        let _active = store.acquire_active_lock()?;
+        mark_abandoned_locked(store)
+    }
+}
+
 pub(crate) struct ActiveLock {
     file: File,
 }
@@ -507,6 +586,7 @@ impl SessionRunner {
             let active_lock = store.acquire_active_lock()?;
             restore::ensure_no_unresolved_transactions(store.root())
                 .map_err(|error| SessionError::TransactionState(error.to_string()))?;
+            mark_abandoned_locked(&store)?;
 
             let capture_policy = request.capture_policy.validate()?;
             let capture_options = capture_policy.capture_options();
@@ -556,7 +636,7 @@ impl SessionRunner {
             };
             store.save_session(&session)?;
 
-            let interrupted = install_interrupt_flag()?;
+            let signal_forwarder = SignalForwarder::install()?;
             let mut command = Command::new(&request.command[0]);
             command
                 .args(&request.command[1..])
@@ -580,6 +660,7 @@ impl SessionRunner {
                     });
                 }
             };
+            signal_forwarder.set_child(child.id());
             session.state = SessionState::ChildRunning;
             store.save_session(&session)?;
 
@@ -590,6 +671,7 @@ impl SessionRunner {
                     Err(error) => return Err(SessionError::ChildWait(error)),
                 }
             };
+            signal_forwarder.clear_child();
             let exit = ExitRecord::from_status(status);
             session.exit = Some(exit);
             session.state = SessionState::CapturingAfter;
@@ -603,7 +685,7 @@ impl SessionRunner {
             match after_result {
                 Ok(after) => {
                     session.after = Some(after);
-                    session.state = if interrupted.load(Ordering::SeqCst) {
+                    session.state = if signal_forwarder.was_interrupted() {
                         SessionState::Interrupted
                     } else {
                         SessionState::Completed
@@ -624,6 +706,22 @@ impl SessionRunner {
             })
         }
     }
+}
+
+fn mark_abandoned_locked(store: &SessionStore) -> Result<Vec<SessionId>, SessionError> {
+    let mut abandoned = Vec::new();
+    for mut session in store.list_sessions()? {
+        if session.state.is_terminal() {
+            continue;
+        }
+        session.state = SessionState::Abandoned;
+        session.finished_at = Some(Timestamp::now()?);
+        session.failure =
+            Some("wrapper ended without publishing a trustworthy after-snapshot".to_owned());
+        store.save_session(&session)?;
+        abandoned.push(session.id);
+    }
+    Ok(abandoned)
 }
 
 fn reject_unsupported_repository(state: &RepositoryState) -> Result<(), SessionError> {
@@ -689,20 +787,98 @@ fn capture_frozen_endpoint(
     Err(SessionError::UnstableRepositoryEndpoint)
 }
 
-fn install_interrupt_flag() -> Result<Arc<AtomicBool>, SessionError> {
-    let flag = Arc::new(AtomicBool::new(false));
-    #[cfg(unix)]
-    for signal in [
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGHUP,
-        signal_hook::consts::SIGQUIT,
-    ] {
-        signal_hook::flag::register(signal, Arc::clone(&flag))?;
+#[cfg(unix)]
+struct SignalForwarder {
+    interrupted: Arc<AtomicBool>,
+    child_pid: Arc<AtomicI32>,
+    handle: signal_hook::iterator::Handle,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl SignalForwarder {
+    fn install() -> Result<Self, SessionError> {
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+            signal_hook::consts::SIGHUP,
+            signal_hook::consts::SIGQUIT,
+        ])?;
+        let handle = signals.handle();
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let child_pid = Arc::new(AtomicI32::new(0));
+        let thread_interrupted = Arc::clone(&interrupted);
+        let thread_child_pid = Arc::clone(&child_pid);
+        let thread = thread::spawn(move || {
+            for signal in signals.forever() {
+                thread_interrupted.store(true, Ordering::SeqCst);
+                let raw_pid = thread_child_pid.load(Ordering::SeqCst);
+                let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
+                    continue;
+                };
+                let signal = match signal {
+                    signal_hook::consts::SIGINT => rustix::process::Signal::INT,
+                    signal_hook::consts::SIGTERM => rustix::process::Signal::TERM,
+                    signal_hook::consts::SIGHUP => rustix::process::Signal::HUP,
+                    signal_hook::consts::SIGQUIT => rustix::process::Signal::QUIT,
+                    _ => continue,
+                };
+                let _forwarded = rustix::process::kill_process(pid, signal);
+            }
+        });
+        Ok(Self {
+            interrupted,
+            child_pid,
+            handle,
+            thread: Some(thread),
+        })
     }
-    #[cfg(windows)]
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&flag))?;
-    Ok(flag)
+
+    fn set_child(&self, pid: u32) {
+        self.child_pid
+            .store(i32::try_from(pid).unwrap_or(0), Ordering::SeqCst);
+    }
+
+    fn clear_child(&self) {
+        self.child_pid.store(0, Ordering::SeqCst);
+    }
+
+    fn was_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalForwarder {
+    fn drop(&mut self) {
+        self.clear_child();
+        self.handle.close();
+        if let Some(thread) = self.thread.take() {
+            let _joined = thread.join();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct SignalForwarder {
+    interrupted: Arc<AtomicBool>,
+}
+
+#[cfg(not(unix))]
+impl SignalForwarder {
+    fn install() -> Result<Self, SessionError> {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupted))?;
+        Ok(Self { interrupted })
+    }
+
+    fn set_child(&self, _pid: u32) {}
+
+    fn clear_child(&self) {}
+
+    fn was_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::SeqCst)
+    }
 }
 
 fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>, SessionError> {
@@ -956,6 +1132,8 @@ pub enum SessionError {
     #[error(transparent)]
     Path(#[from] anchor_core::PathError),
     #[error(transparent)]
+    Platform(#[from] anchor_core::PlatformMismatch),
+    #[error(transparent)]
     Io(#[from] io::Error),
 }
 
@@ -1134,5 +1312,73 @@ mod tests {
         ));
         drop(read);
         assert!(store.acquire_store_write_lease().is_ok());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn stale_nonterminal_session_is_marked_abandoned_only_after_lock_is_free() {
+        let root = repository();
+        let result = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from("true"),
+            ],
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let mut session = store.load_session(result.session_id).unwrap();
+        session.state = SessionState::ChildRunning;
+        session.after = None;
+        session.finished_at = None;
+        store.save_session(&session).unwrap();
+
+        let active = store.acquire_active_lock().unwrap();
+        assert!(matches!(
+            RecoveryService::mark_abandoned(&store),
+            Err(SessionError::ActiveSession(_))
+        ));
+        drop(active);
+        assert_eq!(
+            RecoveryService::mark_abandoned(&store).unwrap(),
+            vec![session.id]
+        );
+        let recovered = store.load_session(session.id).unwrap();
+        assert_eq!(recovered.state, SessionState::Abandoned);
+        assert!(recovered.after.is_none());
+        assert!(recovered.failure.is_some());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn current_capture_uses_retained_session_scope() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"before").unwrap();
+        let result = SessionRunner::run(&RunRequest {
+            invocation_directory: root.path().to_path_buf(),
+            command: vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from("printf session > file"),
+            ],
+            capture_policy: CapturePolicy::default(),
+        })
+        .unwrap();
+        fs::write(root.path().join("file"), b"current").unwrap();
+        let context = GitContext::discover(root.path()).unwrap();
+        let location = context.store_location();
+        let store = SessionStore::open(location.root, location.worktree_key).unwrap();
+        let session = store.load_session(result.session_id).unwrap();
+        let after = store
+            .load_manifest(session.after.as_ref().unwrap().manifest)
+            .unwrap();
+        let current = SessionInspection::capture_current(&store, session.id).unwrap();
+        let drift = anchor_core::ManifestDiff::between(&after, &current.manifest);
+        assert_eq!(drift.changes.len(), 1);
+        assert_eq!(drift.changes[0].kind, anchor_core::ChangeKind::Modified);
     }
 }
