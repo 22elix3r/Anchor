@@ -1,10 +1,13 @@
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 
 use anchor_core::{ChangeKind, ManifestDiff, NativeRelativePath, NativeString, PathEncoding};
 use anchor_git::GitContext;
-use anchor_session::{RunRequest, Session, SessionId, SessionRunner, SessionStore};
+use anchor_session::{
+    RestoreApplyResult, RestoreService, RunRequest, Session, SessionId, SessionRunner, SessionStore,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
 use serde::Serialize;
@@ -48,6 +51,13 @@ enum Commands {
         session: String,
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
+    },
+    /// Remove one path's session-window change when it is provably safe.
+    Restore {
+        session: String,
+        /// Worktree-root-relative path to restore.
+        #[arg(long)]
+        file: PathBuf,
     },
 }
 
@@ -141,6 +151,32 @@ fn execute(cli: Cli) -> Result<i32> {
             let diff = ManifestDiff::between(&before, &after);
             print_diff(&diff, format)?;
             Ok(i32::from(!diff.is_empty()))
+        }
+        Commands::Restore { session, file } => {
+            let store = current_store()?;
+            let id = SessionId::from_str(&session)
+                .into_diagnostic()
+                .wrap_err("session ID is not a UUID")?;
+            let path = NativeRelativePath::from_host_path(&file)
+                .into_diagnostic()
+                .wrap_err("--file must be a safe worktree-root-relative path")?;
+            let result = RestoreService::restore_file(&store, id, path)
+                .into_diagnostic()
+                .wrap_err("restore was refused")?;
+            match result {
+                RestoreApplyResult::Applied { path, .. } => {
+                    println!("restored {}", display_path(&path));
+                    Ok(0)
+                }
+                RestoreApplyResult::NoChange { reason } => {
+                    println!("no change: {reason:?}");
+                    Ok(0)
+                }
+                RestoreApplyResult::Conflict { reason } => {
+                    eprintln!("conflict: {reason:?}; no filesystem change was made");
+                    Ok(4)
+                }
+            }
         }
     }
 }

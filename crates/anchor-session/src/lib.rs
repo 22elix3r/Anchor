@@ -1,5 +1,7 @@
 //! Durable session lifecycle and interactive command execution.
 
+mod restore;
+
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Write};
@@ -20,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use uuid::Uuid;
+
+pub use restore::{RestoreApplyResult, RestoreError, RestoreService};
 
 const SESSION_TAG: u64 = 0x4153_4553;
 const SESSION_SCHEMA: u16 = 1;
@@ -229,6 +233,11 @@ impl SessionStore {
         &self.objects
     }
 
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Publish and verify an immutable manifest.
     ///
     /// # Errors
@@ -358,7 +367,7 @@ impl SessionStore {
             .join(format!("{id}.cbor"))
     }
 
-    fn acquire_active_lock(&self) -> Result<ActiveLock, SessionError> {
+    pub(crate) fn acquire_active_lock(&self) -> Result<ActiveLock, SessionError> {
         let path = self
             .root
             .join("locks")
@@ -375,7 +384,7 @@ impl SessionStore {
     }
 }
 
-struct ActiveLock {
+pub(crate) struct ActiveLock {
     _file: File,
 }
 
