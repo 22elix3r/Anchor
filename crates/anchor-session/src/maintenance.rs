@@ -253,11 +253,7 @@ mod tests {
         fs::write(root.path().join("file"), b"before").unwrap();
         SessionRunner::run(&RunRequest {
             invocation_directory: root.path().to_path_buf(),
-            command: vec![
-                OsString::from("sh"),
-                OsString::from("-c"),
-                OsString::from("printf after > file"),
-            ],
+            command: change_command(),
             capture_options: CaptureOptions::default(),
         })
         .unwrap();
@@ -267,6 +263,7 @@ mod tests {
         let doctor = MaintenanceService::doctor(&store, &context).unwrap();
         assert_eq!(doctor.sessions, 1);
         assert!(doctor.objects_verified >= 2);
+        #[cfg(unix)]
         assert!(doctor.store_private);
         let gc = MaintenanceService::gc(&store, false).unwrap();
         assert_eq!(gc.objects_removed, 0);
@@ -287,5 +284,21 @@ mod tests {
         let swept = MaintenanceService::gc(&store, false).unwrap();
         assert_eq!(swept.objects_removed, 1);
         assert!(!store.objects().object_path(object).exists());
+    }
+
+    fn change_command() -> Vec<OsString> {
+        if cfg!(windows) {
+            vec![
+                OsString::from("cmd"),
+                OsString::from("/C"),
+                OsString::from("echo after>file"),
+            ]
+        } else {
+            vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from("printf after > file"),
+            ]
+        }
     }
 }
