@@ -126,6 +126,8 @@ The current mutation backend refuses restoration if repository state changed
 during the session or differs from the recorded session end. Working-tree
 restoration never writes the index. The separate `restore-index` operation
 returns a conflict without writing when post-session index drift is present.
+CLI filesystem and index mutation requires explicit `--yes`; the default exact
+restore invocation points back to the immutable session diff without writing.
 
 ## Included and excluded data
 

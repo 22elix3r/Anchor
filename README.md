@@ -38,6 +38,7 @@ Anchor is pre-release software. The implemented safety-first subset is:
 - structured three-state restoration planning;
 - bounded inverse three-way text merge with structured overlap conflicts;
 - single-path regular-file and symlink restore on Unix when safety is proven;
+- byte-verified empty-directory restore on Unix;
 - exact raw-index restore on Unix when the current index still equals the
   session-end index (split indexes are refused);
 - byte-verified rollback of interrupted schema-v3 file and index transactions;
@@ -45,9 +46,9 @@ Anchor is pre-release software. The implemented safety-first subset is:
   operation state is ambiguous;
 - storage integrity checking and reachability-based garbage collection.
 
-Not yet implemented: whole-session transactional rollback, empty-directory
-mutation, TUI-triggered restore actions, and Windows filesystem mutation. Those
-cases are refused rather than approximated.
+Not yet implemented: whole-session transactional rollback, TUI-triggered
+restore actions, and Windows filesystem mutation. Those cases are refused
+rather than approximated.
 
 ## Build
 
@@ -79,15 +80,17 @@ Restore one worktree-root-relative path:
 
 ```console
 anchor restore <session-id> --file src/main.rs
+anchor restore <session-id> --file src/main.rs --yes
 anchor restore <session-id> --file src/main.rs --merge
 anchor restore <session-id> --file src/main.rs --merge --yes \
   --expect-merged <previewed-object-id>
-anchor restore-index <session-id>
+anchor restore-index <session-id> --yes
 ```
 
 The restore either applies a byte-verified inverse, reports that no action is
 needed, or exits with a visible conflict. It does not overwrite post-session
-drift. `--merge` previews a clean, bounded inverse text merge without changing
+drift. Without `--yes`, exact restore prints the diff-review command and makes
+no change. `--merge` previews a clean, bounded inverse text merge without changing
 the worktree and prints its object ID. `--merge --yes --expect-merged <id>`
 recalculates and applies only that exact result. Overlapping edits,
 binary/opaque input, and oversized text remain conflicts.

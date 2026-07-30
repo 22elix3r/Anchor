@@ -97,15 +97,19 @@ enum Commands {
         /// Attempt a bounded inverse three-way text merge when current content drifted.
         #[arg(long)]
         merge: bool,
-        /// Apply a clean text-merge preview.
-        #[arg(long, requires_all = ["merge", "expect_merged"])]
+        /// Confirm filesystem mutation after reviewing the relevant diff.
+        #[arg(long)]
         yes: bool,
         /// Require the recalculated merge to match this previewed BLAKE3 object ID.
         #[arg(long, requires_all = ["merge", "yes"])]
         expect_merged: Option<String>,
     },
     /// Restore exact raw index bytes if no post-session index drift exists.
-    RestoreIndex { session: String },
+    RestoreIndex {
+        session: String,
+        #[arg(long, required = true)]
+        yes: bool,
+    },
     /// Verify retained sessions, manifests, objects, and repository drift.
     Doctor {
         #[arg(long, value_enum, default_value_t)]
@@ -401,6 +405,15 @@ fn execute(cli: Cli) -> Result<i32> {
             yes,
             expect_merged,
         } => {
+            if !merge && !yes {
+                eprintln!(
+                    "no change made; review `anchor diff {session}` and rerun this command with --yes"
+                );
+                return Ok(3);
+            }
+            if merge && yes && expect_merged.is_none() {
+                miette::bail!("merged restoration requires --expect-merged from a fresh preview");
+            }
             let store = current_store()?;
             let id = SessionId::from_str(&session)
                 .into_diagnostic()
@@ -471,7 +484,10 @@ fn execute(cli: Cli) -> Result<i32> {
                 }
             }
         }
-        Commands::RestoreIndex { session } => {
+        Commands::RestoreIndex { session, yes } => {
+            if !yes {
+                miette::bail!("index restoration requires --yes");
+            }
             let store = current_store()?;
             let id = SessionId::from_str(&session)
                 .into_diagnostic()

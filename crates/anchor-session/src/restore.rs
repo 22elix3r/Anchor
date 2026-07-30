@@ -166,9 +166,6 @@ impl RestoreService {
             .iter()
             .find(|entry| entry.path == selected)
             .or_else(|| base.entries().iter().find(|entry| entry.path == selected));
-        if expected.is_some_and(|entry| matches!(entry.node, ManifestNode::EmptyDirectory)) {
-            return Err(RestoreError::DirectoryUnsupported);
-        }
         let scope = SelectedScope {
             selected: selected.clone(),
             expected_kind: expected.map(|entry| node_kind(&entry.node)),
@@ -787,7 +784,9 @@ fn stage_node(
         ManifestNode::Symlink { target, .. } => {
             parent.symlink_contents(target.to_host()?, name)?;
         }
-        ManifestNode::EmptyDirectory => return Err(RestoreError::DirectoryUnsupported),
+        ManifestNode::EmptyDirectory => {
+            parent.create_dir(name)?;
+        }
     }
     Ok(())
 }
@@ -860,7 +859,13 @@ fn verify_node(
             }
             Ok(directory.read_link_contents(name)?.as_os_str() == target.to_host()?)
         }
-        ManifestNode::EmptyDirectory => Err(RestoreError::DirectoryUnsupported),
+        ManifestNode::EmptyDirectory => {
+            if !metadata.is_dir() {
+                return Ok(false);
+            }
+            let directory = directory.open_dir(name)?;
+            Ok(directory.entries()?.next().is_none())
+        }
     }
 }
 
@@ -1229,13 +1234,6 @@ fn recover_file_journal(
         .as_ref()
         .ok_or(RestoreError::IncompleteRecoveryJournal)?
         .to_entry(&journal.path);
-    if expected
-        .as_ref()
-        .or(desired.as_ref())
-        .is_some_and(|entry| matches!(entry.node, ManifestNode::EmptyDirectory))
-    {
-        return Err(RestoreError::DirectoryUnsupported);
-    }
     let host = journal.path.to_host_path()?;
     let name = host.file_name().ok_or(RestoreError::UnsafeRootPath)?;
     let parent_path = host.parent().unwrap_or_else(|| Path::new(""));
@@ -1501,8 +1499,6 @@ pub enum RestoreError {
     RepositoryDrift,
     #[error("selected path was not changed during the session")]
     PathNotChanged,
-    #[error("empty-directory restoration is not enabled in the first safe mutation backend")]
-    DirectoryUnsupported,
     #[error("split-index restoration is refused until shared-index dependencies are captured")]
     SplitIndexUnsupported,
     #[error("Git index path is unsafe")]
@@ -1878,6 +1874,24 @@ mod tests {
         let result = RestoreService::restore_file(&store, session, selected(b"added")).unwrap();
         assert!(matches!(result, RestoreApplyResult::Applied { .. }));
         assert!(!root.path().join("added").exists());
+    }
+
+    #[test]
+    fn restores_empty_directory_additions_and_deletions() {
+        let added_root = repository();
+        let (store, session) = run_change(added_root.path(), "mkdir added-empty");
+        let result =
+            RestoreService::restore_file(&store, session, selected(b"added-empty")).unwrap();
+        assert!(matches!(result, RestoreApplyResult::Applied { .. }));
+        assert!(!added_root.path().join("added-empty").exists());
+
+        let deleted_root = repository();
+        fs::create_dir(deleted_root.path().join("deleted-empty")).unwrap();
+        let (store, session) = run_change(deleted_root.path(), "rmdir deleted-empty");
+        let result =
+            RestoreService::restore_file(&store, session, selected(b"deleted-empty")).unwrap();
+        assert!(matches!(result, RestoreApplyResult::Applied { .. }));
+        assert!(deleted_root.path().join("deleted-empty").is_dir());
     }
 
     #[test]
