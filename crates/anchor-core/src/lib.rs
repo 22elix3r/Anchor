@@ -5,6 +5,7 @@ pub mod diff;
 pub mod manifest;
 pub mod object;
 pub mod path;
+pub mod restore;
 pub mod wire;
 
 pub use capture::{
@@ -18,3 +19,7 @@ pub use manifest::{
 };
 pub use object::{ObjectId, ObjectStore, StoreError};
 pub use path::{NativeRelativePath, NativeString, PathEncoding, PathError, PlatformMismatch};
+pub use restore::{
+    ConflictReason, NoChangeReason, PathRestore, RestoreConflict, RestoreOutcome, RestorePlan,
+    RestorePlanError,
+};
