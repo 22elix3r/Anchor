@@ -15,6 +15,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - run: cargo fuzz run manifest_decode -- -max_total_time=30
       - run: cargo fuzz run native_path_decode -- -max_total_time=30
