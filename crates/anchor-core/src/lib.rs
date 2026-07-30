@@ -3,6 +3,7 @@
 pub mod capture;
 pub mod diff;
 pub mod manifest;
+pub mod merge;
 pub mod object;
 pub mod path;
 pub mod restore;
@@ -16,6 +17,10 @@ pub use diff::{ChangeKind, ManifestChange, ManifestDiff};
 pub use manifest::{
     Completeness, Coverage, Manifest, ManifestEntry, ManifestError, ManifestId, ManifestNode,
     Omission, OmissionReason, SafetyObservations,
+};
+pub use merge::{
+    TextMergeConflict, TextMergeError, TextMergeLimits, TextMergeResult,
+    inverse_three_way_text_merge,
 };
 pub use object::{ObjectId, ObjectStore, StoreError};
 pub use path::{NativeRelativePath, NativeString, PathEncoding, PathError, PlatformMismatch};

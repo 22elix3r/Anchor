@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use anchor_core::ObjectStore;
 use anchor_core::{
     CaptureEngine, ConflictReason, ManifestEntry, ManifestNode, NativeRelativePath, NoChangeReason,
-    ObservedKind, RestoreOutcome, RestorePlan, ScopeClassifier, ScopeDecision, ScopeError,
+    ObjectId, ObservedKind, RestoreConflict, RestoreOutcome, RestorePlan, ScopeClassifier,
+    ScopeDecision, ScopeError, TextMergeConflict, TextMergeLimits, TextMergeResult,
+    inverse_three_way_text_merge,
 };
 use anchor_git::{GitContext, IndexCapture};
 #[cfg(unix)]
@@ -37,6 +39,15 @@ pub enum RestoreApplyResult {
     Applied {
         session_id: SessionId,
         path: NativeRelativePath,
+        merged: bool,
+    },
+    TextMergeAvailable {
+        session_id: SessionId,
+        path: NativeRelativePath,
+        current_object: ObjectId,
+        current_raw_size: u64,
+        merged_object: ObjectId,
+        merged_raw_size: u64,
     },
     NoChange {
         reason: NoChangeReason,
@@ -51,6 +62,16 @@ pub enum IndexRestoreResult {
     Applied,
     NoChange,
     Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextMergeMode {
+    #[default]
+    Disabled,
+    Preview,
+    Apply {
+        expected_object: ObjectId,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +89,25 @@ impl RestoreService {
         store: &SessionStore,
         session_id: SessionId,
         selected: NativeRelativePath,
+    ) -> Result<RestoreApplyResult, RestoreError> {
+        Self::restore_file_with_merge(store, session_id, selected, TextMergeMode::Disabled)
+    }
+
+    /// Preview or apply a conservative inverse text merge for one selected path.
+    ///
+    /// `Preview` publishes only an immutable merged object and never changes the worktree.
+    /// `Apply` uses the same evacuation, verification, and no-replace transaction as exact
+    /// restoration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RestoreError`] under the same refusal rules as [`Self::restore_file`].
+    #[allow(clippy::too_many_lines)]
+    pub fn restore_file_with_merge(
+        store: &SessionStore,
+        session_id: SessionId,
+        selected: NativeRelativePath,
+        merge_mode: TextMergeMode,
     ) -> Result<RestoreApplyResult, RestoreError> {
         let _store_lease = store.acquire_store_read_lease()?;
         let _lock = store.acquire_active_lock()?;
@@ -120,7 +160,53 @@ impl RestoreService {
                 Ok(RestoreApplyResult::NoChange { reason: *reason })
             }
             RestoreOutcome::Conflict(conflict) => Ok(RestoreApplyResult::Conflict {
-                reason: conflict.reason,
+                reason: if conflict.reason == ConflictReason::OpaqueContentDrifted
+                    && merge_mode != TextMergeMode::Disabled
+                {
+                    let merged = merge_regular_conflict(conflict, store)?;
+                    match merged {
+                        MergeResolution::Clean(candidate) => {
+                            if merge_mode == TextMergeMode::Preview {
+                                return Ok(RestoreApplyResult::TextMergeAvailable {
+                                    session_id,
+                                    path: selected,
+                                    current_object: candidate.current_object,
+                                    current_raw_size: candidate.current_raw_size,
+                                    merged_object: candidate.merged_object,
+                                    merged_raw_size: candidate.merged_raw_size,
+                                });
+                            }
+                            if let TextMergeMode::Apply { expected_object } = merge_mode
+                                && candidate.merged_object != expected_object
+                            {
+                                return Err(RestoreError::MergePreviewChanged {
+                                    expected: expected_object,
+                                    actual: candidate.merged_object,
+                                });
+                            }
+                            let current_entry = current
+                                .entries()
+                                .iter()
+                                .find(|entry| entry.path == selected);
+                            apply_one(
+                                store,
+                                session_id,
+                                &worktree,
+                                &selected,
+                                current_entry,
+                                Some(&candidate.desired),
+                            )?;
+                            return Ok(RestoreApplyResult::Applied {
+                                session_id,
+                                path: selected,
+                                merged: true,
+                            });
+                        }
+                        MergeResolution::Conflict(reason) => reason,
+                    }
+                } else {
+                    conflict.reason
+                },
             }),
             RestoreOutcome::Write(desired) => {
                 let current_entry = current
@@ -138,6 +224,7 @@ impl RestoreService {
                 Ok(RestoreApplyResult::Applied {
                     session_id,
                     path: selected,
+                    merged: false,
                 })
             }
         }
@@ -196,6 +283,102 @@ impl RestoreService {
             &session.before.index,
         )?;
         Ok(IndexRestoreResult::Applied)
+    }
+}
+
+struct MergeCandidate {
+    desired: ManifestEntry,
+    current_object: ObjectId,
+    current_raw_size: u64,
+    merged_object: ObjectId,
+    merged_raw_size: u64,
+}
+
+enum MergeResolution {
+    Clean(MergeCandidate),
+    Conflict(ConflictReason),
+}
+
+fn merge_regular_conflict(
+    conflict: &RestoreConflict,
+    store: &SessionStore,
+) -> Result<MergeResolution, RestoreError> {
+    let (Some(base), Some(session), Some(current)) =
+        (&conflict.base, &conflict.session, &conflict.current)
+    else {
+        return Ok(MergeResolution::Conflict(
+            ConflictReason::TextMergeUnsupported,
+        ));
+    };
+    let (
+        ManifestNode::Regular {
+            object: base_object,
+            raw_size: base_size,
+            unix_exec_bits: base_mode,
+        },
+        ManifestNode::Regular {
+            object: session_object,
+            raw_size: session_size,
+            unix_exec_bits: session_mode,
+        },
+        ManifestNode::Regular {
+            object: current_object,
+            raw_size: current_size,
+            unix_exec_bits: current_mode,
+        },
+    ) = (&base.node, &session.node, &current.node)
+    else {
+        return Ok(MergeResolution::Conflict(
+            ConflictReason::TextMergeUnsupported,
+        ));
+    };
+    let Some(desired_mode) = inverse_scalar(*base_mode, *session_mode, *current_mode) else {
+        return Ok(MergeResolution::Conflict(ConflictReason::ModeDrifted));
+    };
+    let limits = TextMergeLimits::default();
+    let base_bytes = store.objects().get(*base_object, *base_size)?;
+    let session_bytes = store.objects().get(*session_object, *session_size)?;
+    let current_bytes = store.objects().get(*current_object, *current_size)?;
+    match inverse_three_way_text_merge(&base_bytes, &session_bytes, &current_bytes, limits)? {
+        TextMergeResult::Clean(bytes) => {
+            let merged_raw_size =
+                u64::try_from(bytes.len()).map_err(|_| RestoreError::MergedFileTooLarge)?;
+            let merged_object = store.objects().put_bytes(&bytes)?;
+            Ok(MergeResolution::Clean(MergeCandidate {
+                desired: ManifestEntry {
+                    path: current.path.clone(),
+                    node: ManifestNode::Regular {
+                        object: merged_object,
+                        raw_size: merged_raw_size,
+                        unix_exec_bits: desired_mode,
+                    },
+                    safety: current.safety.clone(),
+                },
+                current_object: *current_object,
+                current_raw_size: *current_size,
+                merged_object,
+                merged_raw_size,
+            }))
+        }
+        TextMergeResult::Conflict(reason) => Ok(MergeResolution::Conflict(match reason {
+            TextMergeConflict::OverlappingEdits => ConflictReason::TextMergeOverlaps,
+            TextMergeConflict::InputTooLarge | TextMergeConflict::OutputTooLarge => {
+                ConflictReason::TextMergeTooLarge
+            }
+            TextMergeConflict::NotUtf8 | TextMergeConflict::ContainsNul => {
+                ConflictReason::TextMergeUnsupported
+            }
+        })),
+    }
+}
+
+fn inverse_scalar<T: Copy + Eq>(base: T, session: T, current: T) -> Option<T> {
+    if base == session || current == base {
+        Some(current)
+    } else if current == session {
+        Some(base)
+    } else {
+        None
     }
 }
 
@@ -840,6 +1023,15 @@ pub enum RestoreError {
     RollbackFailed(io::Error),
     #[error("installed path failed byte-for-byte verification")]
     VerificationFailed,
+    #[error("merged file length cannot be represented safely")]
+    MergedFileTooLarge,
+    #[error(
+        "clean merge changed since preview (expected {expected}, recalculated {actual}); review again"
+    )]
+    MergePreviewChanged {
+        expected: ObjectId,
+        actual: ObjectId,
+    },
     #[error("restore journal encoding failed: {0}")]
     Journal(String),
     #[error("restore journal exceeds its size limit: {0}")]
@@ -865,6 +1057,8 @@ pub enum RestoreError {
     Path(#[from] anchor_core::PlatformMismatch),
     #[error(transparent)]
     Store(#[from] anchor_core::StoreError),
+    #[error(transparent)]
+    TextMerge(#[from] anchor_core::TextMergeError),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -952,6 +1146,111 @@ mod tests {
             }
         );
         assert_eq!(fs::read(root.path().join("file")).unwrap(), b"post-session");
+    }
+
+    #[test]
+    fn previews_then_applies_a_clean_inverse_text_merge() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"one\nbase\ntail\n").unwrap();
+        let (store, session) = run_change(root.path(), "printf 'one\\nsession\\ntail\\n' > file");
+        fs::write(root.path().join("file"), b"current\nsession\ntail\n").unwrap();
+
+        let preview = RestoreService::restore_file_with_merge(
+            &store,
+            session,
+            selected(b"file"),
+            TextMergeMode::Preview,
+        )
+        .unwrap();
+        assert!(matches!(
+            preview,
+            RestoreApplyResult::TextMergeAvailable { .. }
+        ));
+        assert_eq!(
+            fs::read(root.path().join("file")).unwrap(),
+            b"current\nsession\ntail\n"
+        );
+        let RestoreApplyResult::TextMergeAvailable { merged_object, .. } = preview else {
+            unreachable!("preview variant was asserted above");
+        };
+
+        let applied = RestoreService::restore_file_with_merge(
+            &store,
+            session,
+            selected(b"file"),
+            TextMergeMode::Apply {
+                expected_object: merged_object,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            applied,
+            RestoreApplyResult::Applied { merged: true, .. }
+        ));
+        assert_eq!(
+            fs::read(root.path().join("file")).unwrap(),
+            b"current\nbase\ntail\n"
+        );
+    }
+
+    #[test]
+    fn overlapping_text_edits_remain_a_structured_conflict() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"base\n").unwrap();
+        let (store, session) = run_change(root.path(), "printf 'session\\n' > file");
+        fs::write(root.path().join("file"), b"post-session\n").unwrap();
+
+        let result = RestoreService::restore_file_with_merge(
+            &store,
+            session,
+            selected(b"file"),
+            TextMergeMode::Preview,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            RestoreApplyResult::Conflict {
+                reason: ConflictReason::TextMergeOverlaps
+            }
+        );
+        assert_eq!(
+            fs::read(root.path().join("file")).unwrap(),
+            b"post-session\n"
+        );
+    }
+
+    #[test]
+    fn refuses_when_clean_merge_changed_after_preview() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"one\nbase\ntail\n").unwrap();
+        let (store, session) = run_change(root.path(), "printf 'one\\nsession\\ntail\\n' > file");
+        fs::write(root.path().join("file"), b"current\nsession\ntail\n").unwrap();
+        let preview = RestoreService::restore_file_with_merge(
+            &store,
+            session,
+            selected(b"file"),
+            TextMergeMode::Preview,
+        )
+        .unwrap();
+        let RestoreApplyResult::TextMergeAvailable { merged_object, .. } = preview else {
+            unreachable!("expected a clean merge preview");
+        };
+        fs::write(root.path().join("file"), b"newer-current\nsession\ntail\n").unwrap();
+
+        let error = RestoreService::restore_file_with_merge(
+            &store,
+            session,
+            selected(b"file"),
+            TextMergeMode::Apply {
+                expected_object: merged_object,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, RestoreError::MergePreviewChanged { .. }));
+        assert_eq!(
+            fs::read(root.path().join("file")).unwrap(),
+            b"newer-current\nsession\ntail\n"
+        );
     }
 
     #[test]

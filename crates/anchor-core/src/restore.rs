@@ -114,6 +114,9 @@ pub enum ConflictReason {
     SymlinkTargetDrifted,
     TypeDrifted,
     ModeDrifted,
+    TextMergeOverlaps,
+    TextMergeUnsupported,
+    TextMergeTooLarge,
 }
 
 fn decide(

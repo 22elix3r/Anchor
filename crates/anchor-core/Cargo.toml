@@ -13,6 +13,7 @@ authors.workspace = true
 blake3.workspace = true
 cap-std.workspace = true
 ciborium.workspace = true
+imara-diff.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 tempfile.workspace = true

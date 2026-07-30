@@ -35,7 +35,9 @@ pub use config::{
 pub use maintenance::{
     DoctorReport, GarbageCollectionReport, MaintenanceError, MaintenanceService,
 };
-pub use restore::{IndexRestoreResult, RestoreApplyResult, RestoreError, RestoreService};
+pub use restore::{
+    IndexRestoreResult, RestoreApplyResult, RestoreError, RestoreService, TextMergeMode,
+};
 
 const SESSION_TAG: u64 = 0x4153_4553;
 const SESSION_SCHEMA: u16 = 2;
@@ -366,7 +368,7 @@ impl SessionStore {
         let file = self.open_store_lock()?;
         fs4::FileExt::try_lock_shared(&file)
             .map_err(|error| SessionError::StoreBusy(error.to_string()))?;
-        Ok(StoreLease { _file: file })
+        Ok(StoreLease { file })
     }
 
     pub(crate) fn list_all_sessions(&self) -> Result<Vec<Session>, SessionError> {
@@ -439,14 +441,17 @@ impl SessionStore {
             .open(&path)?;
         fs4::FileExt::try_lock(&file)
             .map_err(|error| SessionError::ActiveSession(error.to_string()))?;
-        Ok(ActiveLock { file })
+        Ok(ActiveLock {
+            file,
+            unlock_on_drop: true,
+        })
     }
 
     pub(crate) fn acquire_store_write_lease(&self) -> Result<StoreLease, SessionError> {
         let file = self.open_store_lock()?;
         fs4::FileExt::try_lock(&file)
             .map_err(|error| SessionError::StoreBusy(error.to_string()))?;
-        Ok(StoreLease { _file: file })
+        Ok(StoreLease { file })
     }
 
     fn open_store_lock(&self) -> Result<File, SessionError> {
@@ -462,7 +467,13 @@ impl SessionStore {
 /// RAII lease preventing common-store garbage collection.
 #[derive(Debug)]
 pub struct StoreLease {
-    _file: File,
+    file: File,
+}
+
+impl Drop for StoreLease {
+    fn drop(&mut self) {
+        let _unlocked = fs4::FileExt::unlock(&self.file);
+    }
 }
 
 #[derive(Debug)]
@@ -537,6 +548,7 @@ impl RecoveryService {
 
 pub(crate) struct ActiveLock {
     file: File,
+    unlock_on_drop: bool,
 }
 
 impl ActiveLock {
@@ -553,6 +565,18 @@ impl ActiveLock {
     #[cfg(not(unix))]
     fn preserve_for_child(&self, _command: &mut Command) -> Result<(), SessionError> {
         Ok(())
+    }
+
+    fn retain_for_spawned_child(&mut self) {
+        self.unlock_on_drop = false;
+    }
+}
+
+impl Drop for ActiveLock {
+    fn drop(&mut self) {
+        if self.unlock_on_drop {
+            let _unlocked = fs4::FileExt::unlock(&self.file);
+        }
     }
 }
 
@@ -583,7 +607,7 @@ impl SessionRunner {
             let location = before_context.store_location();
             let store = SessionStore::open(&location.root, location.worktree_key)?;
             let _store_lease = store.acquire_store_read_lease()?;
-            let active_lock = store.acquire_active_lock()?;
+            let mut active_lock = store.acquire_active_lock()?;
             restore::ensure_no_unresolved_transactions(store.root())
                 .map_err(|error| SessionError::TransactionState(error.to_string()))?;
             mark_abandoned_locked(&store)?;
@@ -648,7 +672,10 @@ impl SessionRunner {
             let spawn_result = command.spawn();
             drop(command);
             let mut child = match spawn_result {
-                Ok(child) => child,
+                Ok(child) => {
+                    active_lock.retain_for_spawned_child();
+                    child
+                }
                 Err(error) => {
                     session.state = SessionState::LaunchFailed;
                     session.failure = Some(error.to_string());
@@ -1286,11 +1313,12 @@ mod tests {
     fn child_inherits_worktree_lock_after_parent_handle_closes() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::open(root.path(), "worktree").unwrap();
-        let lock = store.acquire_active_lock().unwrap();
+        let mut lock = store.acquire_active_lock().unwrap();
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 0.2"]);
         lock.preserve_for_child(&mut command).unwrap();
         let mut child = command.spawn().unwrap();
+        lock.retain_for_spawned_child();
         drop(command);
         drop(lock);
         assert!(matches!(

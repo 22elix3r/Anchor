@@ -36,6 +36,7 @@ dependencies = [
  "blake3",
  "cap-std",
  "ciborium",
+ "gix-imara-diff",
  "proptest",
  "serde",
  "serde_bytes",

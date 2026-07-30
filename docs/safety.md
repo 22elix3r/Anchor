@@ -61,6 +61,16 @@ the executable bits, Anchor can invert them while retaining later content. It
 does not preserve ownership, timestamps, ACLs, extended attributes, or general
 permission bits.
 
+For a regular text file whose current bytes differ from both endpoints,
+`--merge` may calculate an inverse three-way merge with `session end` as the
+ancestor, `base` as the inverse side, and `current` as the post-session side.
+Only valid UTF-8, NUL-free inputs up to 8 MiB each are considered. Different
+line edits must not overlap, and output is capped at 16 MiB. A clean result is
+shown as `current → merged` and is not installed until `--yes` is supplied.
+Confirmation also supplies the previewed BLAKE3 object ID; Anchor recalculates
+under the worktree lock and refuses if the result changed. Anchor returns a
+structured conflict instead of writing conflict markers.
+
 ## Capture consistency
 
 Anchor does not claim a globally atomic filesystem snapshot. For each regular
@@ -146,7 +156,7 @@ Manifests and sessions are treated as untrusted:
 - no process-level or prompt-level attribution;
 - no globally atomic snapshot;
 - no atomic multi-file restore;
-- no automatic three-way text merge;
+- no speculative binary merge or conflict-marker-only text merge;
 - no split-index restoration or Git history restoration;
 - no recursive dirty-submodule capture or restoration;
 - no preservation of hard-link topology, ACLs, xattrs, ownership, or timestamps;

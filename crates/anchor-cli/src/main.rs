@@ -5,13 +5,13 @@ use std::str::FromStr;
 
 use anchor_core::{
     ChangeKind, ManifestChange, ManifestDiff, ManifestNode, NativeRelativePath, NativeString,
-    ObjectStore, PathEncoding,
+    ObjectId, ObjectStore, PathEncoding,
 };
 use anchor_git::GitContext;
 use anchor_session::{
     CapturePolicy, ConfigLoader, IndexRestoreResult, MaintenanceService, PolicyOverrides,
     RecoveryService, RestoreApplyResult, RestoreService, RunRequest, Session, SessionId,
-    SessionInspection, SessionRunner, SessionStore,
+    SessionInspection, SessionRunner, SessionStore, TextMergeMode,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
@@ -89,6 +89,15 @@ enum Commands {
         /// Worktree-root-relative path to restore.
         #[arg(long)]
         file: PathBuf,
+        /// Attempt a bounded inverse three-way text merge when current content drifted.
+        #[arg(long)]
+        merge: bool,
+        /// Apply a clean text-merge preview.
+        #[arg(long, requires_all = ["merge", "expect_merged"])]
+        yes: bool,
+        /// Require the recalculated merge to match this previewed BLAKE3 object ID.
+        #[arg(long, requires_all = ["merge", "yes"])]
+        expect_merged: Option<String>,
     },
     /// Restore exact raw index bytes if no post-session index drift exists.
     RestoreIndex { session: String },
@@ -345,7 +354,13 @@ fn execute(cli: Cli) -> Result<i32> {
                 .wrap_err("terminal review failed")?;
             Ok(0)
         }
-        Commands::Restore { session, file } => {
+        Commands::Restore {
+            session,
+            file,
+            merge,
+            yes,
+            expect_merged,
+        } => {
             let store = current_store()?;
             let id = SessionId::from_str(&session)
                 .into_diagnostic()
@@ -353,13 +368,58 @@ fn execute(cli: Cli) -> Result<i32> {
             let path = NativeRelativePath::from_host_path(&file)
                 .into_diagnostic()
                 .wrap_err("--file must be a safe worktree-root-relative path")?;
-            let result = RestoreService::restore_file(&store, id, path)
+            let merge_mode = if !merge {
+                TextMergeMode::Disabled
+            } else if yes {
+                let expected = ObjectId::from_hex(
+                    expect_merged
+                        .as_deref()
+                        .ok_or_else(|| miette::miette!("--yes requires --expect-merged"))?,
+                )
+                .into_diagnostic()
+                .wrap_err("--expect-merged is not a BLAKE3 object ID")?;
+                TextMergeMode::Apply {
+                    expected_object: expected,
+                }
+            } else {
+                TextMergeMode::Preview
+            };
+            let result = RestoreService::restore_file_with_merge(&store, id, path, merge_mode)
                 .into_diagnostic()
                 .wrap_err("restore was refused")?;
             match result {
                 RestoreApplyResult::Applied { path, .. } => {
                     println!("restored {}", display_path(&path));
                     Ok(0)
+                }
+                RestoreApplyResult::TextMergeAvailable {
+                    path,
+                    current_object,
+                    current_raw_size,
+                    merged_object,
+                    merged_raw_size,
+                    ..
+                } => {
+                    let current = store
+                        .objects()
+                        .get(current_object, current_raw_size)
+                        .into_diagnostic()
+                        .wrap_err("cannot load current merge input")?;
+                    let merged = store
+                        .objects()
+                        .get(merged_object, merged_raw_size)
+                        .into_diagnostic()
+                        .wrap_err("cannot load merged preview")?;
+                    print_text_pair(
+                        &current,
+                        &merged,
+                        &format!("current/{}", display_path(&path)),
+                        &format!("merged/{}", display_path(&path)),
+                    );
+                    eprintln!(
+                        "clean merge preview only; rerun with --merge --yes --expect-merged {merged_object} to apply this exact result"
+                    );
+                    Ok(3)
                 }
                 RestoreApplyResult::NoChange { reason } => {
                     println!("no change: {reason:?}");
@@ -690,6 +750,29 @@ fn print_content_diff(change: &ManifestChange, objects: &ObjectStore) -> Result<
         }
     }
     Ok(())
+}
+
+fn print_text_pair(before: &[u8], after: &[u8], before_label: &str, after_label: &str) {
+    let (Ok(before), Ok(after)) = (std::str::from_utf8(before), std::str::from_utf8(after)) else {
+        println!("Binary or opaque content differs");
+        return;
+    };
+    let input = imara_diff::InternedInput::new(before, after);
+    let mut content_diff = imara_diff::Diff::compute(imara_diff::Algorithm::Histogram, &input);
+    content_diff.postprocess_lines(&input);
+    let rendered = content_diff
+        .unified_diff(
+            &imara_diff::BasicLineDiffPrinter(&input.interner),
+            imara_diff::UnifiedDiffConfig::default(),
+            &input,
+        )
+        .to_string();
+    println!("--- {before_label}");
+    println!("+++ {after_label}");
+    print!("{}", sanitize_diff_text(&rendered));
+    if !rendered.ends_with('\n') {
+        println!();
+    }
 }
 
 fn review_model(

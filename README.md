@@ -36,6 +36,7 @@ Anchor is pre-release software. The implemented safety-first subset is:
 - bounded, control-character-sanitized unified text diffs;
 - a read-only side-by-side terminal reviewer with narrow-layout fallback;
 - structured three-state restoration planning;
+- bounded inverse three-way text merge with structured overlap conflicts;
 - single-path regular-file and symlink restore on Unix when safety is proven;
 - exact raw-index restore on Unix when the current index still equals the
   session-end index (split indexes are refused);
@@ -43,10 +44,9 @@ Anchor is pre-release software. The implemented safety-first subset is:
   operation state is ambiguous;
 - storage integrity checking and reachability-based garbage collection.
 
-Not yet implemented: automatic text three-way merge, whole-session transactional
-rollback, crash-journal recovery commands, empty-directory
-mutation, TUI-triggered restore actions, and Windows filesystem mutation. Those cases
-are refused rather than approximated.
+Not yet implemented: whole-session transactional rollback, crash-journal
+recovery commands, empty-directory mutation, TUI-triggered restore actions, and
+Windows filesystem mutation. Those cases are refused rather than approximated.
 
 ## Build
 
@@ -78,12 +78,18 @@ Restore one worktree-root-relative path:
 
 ```console
 anchor restore <session-id> --file src/main.rs
+anchor restore <session-id> --file src/main.rs --merge
+anchor restore <session-id> --file src/main.rs --merge --yes \
+  --expect-merged <previewed-object-id>
 anchor restore-index <session-id>
 ```
 
 The restore either applies a byte-verified inverse, reports that no action is
 needed, or exits with a visible conflict. It does not overwrite post-session
-drift.
+drift. `--merge` previews a clean, bounded inverse text merge without changing
+the worktree and prints its object ID. `--merge --yes --expect-merged <id>`
+recalculates and applies only that exact result. Overlapping edits,
+binary/opaque input, and oversized text remain conflicts.
 
 Verify retained data and preview garbage collection:
 
