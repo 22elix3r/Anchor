@@ -22,6 +22,7 @@ dependencies = [
  "anchor-git",
  "anchor-session",
  "clap",
+ "gix-imara-diff",
  "miette",
  "serde",
  "serde_json",
@@ -983,6 +984,16 @@ dependencies = [
  "gix-path",
  "gix-trace",
  "unicode-bom",
+]
+
+[[package]]
+name = "gix-imara-diff"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a791e6620676a875f362f3156ed213e73ca099a09bf992c18812abe65cc37b1"
+dependencies = [
+ "bstr",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]

@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 
-use anchor_core::{ChangeKind, ManifestDiff, NativeRelativePath, NativeString, PathEncoding};
+use anchor_core::{
+    ChangeKind, ManifestChange, ManifestDiff, ManifestNode, NativeRelativePath, NativeString,
+    ObjectStore, PathEncoding,
+};
 use anchor_git::GitContext;
 use anchor_session::{
     IndexRestoreResult, MaintenanceService, RestoreApplyResult, RestoreService, RunRequest,
@@ -165,7 +168,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 .into_diagnostic()
                 .wrap_err("cannot load after manifest")?;
             let diff = ManifestDiff::between(&before, &after);
-            print_diff(&diff, format)?;
+            print_diff(&diff, format, store.objects())?;
             Ok(i32::from(!diff.is_empty()))
         }
         Commands::Restore { session, file } => {
@@ -341,7 +344,7 @@ fn print_sessions(sessions: &[Session], format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn print_diff(diff: &ManifestDiff, format: OutputFormat) -> Result<()> {
+fn print_diff(diff: &ManifestDiff, format: OutputFormat, objects: &ObjectStore) -> Result<()> {
     if format == OutputFormat::Json {
         let changes = diff
             .changes
@@ -375,6 +378,7 @@ fn print_diff(diff: &ManifestDiff, format: OutputFormat) -> Result<()> {
                 display_path(&change.path)
             );
         }
+        print_content_diff(change, objects)?;
     }
     Ok(())
 }
@@ -382,15 +386,121 @@ fn print_diff(diff: &ManifestDiff, format: OutputFormat) -> Result<()> {
 fn display_native(value: &NativeString) -> String {
     value.to_host().map_or_else(
         |_| "<foreign-native-string>".to_owned(),
-        |value| value.to_string_lossy().into(),
+        |value| escape_display(&value.to_string_lossy()),
     )
 }
 
 fn display_path(path: &NativeRelativePath) -> String {
-    path.to_host_path().map_or_else(
-        |_| "<foreign-path>".to_owned(),
-        |value| value.to_string_lossy().into(),
-    )
+    match path.encoding() {
+        PathEncoding::UnixBytes => path
+            .components()
+            .iter()
+            .map(|component| escape_bytes(component))
+            .collect::<Vec<_>>()
+            .join("/"),
+        PathEncoding::WindowsWtf16Le => path.to_host_path().map_or_else(
+            |_| "<foreign-path>".to_owned(),
+            |value| escape_display(&value.to_string_lossy()),
+        ),
+    }
+}
+
+fn print_content_diff(change: &ManifestChange, objects: &ObjectStore) -> Result<()> {
+    const MAX_TEXT_DIFF_BYTES: u64 = 8 * 1024 * 1024;
+    if change.kind == ChangeKind::Renamed || change.kind == ChangeKind::ModeChanged {
+        return Ok(());
+    }
+    let before = load_regular(change.before.as_ref(), objects, MAX_TEXT_DIFF_BYTES)?;
+    let after = load_regular(change.after.as_ref(), objects, MAX_TEXT_DIFF_BYTES)?;
+    let (Some(before), Some(after)) = (before, after) else {
+        return Ok(());
+    };
+    if before.iter().chain(&after).any(|byte| *byte == 0)
+        || std::str::from_utf8(&before).is_err()
+        || std::str::from_utf8(&after).is_err()
+    {
+        println!("  Binary or opaque content differs");
+        return Ok(());
+    }
+    let before = std::str::from_utf8(&before).expect("validated above");
+    let after = std::str::from_utf8(&after).expect("validated above");
+    let input = imara_diff::InternedInput::new(before, after);
+    let mut content_diff = imara_diff::Diff::compute(imara_diff::Algorithm::Histogram, &input);
+    content_diff.postprocess_lines(&input);
+    let rendered = content_diff
+        .unified_diff(
+            &imara_diff::BasicLineDiffPrinter(&input.interner),
+            imara_diff::UnifiedDiffConfig::default(),
+            &input,
+        )
+        .to_string();
+    if !rendered.is_empty() {
+        println!("--- before/{}", display_path(&change.path));
+        println!("+++ session/{}", display_path(&change.path));
+        print!("{}", sanitize_diff_text(&rendered));
+        if !rendered.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+fn load_regular(
+    entry: Option<&anchor_core::ManifestEntry>,
+    objects: &ObjectStore,
+    maximum: u64,
+) -> Result<Option<Vec<u8>>> {
+    let Some(entry) = entry else {
+        return Ok(Some(Vec::new()));
+    };
+    let ManifestNode::Regular {
+        object, raw_size, ..
+    } = entry.node
+    else {
+        return Ok(None);
+    };
+    if raw_size > maximum {
+        return Ok(None);
+    }
+    objects
+        .get(object, raw_size)
+        .map(Some)
+        .into_diagnostic()
+        .wrap_err("cannot read diff object")
+}
+
+fn sanitize_diff_text(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '\n' | '\t' => character.to_string().chars().collect::<Vec<_>>(),
+            character if character.is_control() => character
+                .escape_default()
+                .collect::<String>()
+                .chars()
+                .collect(),
+            character => vec![character],
+        })
+        .collect()
+}
+
+fn escape_display(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::escape_default)
+        .collect::<String>()
+}
+
+fn escape_bytes(value: &[u8]) -> String {
+    value.iter().fold(String::new(), |mut output, byte| {
+        use std::fmt::Write as _;
+        match byte {
+            b' '..=b'~' if *byte != b'\\' => output.push(char::from(*byte)),
+            b'\\' => output.push_str("\\\\"),
+            _ => write!(output, "\\x{byte:02x}").expect("writing to a string cannot fail"),
+        }
+        output
+    })
 }
 
 fn change_symbol(kind: ChangeKind) -> &'static str {
