@@ -33,6 +33,7 @@ dependencies = [
 name = "anchor-core"
 version = "0.1.0"
 dependencies = [
+ "anchor-windows",
  "blake3",
  "cap-std",
  "ciborium",

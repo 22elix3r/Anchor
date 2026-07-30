@@ -1,10 +1,15 @@
+#[cfg(not(windows))]
 use std::collections::HashMap;
+#[cfg(not(windows))]
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 
+#[cfg(not(windows))]
 use cap_std::ambient_authority;
+#[cfg(not(windows))]
 use cap_std::fs::{Dir, FileType, Metadata};
+#[cfg(not(windows))]
 use cap_std::time::SystemTime;
 use thiserror::Error;
 
@@ -16,6 +21,10 @@ use crate::{
 
 const FILE_STABILITY_RETRIES: usize = 3;
 const NAMESPACE_RETRIES: usize = 2;
+
+#[cfg(windows)]
+#[path = "capture_windows.rs"]
+mod windows;
 
 /// The file type observed before applying an inclusion policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +140,22 @@ impl<'store> CaptureEngine<'store> {
         root: &Path,
         classifier: &impl ScopeClassifier,
     ) -> Result<CaptureResult, CaptureError> {
+        #[cfg(windows)]
+        {
+            windows::capture(self, root, classifier)
+        }
+        #[cfg(not(windows))]
+        {
+            self.capture_capability(root, classifier)
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn capture_capability(
+        &self,
+        root: &Path,
+        classifier: &impl ScopeClassifier,
+    ) -> Result<CaptureResult, CaptureError> {
         let root_dir = Dir::open_ambient_dir(root, ambient_authority())
             .map_err(|source| CaptureError::Root { source })?;
         let root_metadata = root_dir
@@ -188,6 +213,7 @@ impl<'store> CaptureEngine<'store> {
     }
 }
 
+#[cfg(not(windows))]
 struct CaptureAttempt<'store, 'classifier, C> {
     store: &'store ObjectStore,
     options: CaptureOptions,
@@ -200,6 +226,7 @@ struct CaptureAttempt<'store, 'classifier, C> {
     root_device: Option<u64>,
 }
 
+#[cfg(not(windows))]
 impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
     fn capture_directory(
         &mut self,
@@ -467,6 +494,7 @@ impl<C: ScopeClassifier> CaptureAttempt<'_, '_, C> {
     }
 }
 
+#[cfg(not(windows))]
 fn read_sorted_names(
     directory: &Dir,
     path: &NativeRelativePath,
@@ -493,6 +521,7 @@ fn read_sorted_names(
     Ok(names)
 }
 
+#[cfg(not(windows))]
 fn observed_kind(file_type: FileType) -> ObservedKind {
     if file_type.is_file() {
         ObservedKind::Regular
@@ -506,11 +535,13 @@ fn observed_kind(file_type: FileType) -> ObservedKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg(not(windows))]
 struct FileIdentity {
     first: u64,
     second: u64,
 }
 
+#[cfg(not(windows))]
 fn stable_file(
     before: &Metadata,
     opened: &Metadata,
@@ -529,6 +560,7 @@ fn stable_file(
         && same_fingerprint(before, after_path)
 }
 
+#[cfg(not(windows))]
 fn same_fingerprint(left: &Metadata, right: &Metadata) -> bool {
     left.len() == right.len()
         && left.file_type() == right.file_type()
@@ -537,6 +569,7 @@ fn same_fingerprint(left: &Metadata, right: &Metadata) -> bool {
         && execute_bits(left) == execute_bits(right)
 }
 
+#[cfg(not(windows))]
 fn modified(metadata: &Metadata) -> Option<SystemTime> {
     metadata.modified().ok()
 }
@@ -547,7 +580,7 @@ fn same_identity(left: &Metadata, right: &Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn same_identity(left: &Metadata, right: &Metadata) -> bool {
     same_fingerprint(left, right)
 }
@@ -559,7 +592,7 @@ fn change_time(metadata: &Metadata) -> Option<(i64, i64)> {
     Some((metadata.ctime(), metadata.ctime_nsec()))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn change_time(_metadata: &Metadata) -> Option<(i64, i64)> {
     None
 }
@@ -576,7 +609,7 @@ fn execute_bits(metadata: &Metadata) -> Option<u8> {
     )
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn execute_bits(_metadata: &Metadata) -> Option<u8> {
     None
 }
@@ -588,7 +621,7 @@ fn device_id(metadata: &Metadata) -> Option<u64> {
     Some(metadata.dev())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn device_id(_metadata: &Metadata) -> Option<u64> {
     None
 }
@@ -602,7 +635,7 @@ fn hardlink_identity(metadata: &Metadata) -> Option<FileIdentity> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn hardlink_identity(_metadata: &Metadata) -> Option<FileIdentity> {
     None
 }
@@ -613,7 +646,7 @@ fn link_count(metadata: &Metadata) -> u64 {
     metadata.nlink()
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn link_count(_metadata: &Metadata) -> u64 {
     1
 }
@@ -656,6 +689,9 @@ pub enum CaptureError {
     Manifest(#[from] ManifestError),
     #[error(transparent)]
     Scope(#[from] ScopeError),
+    #[cfg(windows)]
+    #[error(transparent)]
+    Windows(#[from] anchor_windows::WindowsError),
 }
 
 #[cfg(test)]

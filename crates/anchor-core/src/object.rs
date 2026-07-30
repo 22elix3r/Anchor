@@ -366,6 +366,7 @@ fn create_private_dir(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+#[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
 fn sync_directory(path: &Path) -> Result<(), StoreError> {
     #[cfg(unix)]
     {

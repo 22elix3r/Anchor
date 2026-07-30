@@ -11,13 +11,14 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
-    FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo,
-    FileStreamInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OPEN_EXISTING,
-    VOLUME_NAME_DOS,
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_OFFLINE,
+    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FileAttributeTagInfo, FileBasicInfo, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo,
+    FileIdInfo, FileStandardInfo, FileStreamInfo, GetFileInformationByHandleEx,
+    GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
@@ -59,6 +60,36 @@ pub struct NodeMetadata {
     pub creation_time: i64,
     pub last_write_time: i64,
     pub change_time: i64,
+}
+
+impl NodeMetadata {
+    /// Whether the node carries the Windows read-only attribute.
+    #[must_use]
+    pub const fn is_readonly(self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_READONLY != 0
+    }
+
+    /// Whether the node is a directory according to its file attributes.
+    #[must_use]
+    pub const fn has_directory_attribute(self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+
+    /// Whether reading the node may recall externally tiered data.
+    #[must_use]
+    pub const fn may_recall_data(self) -> bool {
+        self.attributes
+            & (FILE_ATTRIBUTE_OFFLINE
+                | FILE_ATTRIBUTE_RECALL_ON_OPEN
+                | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+            != 0
+    }
+
+    /// Whether the node is encrypted by EFS.
+    #[must_use]
+    pub const fn is_efs_encrypted(self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_ENCRYPTED != 0
+    }
 }
 
 /// One entry returned by handle-based directory enumeration.
@@ -264,13 +295,30 @@ impl NodeHandle {
         metadata(&self.handle)
     }
 
+    /// Clone an ordinary file handle for streaming reads while retaining the pinned identity
+    /// handle for the post-read verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-files or when the operating system cannot duplicate the handle.
+    pub fn try_clone_file(&self) -> Result<File, WindowsError> {
+        if self.metadata.kind != NodeKind::RegularFile {
+            return Err(WindowsError::Malformed("regular file handle"));
+        }
+        let cloned = self.handle.try_clone().map_err(|source| WindowsError::Io {
+            operation: "DuplicateHandle",
+            source,
+        })?;
+        Ok(File::from(cloned))
+    }
+
     /// Reopen the node by its current name and require the same identity.
     ///
     /// # Errors
     ///
     /// Returns `IdentityChanged` when the path no longer resolves to this node.
     pub fn verify_path_identity(&self) -> Result<(), WindowsError> {
-        let is_directory = self.metadata.kind == NodeKind::Directory;
+        let is_directory = self.metadata.has_directory_attribute();
         let reopened = open_raw(
             &self.path,
             FILE_READ_ATTRIBUTES,

@@ -14,7 +14,7 @@ fn unix_component() -> impl Strategy<Value = Vec<u8>> {
 fn windows_component() -> impl Strategy<Value = Vec<u8>> {
     vec(
         any::<u16>().prop_filter("no separators or NUL", |unit| {
-            !matches!(*unit, 0 | 0x2f | 0x5c)
+            !matches!(*unit, 0 | 0x2f | 0x3a | 0x5c)
         }),
         1..32,
     )

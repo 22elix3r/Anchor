@@ -20,6 +20,9 @@ tempfile.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+anchor-windows = { path = "../anchor-windows" }
+
 [dev-dependencies]
 proptest.workspace = true
 
