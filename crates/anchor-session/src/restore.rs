@@ -31,6 +31,9 @@ use thiserror::Error;
 #[cfg(unix)]
 use uuid::Uuid;
 
+use crate::restore_plan::{
+    PlanItem, PlanOperation, PlanPresence, PlanProof, RestorePlanId, RestorePlanRecord,
+};
 use crate::{SessionError, SessionId, SessionStore};
 
 #[cfg(windows)]
@@ -269,7 +272,29 @@ impl RestoreService {
                 no_changes: u64::try_from(no_changes).unwrap_or(u64::MAX),
             });
         }
-        apply_batch(store, session_id, &worktree, &writes)?;
+        if !writes.is_empty() {
+            let record = RestorePlanRecord::worktree(
+                session_id,
+                session.worktree_root.clone(),
+                session.worktree_key.clone(),
+                after.repository.clone(),
+                session.before.manifest,
+                after.manifest,
+                current_endpoint.manifest,
+                writes
+                    .iter()
+                    .map(|write| {
+                        PlanItem::exact(
+                            write.path.clone(),
+                            write.expected.as_ref(),
+                            write.desired.as_ref(),
+                        )
+                    })
+                    .collect(),
+            )?;
+            let plan_id = store.put_restore_plan(&record)?;
+            apply_batch(store, session_id, plan_id, &worktree, &writes)?;
+        }
         Ok(WholeRestoreResult::Applied {
             paths: u64::try_from(writes.len()).unwrap_or(u64::MAX),
         })
@@ -344,6 +369,7 @@ impl RestoreService {
         let current = CaptureEngine::new(store.objects(), session.capture_policy.capture_options())
             .capture(&worktree, &scope)?
             .manifest;
+        let current_manifest = store.put_manifest(&current)?;
         let selected_set = BTreeSet::from([selected.clone()]);
         let plan = RestorePlan::calculate(&base, &endpoint, &current, &selected_set)?;
         let Some(item) = plan.outcomes.first() else {
@@ -382,9 +408,29 @@ impl RestoreService {
                                 .entries()
                                 .iter()
                                 .find(|entry| entry.path == selected);
+                            let record = RestorePlanRecord::worktree(
+                                session_id,
+                                session.worktree_root.clone(),
+                                session.worktree_key.clone(),
+                                after.repository.clone(),
+                                session.before.manifest,
+                                after.manifest,
+                                current_manifest,
+                                vec![PlanItem::merged(
+                                    selected.clone(),
+                                    current_entry,
+                                    &candidate.desired,
+                                    candidate.base_object,
+                                    candidate.session_object,
+                                    candidate.current_object,
+                                    candidate.merged_object,
+                                )],
+                            )?;
+                            let plan_id = store.put_restore_plan(&record)?;
                             apply_one(
                                 store,
                                 session_id,
+                                plan_id,
                                 &worktree,
                                 &selected,
                                 current_entry,
@@ -407,9 +453,25 @@ impl RestoreService {
                     .entries()
                     .iter()
                     .find(|entry| entry.path == selected);
+                let record = RestorePlanRecord::worktree(
+                    session_id,
+                    session.worktree_root.clone(),
+                    session.worktree_key.clone(),
+                    after.repository.clone(),
+                    session.before.manifest,
+                    after.manifest,
+                    current_manifest,
+                    vec![PlanItem::exact(
+                        selected.clone(),
+                        current_entry,
+                        desired.as_ref(),
+                    )],
+                )?;
+                let plan_id = store.put_restore_plan(&record)?;
                 apply_one(
                     store,
                     session_id,
+                    plan_id,
                     &worktree,
                     &selected,
                     current_entry,
@@ -469,9 +531,20 @@ impl RestoreService {
         if current != after.index {
             return Ok(IndexRestoreResult::Conflict);
         }
+        let record = RestorePlanRecord::index(
+            session_id,
+            session.worktree_root.clone(),
+            session.worktree_key.clone(),
+            after.repository.clone(),
+            anchor_core::NativeString::from_host(context.index_path().as_os_str()),
+            after.index.clone(),
+            session.before.index.clone(),
+        )?;
+        let plan_id = store.put_restore_plan(&record)?;
         apply_index(
             store,
             session_id,
+            plan_id,
             context.index_path(),
             &after.index,
             &session.before.index,
@@ -482,6 +555,8 @@ impl RestoreService {
 
 struct MergeCandidate {
     desired: ManifestEntry,
+    base_object: ObjectId,
+    session_object: ObjectId,
     current_object: ObjectId,
     current_raw_size: u64,
     merged_object: ObjectId,
@@ -561,6 +636,8 @@ fn merge_regular_conflict(
                     },
                     safety: current.safety.clone(),
                 },
+                base_object: *base_object,
+                session_object: *session_object,
                 current_object: *current_object,
                 current_raw_size: *current_size,
                 merged_object,
@@ -647,6 +724,7 @@ struct BatchWrite {
 fn apply_batch(
     store: &SessionStore,
     session_id: SessionId,
+    plan_id: RestorePlanId,
     worktree: &Path,
     writes: &[BatchWrite],
 ) -> Result<(), RestoreError> {
@@ -662,7 +740,9 @@ fn apply_batch(
     let journal_path = transaction_path.join("journal.cbor");
     let mut journal = BatchRestoreJournal {
         tag: BATCH_JOURNAL_TAG,
-        schema: 1,
+        schema: 2,
+        plan_id: Some(plan_id),
+        transaction_id: Some(transaction_id),
         session_id,
         worktree_root: anchor_core::NativeString::from_host(worktree.as_os_str()),
         worktree_key: store.worktree_key.clone(),
@@ -712,10 +792,11 @@ fn apply_batch(
 fn apply_batch(
     store: &SessionStore,
     session_id: SessionId,
+    plan_id: RestorePlanId,
     worktree: &Path,
     writes: &[BatchWrite],
 ) -> Result<(), RestoreError> {
-    windows::apply_batch(store, session_id, worktree, writes)
+    windows::apply_batch(store, session_id, plan_id, worktree, writes)
 }
 
 #[cfg(unix)]
@@ -904,6 +985,7 @@ fn open_batch_parent(
 fn apply_one(
     store: &SessionStore,
     session_id: SessionId,
+    plan_id: RestorePlanId,
     worktree: &Path,
     path: &NativeRelativePath,
     expected: Option<&ManifestEntry>,
@@ -934,8 +1016,10 @@ fn apply_one(
     let backup_name = OsString::from(&backup_name_text);
     let journal_path = transaction_path.join("journal.cbor");
     let mut journal = RestoreJournal {
-        schema: 3,
+        schema: 4,
         session_id,
+        plan_id: Some(plan_id),
+        transaction_id: Some(transaction_id),
         path: path.clone(),
         stage_name: stage_name_text,
         backup_name: Some(backup_name_text),
@@ -1023,6 +1107,7 @@ fn apply_one(
 fn apply_index(
     store: &SessionStore,
     session_id: SessionId,
+    plan_id: RestorePlanId,
     index_path: &Path,
     expected: &IndexCapture,
     desired: &IndexCapture,
@@ -1065,8 +1150,10 @@ fn apply_index(
     let backup_name = OsString::from(&backup_name_text);
     let journal_path = transaction_path.join("journal.cbor");
     let mut journal = IndexRestoreJournal {
-        schema: 3,
+        schema: 4,
         session_id,
+        plan_id: Some(plan_id),
+        transaction_id: Some(transaction_id),
         backup_name: Some(backup_name_text),
         worktree_key: Some(store.worktree_key.clone()),
         index_path: Some(anchor_core::NativeString::from_host(index_path.as_os_str())),
@@ -1137,11 +1224,12 @@ fn apply_index(
 fn apply_index(
     store: &SessionStore,
     session_id: SessionId,
+    plan_id: RestorePlanId,
     index_path: &Path,
     expected: &IndexCapture,
     desired: &IndexCapture,
 ) -> Result<(), RestoreError> {
-    windows::apply_index(store, session_id, index_path, expected, desired)
+    windows::apply_index(store, session_id, plan_id, index_path, expected, desired)
 }
 
 #[cfg(unix)]
@@ -1178,12 +1266,15 @@ fn verify_index(
 fn apply_one(
     store: &SessionStore,
     session_id: SessionId,
+    plan_id: RestorePlanId,
     worktree: &Path,
     path: &NativeRelativePath,
     expected: Option<&ManifestEntry>,
     desired: Option<&ManifestEntry>,
 ) -> Result<(), RestoreError> {
-    windows::apply_one(store, session_id, worktree, path, expected, desired)
+    windows::apply_one(
+        store, session_id, plan_id, worktree, path, expected, desired,
+    )
 }
 
 #[cfg(unix)]
@@ -1393,6 +1484,10 @@ fn save_batch_journal(path: &Path, journal: &BatchRestoreJournal) -> Result<(), 
 struct RestoreJournal {
     schema: u16,
     session_id: SessionId,
+    #[serde(default)]
+    plan_id: Option<RestorePlanId>,
+    #[serde(default)]
+    transaction_id: Option<Uuid>,
     path: NativeRelativePath,
     stage_name: String,
     #[serde(default)]
@@ -1414,6 +1509,10 @@ struct IndexRestoreJournal {
     schema: u16,
     session_id: SessionId,
     #[serde(default)]
+    plan_id: Option<RestorePlanId>,
+    #[serde(default)]
+    transaction_id: Option<Uuid>,
+    #[serde(default)]
     backup_name: Option<String>,
     #[serde(default)]
     worktree_key: Option<String>,
@@ -1432,6 +1531,10 @@ struct BatchRestoreJournal {
     tag: u64,
     schema: u16,
     session_id: SessionId,
+    #[serde(default)]
+    plan_id: Option<RestorePlanId>,
+    #[serde(default)]
+    transaction_id: Option<Uuid>,
     worktree_root: anchor_core::NativeString,
     worktree_key: String,
     state: BatchJournalState,
@@ -1615,7 +1718,7 @@ pub(crate) fn scan_transactions(root: &Path) -> Result<TransactionSummary, Resto
         if let Ok(journal) =
             ciborium::de::from_reader::<BatchRestoreJournal, _>(Cursor::new(&bytes))
         {
-            if journal.tag != BATCH_JOURNAL_TAG || journal.schema != 1 {
+            if journal.tag != BATCH_JOURNAL_TAG || !matches!(journal.schema, 1 | 2) {
                 return Err(RestoreError::Journal(format!(
                     "transaction {} has an unsupported batch journal",
                     entry.file_name().to_string_lossy()
@@ -1757,23 +1860,165 @@ fn recover_transactions(store: &SessionStore) -> Result<TransactionRecoveryRepor
     Ok(report)
 }
 
+#[allow(clippy::too_many_lines)]
+fn validate_restore_plan(
+    store: &SessionStore,
+    plan_id: RestorePlanId,
+    session_id: SessionId,
+) -> Result<RestorePlanRecord, RestoreError> {
+    let plan = store.load_restore_plan(plan_id)?;
+    if plan.session_id != session_id || plan.worktree_key != store.worktree_key {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    }
+    let session = store.load_session(session_id)?;
+    let after = session
+        .after
+        .as_ref()
+        .ok_or(RestoreError::IncompleteSession)?;
+    if plan.worktree_root != session.worktree_root
+        || plan.worktree_key != session.worktree_key
+        || plan.repository != after.repository
+    {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    }
+    let worktree = PathBuf::from(session.worktree_root.to_host()?);
+    let context = GitContext::discover(&worktree)?;
+    validate_store_identity(store, &context)?;
+    if context.repository_state()? != plan.repository {
+        return Err(RestoreError::RepositoryDrift);
+    }
+
+    match &plan.operation {
+        PlanOperation::Worktree {
+            base_manifest,
+            session_manifest,
+            current_manifest,
+            items,
+        } => {
+            if *base_manifest != session.before.manifest || *session_manifest != after.manifest {
+                return Err(RestoreError::RecoveryPlanMismatch);
+            }
+            let base = store.load_manifest(*base_manifest)?;
+            let endpoint = store.load_manifest(*session_manifest)?;
+            let current = store.load_manifest(*current_manifest)?;
+            let selected = items
+                .iter()
+                .map(|item| item.path.clone())
+                .collect::<BTreeSet<_>>();
+            let recalculated = RestorePlan::calculate(&base, &endpoint, &current, &selected)?;
+            if recalculated.outcomes.len() != items.len() {
+                return Err(RestoreError::RecoveryPlanMismatch);
+            }
+            for item in items {
+                let current_entry = current
+                    .entries()
+                    .binary_search_by(|entry| entry.path.cmp(&item.path))
+                    .ok()
+                    .map(|index| &current.entries()[index]);
+                if item.expected != PlanPresence::from_entry(current_entry) {
+                    return Err(RestoreError::RecoveryPlanMismatch);
+                }
+                let calculated = recalculated
+                    .outcomes
+                    .iter()
+                    .find(|outcome| outcome.path == item.path)
+                    .ok_or(RestoreError::RecoveryPlanMismatch)?;
+                match (&item.proof, &calculated.outcome) {
+                    (PlanProof::Exact, RestoreOutcome::Write(desired))
+                        if item.desired == PlanPresence::from_entry(desired.as_ref()) => {}
+                    (
+                        PlanProof::CleanTextMerge {
+                            base,
+                            session,
+                            current,
+                            merged,
+                        },
+                        RestoreOutcome::Conflict(conflict),
+                    ) if conflict.reason == ConflictReason::OpaqueContentDrifted => {
+                        let MergeResolution::Clean(candidate) =
+                            merge_regular_conflict(conflict, store)?
+                        else {
+                            return Err(RestoreError::RecoveryPlanMismatch);
+                        };
+                        if candidate.base_object != *base
+                            || candidate.session_object != *session
+                            || candidate.current_object != *current
+                            || candidate.merged_object != *merged
+                            || item.desired != PlanPresence::from_entry(Some(&candidate.desired))
+                        {
+                            return Err(RestoreError::RecoveryPlanMismatch);
+                        }
+                    }
+                    _ => return Err(RestoreError::RecoveryPlanMismatch),
+                }
+            }
+        }
+        PlanOperation::Index {
+            index_path,
+            expected,
+            desired,
+        } => {
+            let recorded_index = index_path.to_host()?;
+            if expected != &after.index
+                || desired != &session.before.index
+                || Path::new(&recorded_index) != context.index_path()
+            {
+                return Err(RestoreError::RecoveryPlanMismatch);
+            }
+        }
+    }
+    Ok(plan)
+}
+
 #[cfg(unix)]
 fn recover_batch_journal(
     store: &SessionStore,
     journal: &mut BatchRestoreJournal,
     journal_path: &Path,
 ) -> Result<(), RestoreError> {
-    if journal.tag != BATCH_JOURNAL_TAG || journal.schema != 1 {
+    if journal.tag != BATCH_JOURNAL_TAG || journal.schema != 2 {
         return Err(RestoreError::LegacyRecoveryUnsupported(
             journal_path.display().to_string(),
         ));
     }
+    let plan_id = journal.plan_id.ok_or_else(|| {
+        RestoreError::LegacyRecoveryUnsupported(journal_path.display().to_string())
+    })?;
+    let transaction_id = journal.transaction_id.ok_or_else(|| {
+        RestoreError::LegacyRecoveryUnsupported(journal_path.display().to_string())
+    })?;
+    validate_transaction_directory(journal_path, &format!("batch-{transaction_id}"))?;
+    let plan = validate_restore_plan(store, plan_id, journal.session_id)?;
+    let PlanOperation::Worktree { items, .. } = &plan.operation else {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    };
+    if items.len() != journal.items.len() {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    }
     let worktree = validated_journal_worktree(store, journal.session_id, &journal.worktree_root)?;
     let mut paths = BTreeSet::new();
     let mut temporary_names = BTreeSet::new();
-    for item in &journal.items {
+    for (index, item) in journal.items.iter().enumerate() {
         if !paths.insert(item.path.clone()) {
             return Err(RestoreError::BatchJournalDuplicatePath);
+        }
+        let plan_item = &items[index];
+        if plan_item.path != item.path
+            || !same_optional_node(
+                plan_item.expected.to_entry(&item.path).as_ref(),
+                item.expected.to_entry(&item.path).as_ref(),
+            )
+            || !same_optional_node(
+                plan_item.desired.to_entry(&item.path).as_ref(),
+                item.desired.to_entry(&item.path).as_ref(),
+            )
+        {
+            return Err(RestoreError::RecoveryPlanMismatch);
+        }
+        let expected_stage = format!(".anchor-stage-{transaction_id}-{index}");
+        let expected_backup = format!(".anchor-backup-{transaction_id}-{index}");
+        if item.stage_name != expected_stage || item.backup_name != expected_backup {
+            return Err(RestoreError::UnsafeJournalName);
         }
         let stage = validate_journal_temp_name(&item.stage_name, ".anchor-stage-")?;
         let backup = validate_journal_temp_name(&item.backup_name, ".anchor-backup-")?;
@@ -1813,10 +2058,27 @@ fn recover_file_journal(
     journal: &mut RestoreJournal,
     journal_path: &Path,
 ) -> Result<(), RestoreError> {
-    if journal.schema != 3 {
+    if journal.schema != 4 {
         return Err(RestoreError::LegacyRecoveryUnsupported(
             journal_path.display().to_string(),
         ));
+    }
+    let plan_id = journal.plan_id.ok_or_else(|| {
+        RestoreError::LegacyRecoveryUnsupported(journal_path.display().to_string())
+    })?;
+    let transaction_id = journal.transaction_id.ok_or_else(|| {
+        RestoreError::LegacyRecoveryUnsupported(journal_path.display().to_string())
+    })?;
+    validate_transaction_directory(journal_path, &transaction_id.to_string())?;
+    let plan = validate_restore_plan(store, plan_id, journal.session_id)?;
+    let PlanOperation::Worktree { items, .. } = &plan.operation else {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    };
+    let [plan_item] = items.as_slice() else {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    };
+    if plan_item.path != journal.path {
+        return Err(RestoreError::RecoveryPlanMismatch);
     }
     let worktree = validated_journal_worktree(
         store,
@@ -1836,6 +2098,15 @@ fn recover_file_journal(
         .as_ref()
         .ok_or(RestoreError::IncompleteRecoveryJournal)?
         .to_entry(&journal.path);
+    if !same_optional_node(
+        plan_item.expected.to_entry(&journal.path).as_ref(),
+        expected.as_ref(),
+    ) || !same_optional_node(
+        plan_item.desired.to_entry(&journal.path).as_ref(),
+        desired.as_ref(),
+    ) {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    }
     let host = journal.path.to_host_path()?;
     let name = host.file_name().ok_or(RestoreError::UnsafeRootPath)?;
     let parent_path = host.parent().unwrap_or_else(|| Path::new(""));
@@ -1845,6 +2116,11 @@ fn recover_file_journal(
     } else {
         root.open_dir(parent_path)?
     };
+    if journal.stage_name != format!(".anchor-stage-{transaction_id}")
+        || journal.backup_name.as_deref() != Some(&format!(".anchor-backup-{transaction_id}"))
+    {
+        return Err(RestoreError::UnsafeJournalName);
+    }
     let stage = validate_journal_temp_name(&journal.stage_name, ".anchor-stage-")?;
     let backup = validate_journal_temp_name(
         journal
@@ -1864,6 +2140,14 @@ fn recover_file_journal(
     )?;
     journal.state = JournalState::RolledBack;
     save_journal(journal_path, journal)
+}
+
+fn same_optional_node(left: Option<&ManifestEntry>, right: Option<&ManifestEntry>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.path == right.path && left.node == right.node,
+        _ => false,
+    }
 }
 
 #[cfg(unix)]
@@ -1923,11 +2207,19 @@ fn recover_index_journal(
     journal: &mut IndexRestoreJournal,
     journal_path: &Path,
 ) -> Result<(), RestoreError> {
-    if journal.schema != 3 {
+    if journal.schema != 4 {
         return Err(RestoreError::LegacyRecoveryUnsupported(
             journal_path.display().to_string(),
         ));
     }
+    let plan_id = journal.plan_id.ok_or_else(|| {
+        RestoreError::LegacyRecoveryUnsupported(journal_path.display().to_string())
+    })?;
+    let transaction_id = journal.transaction_id.ok_or_else(|| {
+        RestoreError::LegacyRecoveryUnsupported(journal_path.display().to_string())
+    })?;
+    validate_transaction_directory(journal_path, &format!("index-{transaction_id}"))?;
+    let plan = validate_restore_plan(store, plan_id, journal.session_id)?;
     let session = store.load_session(journal.session_id)?;
     let worktree = PathBuf::from(session.worktree_root.to_host()?);
     let context = GitContext::discover(&worktree)?;
@@ -1950,6 +2242,24 @@ fn recover_index_journal(
         .desired
         .as_ref()
         .ok_or(RestoreError::IncompleteRecoveryJournal)?;
+    let PlanOperation::Index {
+        index_path,
+        expected: plan_expected,
+        desired: plan_desired,
+    } = &plan.operation
+    else {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    };
+    if index_path
+        != journal
+            .index_path
+            .as_ref()
+            .ok_or(RestoreError::IncompleteRecoveryJournal)?
+        || plan_expected != expected
+        || plan_desired != desired
+    {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    }
     let parent_path = recorded_index
         .parent()
         .ok_or(RestoreError::UnsafeIndexPath)?;
@@ -1957,6 +2267,9 @@ fn recover_index_journal(
         .file_name()
         .ok_or(RestoreError::UnsafeIndexPath)?;
     let parent = Dir::open_ambient_dir(parent_path, ambient_authority())?;
+    if journal.backup_name.as_deref() != Some(&format!(".anchor-index-backup-{transaction_id}")) {
+        return Err(RestoreError::UnsafeJournalName);
+    }
     let backup = validate_journal_temp_name(
         journal
             .backup_name
@@ -2061,6 +2374,17 @@ fn validate_store_identity(store: &SessionStore, context: &GitContext) -> Result
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn validate_store_identity(store: &SessionStore, context: &GitContext) -> Result<(), RestoreError> {
+    let location = context.store_location();
+    if location.worktree_key != store.worktree_key
+        || std::fs::canonicalize(location.root)? != std::fs::canonicalize(store.root())?
+    {
+        return Err(RestoreError::RecoveryPathMismatch);
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn validate_journal_temp_name(value: &str, prefix: &str) -> Result<OsString, RestoreError> {
     if !value.starts_with(prefix)
@@ -2072,6 +2396,19 @@ fn validate_journal_temp_name(value: &str, prefix: &str) -> Result<OsString, Res
         return Err(RestoreError::UnsafeJournalName);
     }
     Ok(OsString::from(value))
+}
+
+#[cfg(unix)]
+fn validate_transaction_directory(journal_path: &Path, expected: &str) -> Result<(), RestoreError> {
+    let actual = journal_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+        .ok_or(RestoreError::UnsafeJournalName)?;
+    if actual != expected {
+        return Err(RestoreError::UnsafeJournalName);
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -2160,6 +2497,8 @@ pub enum RestoreError {
     LegacyRecoveryUnsupported(String),
     #[error("restore journal path or worktree identity does not match fresh repository discovery")]
     RecoveryPathMismatch,
+    #[error("restore journal is not semantically bound to the retained session restore plan")]
+    RecoveryPlanMismatch,
     #[error("recovery backup does not match the byte-exact recorded current state")]
     RecoveryBackupMismatch,
     #[error("recovery backup is missing and the live path is not already restored")]
@@ -2188,6 +2527,8 @@ pub enum RestoreError {
     Capture(#[from] anchor_core::CaptureError),
     #[error(transparent)]
     Plan(#[from] anchor_core::RestorePlanError),
+    #[error(transparent)]
+    PlanRecord(#[from] crate::restore_plan::RestorePlanError),
     #[error(transparent)]
     Path(#[from] anchor_core::PlatformMismatch),
     #[error(transparent)]
@@ -2469,6 +2810,86 @@ mod tests {
     }
 
     #[test]
+    fn plan_bound_recovery_refuses_a_journal_authored_transformation() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"base").unwrap();
+        fs::write(root.path().join("unrelated"), b"keep").unwrap();
+        let (store, session) = run_change(root.path(), "printf session > file");
+        let WholeRestoreResult::Preview {
+            current_manifest, ..
+        } = RestoreService::restore_all(&store, session, WholeRestoreMode::Preview).unwrap()
+        else {
+            panic!("expected a whole-restore preview");
+        };
+        inject_batch_fault(BatchFaultPoint::Prepared);
+        let error = RestoreService::restore_all(
+            &store,
+            session,
+            WholeRestoreMode::Apply {
+                expected_current: current_manifest,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, RestoreError::InjectedBatchCrash));
+
+        let transaction = fs::read_dir(store.root().join("transactions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let journal_path = transaction.join("journal.cbor");
+        let mut journal: BatchRestoreJournal =
+            ciborium::de::from_reader(fs::read(&journal_path).unwrap().as_slice()).unwrap();
+        journal.items[0].path = selected(b"unrelated");
+        save_batch_journal(&journal_path, &journal).unwrap();
+
+        let error = TransactionRecoveryService::recover(&store).unwrap_err();
+        assert!(matches!(error, RestoreError::RecoveryPlanMismatch));
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"session");
+        assert_eq!(fs::read(root.path().join("unrelated")).unwrap(), b"keep");
+        assert_eq!(scan_transactions(store.root()).unwrap().unfinished, 1);
+    }
+
+    #[test]
+    fn plan_bound_recovery_refuses_a_non_derived_temporary_name() {
+        let root = repository();
+        fs::write(root.path().join("file"), b"base").unwrap();
+        let (store, session) = run_change(root.path(), "printf session > file");
+        let WholeRestoreResult::Preview {
+            current_manifest, ..
+        } = RestoreService::restore_all(&store, session, WholeRestoreMode::Preview).unwrap()
+        else {
+            panic!("expected a whole-restore preview");
+        };
+        inject_batch_fault(BatchFaultPoint::Prepared);
+        RestoreService::restore_all(
+            &store,
+            session,
+            WholeRestoreMode::Apply {
+                expected_current: current_manifest,
+            },
+        )
+        .unwrap_err();
+
+        let transaction = fs::read_dir(store.root().join("transactions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let journal_path = transaction.join("journal.cbor");
+        let mut journal: BatchRestoreJournal =
+            ciborium::de::from_reader(fs::read(&journal_path).unwrap().as_slice()).unwrap();
+        journal.items[0].stage_name = ".anchor-stage-attacker".to_owned();
+        save_batch_journal(&journal_path, &journal).unwrap();
+
+        let error = TransactionRecoveryService::recover(&store).unwrap_err();
+        assert!(matches!(error, RestoreError::UnsafeJournalName));
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"session");
+    }
+
+    #[test]
     fn batch_recovery_refuses_a_duplicate_path_in_an_untrusted_journal() {
         let root = repository();
         fs::write(root.path().join("file"), b"base").unwrap();
@@ -2500,6 +2921,8 @@ mod tests {
                 tag: BATCH_JOURNAL_TAG,
                 schema: 1,
                 session_id,
+                plan_id: None,
+                transaction_id: None,
                 worktree_root: anchor_core::NativeString::from_host(root.path().as_os_str()),
                 worktree_key: store.worktree_key.clone(),
                 state: BatchJournalState::Prepared,
@@ -2509,7 +2932,7 @@ mod tests {
         .unwrap();
 
         let error = TransactionRecoveryService::recover(&store).unwrap_err();
-        assert!(matches!(error, RestoreError::BatchJournalDuplicatePath));
+        assert!(matches!(error, RestoreError::LegacyRecoveryUnsupported(_)));
         assert_eq!(fs::read(root.path().join("file")).unwrap(), b"session");
         let unresolved = scan_transactions(store.root()).unwrap();
         assert_eq!(unresolved.unfinished, 1);
@@ -2673,7 +3096,7 @@ mod tests {
     }
 
     #[test]
-    fn recovers_an_interrupted_evacuated_file_transaction() {
+    fn refuses_an_unbound_interrupted_file_transaction() {
         let root = repository();
         fs::write(root.path().join("file"), b"base").unwrap();
         let (store, session_id) = run_change(root.path(), "printf session > file");
@@ -2708,6 +3131,8 @@ mod tests {
             &RestoreJournal {
                 schema: 3,
                 session_id,
+                plan_id: None,
+                transaction_id: None,
                 path: selected(b"file"),
                 stage_name: stage_text.clone(),
                 backup_name: Some(backup_text.clone()),
@@ -2722,17 +3147,17 @@ mod tests {
         )
         .unwrap();
 
-        let report = TransactionRecoveryService::recover(&store).unwrap();
-        assert_eq!(report.rolled_back, vec![transaction_id.to_string()]);
-        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"session");
-        assert!(!root.path().join(stage_text).exists());
-        assert!(!root.path().join(backup_text).exists());
+        let error = TransactionRecoveryService::recover(&store).unwrap_err();
+        assert!(matches!(error, RestoreError::LegacyRecoveryUnsupported(_)));
+        assert!(!root.path().join("file").exists());
+        assert!(root.path().join(stage_text).exists());
+        assert!(root.path().join(backup_text).exists());
         let summary = scan_transactions(store.root()).unwrap();
-        assert_eq!(summary.total, summary.complete);
+        assert_eq!(summary.unfinished, 1);
     }
 
     #[test]
-    fn recovery_finishes_cleanup_after_a_batch_commit_point() {
+    fn refuses_an_unbound_batch_at_a_commit_point() {
         let root = repository();
         fs::write(root.path().join("file"), b"base").unwrap();
         let (store, session_id) = run_change(root.path(), "printf session > file");
@@ -2773,6 +3198,8 @@ mod tests {
                 tag: BATCH_JOURNAL_TAG,
                 schema: 1,
                 session_id,
+                plan_id: None,
+                transaction_id: None,
                 worktree_root: anchor_core::NativeString::from_host(root.path().as_os_str()),
                 worktree_key: store.worktree_key.clone(),
                 state: BatchJournalState::Verified,
@@ -2788,17 +3215,16 @@ mod tests {
         )
         .unwrap();
 
-        let report = TransactionRecoveryService::recover(&store).unwrap();
-        assert_eq!(report.completed, vec![transaction_name]);
-        assert!(report.rolled_back.is_empty());
+        let error = TransactionRecoveryService::recover(&store).unwrap_err();
+        assert!(matches!(error, RestoreError::LegacyRecoveryUnsupported(_)));
         assert_eq!(fs::read(root.path().join("file")).unwrap(), b"base");
-        assert!(!root.path().join(backup_text).exists());
+        assert!(root.path().join(backup_text).exists());
         let summary = scan_transactions(store.root()).unwrap();
-        assert_eq!(summary.total, summary.complete);
+        assert_eq!(summary.unfinished, 1);
     }
 
     #[test]
-    fn recovers_an_interrupted_installed_index_transaction() {
+    fn refuses_an_unbound_interrupted_index_transaction() {
         let root = repository();
         let index_path = root.path().join(".git").join("index");
         let index = empty_v2_index();
@@ -2822,6 +3248,8 @@ mod tests {
             &IndexRestoreJournal {
                 schema: 3,
                 session_id,
+                plan_id: None,
+                transaction_id: None,
                 backup_name: Some(backup_text),
                 worktree_key: Some(store.worktree_key.clone()),
                 index_path: Some(anchor_core::NativeString::from_host(index_path.as_os_str())),
@@ -2832,10 +3260,10 @@ mod tests {
         )
         .unwrap();
 
-        let report = TransactionRecoveryService::recover(&store).unwrap();
-        assert_eq!(report.rolled_back, vec![format!("index-{transaction_id}")]);
-        assert!(!index_path.exists());
-        assert_eq!(scan_transactions(store.root()).unwrap().unfinished, 0);
+        let error = TransactionRecoveryService::recover(&store).unwrap_err();
+        assert!(matches!(error, RestoreError::LegacyRecoveryUnsupported(_)));
+        assert_eq!(fs::read(&index_path).unwrap(), index);
+        assert_eq!(scan_transactions(store.root()).unwrap().unfinished, 1);
     }
 
     #[test]
@@ -2897,6 +3325,7 @@ mod tests {
         let error = apply_index(
             &store,
             SessionId::new(),
+            RestorePlanId::from_bytes([0; 32]),
             &index_path,
             &expected,
             &IndexCapture::Absent,

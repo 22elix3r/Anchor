@@ -68,6 +68,9 @@ impl MaintenanceService {
                 collect_index_object(&after.index, &mut objects);
             }
         }
+        for (_, plan) in store.list_restore_plans()? {
+            manifests.extend(plan.referenced_manifests());
+        }
         for id in &manifests {
             let manifest = store.load_manifest(*id)?;
             collect_manifest_objects(&manifest, &mut objects);
@@ -123,6 +126,9 @@ impl MaintenanceService {
                 reachable_manifests.insert(after.manifest);
                 collect_index_object(&after.index, &mut reachable_objects);
             }
+        }
+        for (_, plan) in store.list_restore_plans()? {
+            reachable_manifests.extend(plan.referenced_manifests());
         }
         for id in &reachable_manifests {
             let manifest = store.load_manifest(*id)?;

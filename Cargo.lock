@@ -68,6 +68,7 @@ dependencies = [
  "anchor-git",
  "anchor-windows",
  "atomic-write-file",
+ "blake3",
  "cap-std",
  "ciborium",
  "command-fds",

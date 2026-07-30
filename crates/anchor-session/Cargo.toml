@@ -13,6 +13,7 @@ authors.workspace = true
 anchor-core.workspace = true
 anchor-git.workspace = true
 atomic-write-file.workspace = true
+blake3.workspace = true
 cap-std.workspace = true
 ciborium.workspace = true
 fs4.workspace = true

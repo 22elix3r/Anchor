@@ -3,6 +3,7 @@
 mod config;
 mod maintenance;
 mod restore;
+mod restore_plan;
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -28,6 +29,8 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use uuid::Uuid;
+
+pub use restore_plan::RestorePlanId;
 
 pub use config::{
     CapturePolicy, CommandRecording, ConfigError, ConfigLoader, ConfigResolution, PolicyOverrides,
@@ -242,6 +245,7 @@ impl SessionStore {
         let worktree_key = worktree_key.into();
         let objects = ObjectStore::open(&root)?;
         private_directory(&root.join("manifests").join("b3"))?;
+        private_directory(&root.join("plans").join("b3"))?;
         private_directory(&root.join("sessions").join(&worktree_key))?;
         private_directory(&root.join("deleted-sessions").join(&worktree_key))?;
         private_directory(&root.join("locks"))?;
@@ -1268,6 +1272,12 @@ pub enum SessionError {
     ManifestCollision(ManifestId),
     #[error("manifest object {0} failed identity verification")]
     ManifestIdentityMismatch(ManifestId),
+    #[error("restore-plan object {0} has a colliding encoding")]
+    RestorePlanCollision(RestorePlanId),
+    #[error("restore-plan object {0} failed identity verification")]
+    RestorePlanIdentityMismatch(RestorePlanId),
+    #[error(transparent)]
+    RestorePlan(#[from] restore_plan::RestorePlanError),
     #[error("session encoding failed: {0}")]
     Encode(String),
     #[error("session decoding failed: {0}")]

@@ -17,11 +17,12 @@ use uuid::Uuid;
 
 use super::{
     BatchWrite, RestoreError, SessionId, SessionStore, TransactionRecoveryReport,
-    TransactionSummary,
+    TransactionSummary, same_optional_node, validate_restore_plan,
 };
+use crate::restore_plan::{PlanOperation, RestorePlanId};
 
 const JOURNAL_TAG: u64 = 0x414e_4348_4f52_574a;
-const JOURNAL_SCHEMA: u16 = 1;
+const JOURNAL_SCHEMA: u16 = 2;
 const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -29,6 +30,10 @@ struct Journal {
     tag: u64,
     schema: u16,
     session_id: SessionId,
+    #[serde(default)]
+    plan_id: Option<RestorePlanId>,
+    #[serde(default)]
+    transaction_id: Option<Uuid>,
     worktree_root: NativeString,
     worktree_key: String,
     state: JournalState,
@@ -50,6 +55,10 @@ struct IndexJournal {
     tag: u64,
     schema: u16,
     session_id: SessionId,
+    #[serde(default)]
+    plan_id: Option<RestorePlanId>,
+    #[serde(default)]
+    transaction_id: Option<Uuid>,
     worktree_key: String,
     index_path: NativeString,
     backup_name: String,
@@ -87,6 +96,7 @@ enum ItemState {
 pub(super) fn apply_one(
     store: &SessionStore,
     session_id: SessionId,
+    plan_id: RestorePlanId,
     worktree: &Path,
     path: &NativeRelativePath,
     expected: Option<&ManifestEntry>,
@@ -95,6 +105,7 @@ pub(super) fn apply_one(
     apply_batch(
         store,
         session_id,
+        plan_id,
         worktree,
         &[BatchWrite {
             path: path.clone(),
@@ -107,6 +118,7 @@ pub(super) fn apply_one(
 pub(super) fn apply_batch(
     store: &SessionStore,
     session_id: SessionId,
+    plan_id: RestorePlanId,
     worktree: &Path,
     writes: &[BatchWrite],
 ) -> Result<(), RestoreError> {
@@ -138,6 +150,8 @@ pub(super) fn apply_batch(
         tag: JOURNAL_TAG,
         schema: JOURNAL_SCHEMA,
         session_id,
+        plan_id: Some(plan_id),
+        transaction_id: Some(id),
         worktree_root: NativeString::from_host(worktree.as_os_str()),
         worktree_key: store.worktree_key.clone(),
         state: JournalState::Prepared,
@@ -166,6 +180,7 @@ pub(super) fn apply_batch(
 pub(super) fn apply_index(
     store: &SessionStore,
     session_id: SessionId,
+    plan_id: RestorePlanId,
     index_path: &Path,
     expected: &IndexCapture,
     desired: &IndexCapture,
@@ -187,6 +202,8 @@ pub(super) fn apply_index(
         tag: JOURNAL_TAG,
         schema: JOURNAL_SCHEMA,
         session_id,
+        plan_id: Some(plan_id),
+        transaction_id: Some(id),
         worktree_key: store.worktree_key.clone(),
         index_path: NativeString::from_host(index_path.as_os_str()),
         backup_name: format!(".anchor-index-backup-{id}"),
@@ -566,6 +583,32 @@ fn validate_index_journal(
     {
         return Err(RestoreError::RecoveryPathMismatch);
     }
+    let plan_id = journal.plan_id.ok_or_else(|| {
+        RestoreError::LegacyRecoveryUnsupported("Windows index journal".to_owned())
+    })?;
+    let transaction_id = journal.transaction_id.ok_or_else(|| {
+        RestoreError::LegacyRecoveryUnsupported("Windows index journal".to_owned())
+    })?;
+    if journal.backup_name != format!(".anchor-index-backup-{transaction_id}") {
+        return Err(RestoreError::UnsafeJournalName);
+    }
+    let plan = validate_restore_plan(store, plan_id, journal.session_id)?;
+    let PlanOperation::Index {
+        index_path,
+        expected,
+        desired,
+    } = &plan.operation
+    else {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    };
+    if plan.session_id != journal.session_id
+        || plan.worktree_key != journal.worktree_key
+        || index_path != &journal.index_path
+        || expected != &journal.expected
+        || desired != &journal.desired
+    {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    }
     validate_temp_name(&journal.backup_name, ".anchor-index-backup-")?;
     let session = store.load_session(journal.session_id)?;
     let worktree = PathBuf::from(session.worktree_root.to_host()?);
@@ -702,17 +745,49 @@ fn validate_journal(store: &SessionStore, journal: &Journal) -> Result<(), Resto
     {
         return Err(RestoreError::RecoveryPathMismatch);
     }
+    let plan_id = journal.plan_id.ok_or_else(|| {
+        RestoreError::LegacyRecoveryUnsupported("Windows worktree journal".to_owned())
+    })?;
+    let transaction_id = journal.transaction_id.ok_or_else(|| {
+        RestoreError::LegacyRecoveryUnsupported("Windows worktree journal".to_owned())
+    })?;
+    let plan = validate_restore_plan(store, plan_id, journal.session_id)?;
+    let PlanOperation::Worktree { items, .. } = &plan.operation else {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    };
+    if plan.session_id != journal.session_id
+        || plan.worktree_root != journal.worktree_root
+        || plan.worktree_key != journal.worktree_key
+        || items.len() != journal.items.len()
+    {
+        return Err(RestoreError::RecoveryPlanMismatch);
+    }
     let mut paths = BTreeSet::new();
     let mut names = BTreeSet::new();
-    for item in &journal.items {
+    for (index, item) in journal.items.iter().enumerate() {
+        let plan_item = &items[index];
+        let expected = item.expected.to_entry(&item.path)?;
+        let desired = item.desired.to_entry(&item.path)?;
+        if plan_item.path != item.path
+            || !same_optional_node(
+                plan_item.expected.to_entry(&item.path).as_ref(),
+                expected.as_ref(),
+            )
+            || !same_optional_node(
+                plan_item.desired.to_entry(&item.path).as_ref(),
+                desired.as_ref(),
+            )
+            || item.stage_name != format!(".anchor-stage-{transaction_id}-{index}")
+            || item.backup_name != format!(".anchor-backup-{transaction_id}-{index}")
+        {
+            return Err(RestoreError::RecoveryPlanMismatch);
+        }
         if !paths.insert(item.path.clone())
             || !names.insert(validate_temp_name(&item.stage_name, ".anchor-stage-")?)
             || !names.insert(validate_temp_name(&item.backup_name, ".anchor-backup-")?)
         {
             return Err(RestoreError::BatchJournalDuplicatePath);
         }
-        item.expected.to_entry(&item.path)?;
-        item.desired.to_entry(&item.path)?;
     }
     Ok(())
 }
