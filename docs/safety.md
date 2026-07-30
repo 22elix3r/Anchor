@@ -128,6 +128,10 @@ restoration never writes the index. The separate `restore-index` operation
 returns a conflict without writing when post-session index drift is present.
 CLI filesystem and index mutation requires explicit `--yes`; the default exact
 restore invocation points back to the immutable session diff without writing.
+The TUI is likewise not a mutation engine: `r` returns a selected-path intent to
+the CLI, raw mode is restored, and the CLI asks for `y/yes` before calling the
+same restore service. Rename rows are refused because a one-path action would
+only invert half of the rename.
 
 ## Included and excluded data
 

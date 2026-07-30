@@ -1,4 +1,4 @@
-//! Read-only terminal review frontend for Anchor.
+//! Terminal review frontend for Anchor.
 
 use std::io;
 use std::time::Duration;
@@ -50,7 +50,7 @@ struct AppState {
 /// # Errors
 ///
 /// Returns [`ReviewError`] when terminal setup, drawing, or event handling fails.
-pub fn review(model: &ReviewModel) -> Result<(), ReviewError> {
+pub fn review(model: &ReviewModel) -> Result<ReviewAction, ReviewError> {
     if model.files.is_empty() {
         return Err(ReviewError::NoChanges);
     }
@@ -75,7 +75,12 @@ pub fn review(model: &ReviewModel) -> Result<(), ReviewError> {
             continue;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => break,
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(ReviewAction::Quit),
+            KeyCode::Char('r') => {
+                return Ok(ReviewAction::RestoreSelected {
+                    index: state.selected,
+                });
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 state.selected = (state.selected + 1).min(model.files.len() - 1);
                 state.vertical_scroll = 0;
@@ -101,7 +106,12 @@ pub fn review(model: &ReviewModel) -> Result<(), ReviewError> {
             _ => {}
         }
     }
-    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewAction {
+    Quit,
+    RestoreSelected { index: usize },
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, model: &ReviewModel, state: AppState) {
@@ -109,8 +119,9 @@ fn render(frame: &mut ratatui::Frame<'_>, model: &ReviewModel, state: AppState) 
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
-    let help = Paragraph::new("q quit  j/k file  ←/→ horizontal  PgUp/PgDn vertical")
-        .style(Style::default().fg(Color::DarkGray));
+    let help =
+        Paragraph::new("q quit  r restore selected  j/k file  ←/→ horizontal  PgUp/PgDn vertical")
+            .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(help, outer[1]);
 
     let file = &model.files[state.selected];
@@ -235,6 +246,11 @@ mod tests {
                 .unwrap();
             let rendered = terminal.backend().buffer().content().to_vec();
             assert!(rendered.iter().any(|cell| cell.symbol() == "b"));
+            let text = rendered
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            assert!(text.contains("r restore selected"));
         }
     }
 }

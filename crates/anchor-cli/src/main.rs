@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -371,7 +372,7 @@ fn execute(cli: Cli) -> Result<i32> {
         }
         Commands::Review { session } => {
             let store = current_store()?;
-            let _lease = store
+            let review_lease = store
                 .acquire_store_read_lease()
                 .into_diagnostic()
                 .wrap_err("Anchor storage is busy")?;
@@ -393,10 +394,39 @@ fn execute(cli: Cli) -> Result<i32> {
                 .wrap_err("cannot load after manifest")?;
             let diff = ManifestDiff::between(&before, &after);
             let model = review_model(session.id, &diff, store.objects())?;
-            anchor_tui::review(&model)
+            let action = anchor_tui::review(&model)
                 .into_diagnostic()
                 .wrap_err("terminal review failed")?;
-            Ok(0)
+            let anchor_tui::ReviewAction::RestoreSelected { index } = action else {
+                return Ok(0);
+            };
+            let change = diff
+                .changes
+                .get(index)
+                .ok_or_else(|| miette::miette!("review selection is out of range"))?;
+            if change.kind == ChangeKind::Renamed {
+                miette::bail!(
+                    "a rename spans two paths and cannot be restored as one TUI file action"
+                );
+            }
+            eprintln!(
+                "Restore the exact safe inverse for {}? [y/N]",
+                display_path(&change.path)
+            );
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .into_diagnostic()
+                .wrap_err("cannot read confirmation")?;
+            if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+                println!("no change made");
+                return Ok(0);
+            }
+            drop(review_lease);
+            let result = RestoreService::restore_file(&store, session.id, change.path.clone())
+                .into_diagnostic()
+                .wrap_err("restore was refused")?;
+            report_restore_result(result)
         }
         Commands::Restore {
             session,
@@ -440,48 +470,37 @@ fn execute(cli: Cli) -> Result<i32> {
             let result = RestoreService::restore_file_with_merge(&store, id, path, merge_mode)
                 .into_diagnostic()
                 .wrap_err("restore was refused")?;
-            match result {
-                RestoreApplyResult::Applied { path, .. } => {
-                    println!("restored {}", display_path(&path));
-                    Ok(0)
-                }
-                RestoreApplyResult::TextMergeAvailable {
-                    path,
-                    current_object,
-                    current_raw_size,
-                    merged_object,
-                    merged_raw_size,
-                    ..
-                } => {
-                    let current = store
-                        .objects()
-                        .get(current_object, current_raw_size)
-                        .into_diagnostic()
-                        .wrap_err("cannot load current merge input")?;
-                    let merged = store
-                        .objects()
-                        .get(merged_object, merged_raw_size)
-                        .into_diagnostic()
-                        .wrap_err("cannot load merged preview")?;
-                    print_text_pair(
-                        &current,
-                        &merged,
-                        &format!("current/{}", display_path(&path)),
-                        &format!("merged/{}", display_path(&path)),
-                    );
-                    eprintln!(
-                        "clean merge preview only; rerun with --merge --yes --expect-merged {merged_object} to apply this exact result"
-                    );
-                    Ok(3)
-                }
-                RestoreApplyResult::NoChange { reason } => {
-                    println!("no change: {reason:?}");
-                    Ok(0)
-                }
-                RestoreApplyResult::Conflict { reason } => {
-                    eprintln!("conflict: {reason:?}; no filesystem change was made");
-                    Ok(4)
-                }
+            if let RestoreApplyResult::TextMergeAvailable {
+                path,
+                current_object,
+                current_raw_size,
+                merged_object,
+                merged_raw_size,
+                ..
+            } = result
+            {
+                let current = store
+                    .objects()
+                    .get(current_object, current_raw_size)
+                    .into_diagnostic()
+                    .wrap_err("cannot load current merge input")?;
+                let merged = store
+                    .objects()
+                    .get(merged_object, merged_raw_size)
+                    .into_diagnostic()
+                    .wrap_err("cannot load merged preview")?;
+                print_text_pair(
+                    &current,
+                    &merged,
+                    &format!("current/{}", display_path(&path)),
+                    &format!("merged/{}", display_path(&path)),
+                );
+                eprintln!(
+                    "clean merge preview only; rerun with --merge --yes --expect-merged {merged_object} to apply this exact result"
+                );
+                Ok(3)
+            } else {
+                report_restore_result(result)
             }
         }
         Commands::RestoreIndex { session, yes } => {
@@ -758,6 +777,26 @@ fn print_sessions(sessions: &[Session], format: OutputFormat) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn report_restore_result(result: RestoreApplyResult) -> Result<i32> {
+    match result {
+        RestoreApplyResult::Applied { path, .. } => {
+            println!("restored {}", display_path(&path));
+            Ok(0)
+        }
+        RestoreApplyResult::NoChange { reason } => {
+            println!("no change: {reason:?}");
+            Ok(0)
+        }
+        RestoreApplyResult::Conflict { reason } => {
+            eprintln!("conflict: {reason:?}; no filesystem change was made");
+            Ok(4)
+        }
+        RestoreApplyResult::TextMergeAvailable { .. } => {
+            miette::bail!("internal error: merge preview was not rendered")
+        }
+    }
 }
 
 fn print_diff(

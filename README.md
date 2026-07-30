@@ -34,7 +34,8 @@ Anchor is pre-release software. The implemented safety-first subset is:
 - stale-session abandonment after the inherited child lock is free;
 - path-level diffs with unique exact-content rename detection;
 - bounded, control-character-sanitized unified text diffs;
-- a read-only side-by-side terminal reviewer with narrow-layout fallback;
+- a side-by-side terminal reviewer with narrow-layout fallback and confirmed
+  file-level restore actions;
 - structured three-state restoration planning;
 - bounded inverse three-way text merge with structured overlap conflicts;
 - single-path regular-file and symlink restore on Unix when safety is proven;
@@ -46,9 +47,8 @@ Anchor is pre-release software. The implemented safety-first subset is:
   operation state is ambiguous;
 - storage integrity checking and reachability-based garbage collection.
 
-Not yet implemented: whole-session transactional rollback, TUI-triggered
-restore actions, and Windows filesystem mutation. Those cases are refused
-rather than approximated.
+Not yet implemented: whole-session transactional rollback and Windows
+filesystem mutation. Those cases are refused rather than approximated.
 
 ## Build
 
@@ -75,6 +75,10 @@ anchor diff <session-id> --drift
 anchor diff <session-id> --format json
 anchor review <session-id>
 ```
+
+In the reviewer, `r` exits raw terminal mode and asks for confirmation before
+calling the same exact single-path restore service. Exact renames are disabled
+as a one-file TUI action because they span two paths.
 
 Restore one worktree-root-relative path:
 
