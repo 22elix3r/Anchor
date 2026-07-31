@@ -495,14 +495,18 @@ fn open_or_create_private_component(
         Ok(_) => false,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             #[cfg(unix)]
-            {
+            let creation = {
                 use std::os::fd::AsFd as _;
                 rustix::fs::mkdirat(parent.as_fd(), name, rustix::fs::Mode::from_raw_mode(0o700))
-                    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-            }
+                    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
+            };
             #[cfg(not(unix))]
-            parent.create_dir(name)?;
-            true
+            let creation = parent.create_dir(name);
+            match creation {
+                Ok(()) => true,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+                Err(error) => return Err(error.into()),
+            }
         }
         Err(error) => return Err(error.into()),
     };
@@ -716,5 +720,33 @@ mod windows_tests {
 
         assert_eq!(store.read_bounded("record", 64).unwrap(), b"private record");
         assert!(store.root_is_private().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod concurrent_tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+
+    #[test]
+    fn concurrent_openers_share_a_validated_private_prefix() {
+        let trusted = tempfile::tempdir().unwrap();
+        let trusted_path = trusted.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let trusted_path = trusted_path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    StoreFs::open_beneath(trusted_path, "Fence/repositories/shared-principal/v1")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            assert!(thread.join().unwrap().is_ok());
+        }
     }
 }
