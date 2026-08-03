@@ -4,7 +4,7 @@ All notable changes to Fence are recorded here. Versions follow Semantic
 Versioning; persisted-data compatibility has its own policy because this
 project stores safety-critical snapshots and recovery journals.
 
-## [0.1.0-alpha.2] - Unreleased
+## [0.1.0-alpha.2] - 2026-08-03
 
 This is the first public Unix alpha. Filesystem mutation is not yet stable and
 is not supported on Windows. Cargo and npm versions, the Git tag, and release
