@@ -212,7 +212,15 @@ jobs:
           test "${platform_package_count}" = 1
           PATH="${NPM_CONFIG_PREFIX}/bin:${PATH}" fence --version |
             grep -F "${RELEASE_VERSION}"
-          scripts/release-smoke.sh "${NPM_CONFIG_PREFIX}/bin/fence"
+          smoke_wrapper="${RUNNER_TEMP}/fence-npm-smoke"
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'exec "$FENCE_SMOKE_NODE" "$FENCE_SMOKE_LAUNCHER" "$@"' \
+            > "${smoke_wrapper}"
+          chmod +x "${smoke_wrapper}"
+          FENCE_SMOKE_NODE="$(command -v node)" \
+            FENCE_SMOKE_LAUNCHER="$(npm root --global)/fence-cli/bin/fence.js" \
+            scripts/release-smoke.sh "${smoke_wrapper}"
       - name: Verify public-registry signatures and provenance
         shell: bash
         run: |
