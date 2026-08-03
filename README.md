@@ -21,7 +21,10 @@ the `git` executable, create commits, modify refs, or use Git object storage.
 
 ## Project status
 
-Fence is pre-release software. The implemented safety-first subset is:
+Fence is security-sensitive public-alpha software. Test recovery first in a
+disposable repository, preserve the store when recovery is uncertain, and do
+not run Fence with elevated privileges merely to bypass a permission refusal.
+The implemented safety-first subset is:
 
 - lossless Unix-byte and Windows-WTF-16 path records;
 - immutable BLAKE3-addressed, Zstandard-compressed raw-byte objects;
@@ -57,16 +60,47 @@ Fence is pre-release software. The implemented safety-first subset is:
 Not yet implemented: combining index restoration into the worktree batch,
 and hunk-level restore. Those cases are refused rather than approximated.
 
-## Build
+## Install
 
 Fence uses Rust 2024 and has an MSRV of Rust 1.85.
 
 ```console
-cargo build --release -p fence-cli
-./target/release/fence --help
+npm install -g fence-cli@0.1.0-alpha.1
+# or compile the exact prerelease from crates.io
+cargo install fence-cli --version 0.1.0-alpha.1 --locked
+
+fence --version
 ```
 
-The runtime has no network dependency and does not require the `git` executable.
+The npm package name is `fence-cli`; it installs the `fence` command. The
+unscoped npm name `fence` belongs to an unrelated project. Alpha npm packages
+support GNU/Linux x86-64 and Intel/Apple-silicon macOS. They contain prebuilt
+binaries and have no npm lifecycle scripts or installation-time downloader.
+
+See the [installation and verification guide](docs/installation.md) for direct
+GitHub archives, checksums, build attestations, PATH setup, upgrades, and source
+builds. See [supported platforms](docs/platforms.md) before installing on a
+non-Ubuntu Linux distribution. The runtime has no network dependency and does
+not require the `git` executable.
+
+## Five-minute recovery walkthrough
+
+Fence creates its private store lazily on the first `fence run`; there is no
+separate `init` command. Capture is part of `run`, not a standalone command.
+
+```console
+fence run -- sh -c 'printf "session change\n" > example.txt'
+fence sessions
+fence diff <session-id>
+fence restore <session-id> --file example.txt
+fence restore <session-id> --file example.txt --yes
+fence doctor
+```
+
+The first restore command is a nonmutating preview. Conflicts preserve current
+state and exit with status 4. Work through the disposable-repository
+[quickstart](docs/quickstart.md) and [first recovery example](docs/recovery.md)
+before restoring important files.
 
 The Fence rename is a deliberate pre-alpha compatibility break. The `fence`
 binary does not provide an `anchor` alias, read `ANCHOR_*` environment
@@ -191,17 +225,22 @@ when the complete invocation is safe to store. Capture limits and the two
 degraded-behavior switches can be configured or overridden explicitly; see
 [Configuration](docs/configuration.md).
 
-See [Safety and threat model](docs/safety.md) and
-[Storage format](docs/storage.md) before using Fence on sensitive worktrees.
+See [Safety and threat model](docs/safety.md), [architecture](docs/architecture.md),
+and [storage format](docs/storage.md) before using Fence on sensitive
+worktrees. Operational failures are covered by the
+[troubleshooting guide](docs/troubleshooting.md), and old Anchor users must
+follow the [migration refusal guide](docs/migration-from-anchor.md). Automation
+should follow the [schema-1 JSON and exit-status contract](docs/json-api.md)
+rather than parse human output.
 Independent reviewers can start with the
 [audit guide](docs/audit-guide.md). Implemented and remaining work is tracked
 in the [implementation roadmap](docs/roadmap.md).
 
 Tagged Unix alpha releases provide `.tar.gz` archives for Linux x86-64 and
-macOS x86-64/arm64. Verify the adjacent SHA-256 file before installing:
+macOS x86-64/arm64. Verify the central SHA-256 manifest before installing:
 
 ```console
-sha256sum --check fence-0.1.0-alpha.1-<target>.tar.gz.sha256
+sha256sum --check --ignore-missing fence-0.1.0-alpha.1-SHA256SUMS
 tar -xzf fence-0.1.0-alpha.1-<target>.tar.gz
 install fence-0.1.0-alpha.1-<target>/fence ~/.local/bin/fence
 ```
@@ -214,16 +253,20 @@ gh attestation verify fence-0.1.0-alpha.1-<target>.tar.gz \
   -R 22elix3r/fence
 ```
 
-Release owners follow the [Unix alpha release
+Release owners follow the [public alpha release
 checklist](docs/release-checklist.md).
 
-## Platform support
+## Platform support summary
 
 | Platform | Capture/review | Filesystem restore |
 |---|---|---|
 | Linux | Supported | Experimental single-path and batch |
 | macOS | Supported | Experimental single-path and batch |
 | Windows | Experimental native support | Not claimed; metadata-safe mutation is pending |
+
+Windows does not receive an npm or direct-download artifact in `alpha.1`.
+Linux ARM, Windows ARM, and Alpine/musl are also unsupported. See the complete
+[platform policy](docs/platforms.md).
 
 Windows paths and command arguments retain exact WTF-16. Capture uses pinned
 directory handles, 128-bit file identities, reparse-point inspection, and

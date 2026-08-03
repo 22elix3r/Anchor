@@ -2,6 +2,9 @@
 //!
 //! This crate quarantines the small amount of Unix FFI that cannot be expressed
 //! through the safe APIs used by `fence-core`.
+//!
+//! This implementation crate's Rust API is prerelease and may change between
+//! `0.1.0-alpha.N` versions.
 
 #![cfg(target_os = "macos")]
 

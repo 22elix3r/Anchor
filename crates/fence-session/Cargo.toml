@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = ["crates-io"]
+include = ["src/**", "tests/**"]
 
 [features]
 fuzzing = []

@@ -246,6 +246,26 @@ as untrusted:
 - garbage collection aborts if retained metadata cannot be decoded and all
   reachable objects cannot be verified.
 
+## Distribution and privilege boundary
+
+Fence does not update itself, elevate privileges, or require network access at
+runtime. The npm package has no lifecycle scripts and selects an exact-version
+platform package through npm rather than downloading an executable during
+installation. Its launcher resolves that package by absolute path, verifies the
+binary SHA-256 digest, and replaces itself with the Rust process so terminal,
+signal, and exit behavior are not mediated by a long-lived JavaScript parent.
+
+Published binaries, archives, checksum manifests, npm tarballs, and SBOMs are
+bound to the release workflow with provenance attestations. Users should also
+verify the signed release authorization. A checksum downloaded from the same
+compromised location as an artifact detects corruption but not publisher
+impersonation.
+
+Running Fence as root or an administrator expands the worktree paths and file
+ownership it can affect. Fence never requests elevation, and package
+instructions use user-owned prefixes. A permission refusal is evidence to
+investigate, not a reason to rerun with `sudo`.
+
 ## Current non-guarantees
 
 - no process-level or prompt-level attribution;

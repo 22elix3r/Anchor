@@ -1,0 +1,17 @@
+Fence third-party license notices
+=================================
+
+This file is generated from the release Cargo.lock by cargo-about. It is not
+legal advice. Fence itself is licensed under MIT OR Apache-2.0.
+
+{{#each licenses}}
+-------------------------------------------------------------------------------
+{{name}}
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

@@ -38,13 +38,17 @@ PATH=/fence-release-smoke-path-without-git \
 diff_status=$?
 set -e
 test "$diff_status" -eq 1
+grep '"operation": "diff"' diff.json >/dev/null
 grep '"status": "modified"' diff.json >/dev/null
 
 PATH=/fence-release-smoke-path-without-git \
     "$fence_binary" restore "$session_id" --file file --yes --format json \
     > restore.json
+grep '"operation": "restore-file"' restore.json >/dev/null
 test "$(cat file)" = base
 PATH=/fence-release-smoke-path-without-git \
     "$fence_binary" doctor --format json > doctor.json
+grep '"operation": "doctor"' doctor.json >/dev/null
 PATH=/fence-release-smoke-path-without-git \
     "$fence_binary" gc --dry-run --format json > gc.json
+grep '"operation": "gc"' gc.json >/dev/null

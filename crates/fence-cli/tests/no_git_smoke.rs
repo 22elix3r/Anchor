@@ -21,6 +21,21 @@ fn capture_diff_restore_doctor_and_gc_need_no_git_executable() {
         .and_then(|value| value.strip_suffix(':'))
         .expect("run output did not contain a session ID");
 
+    for (operation, arguments) in [
+        ("status", vec!["status", "--format", "json"]),
+        ("sessions", vec!["sessions", "--format", "json"]),
+        (
+            "deleted-sessions",
+            vec!["deleted-sessions", "--format", "json"],
+        ),
+        ("show", vec!["show", session, "--format", "json"]),
+    ] {
+        let output = fence(root.path(), &arguments);
+        assert_success(operation, &output);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_envelope(&value, operation, "ok");
+    }
+
     let diff = fence(root.path(), &["diff", session, "--format", "json"]);
     assert_eq!(
         diff.status.code(),
@@ -30,7 +45,27 @@ fn capture_diff_restore_doctor_and_gc_need_no_git_executable() {
         String::from_utf8_lossy(&diff.stderr)
     );
     let diff_json: serde_json::Value = serde_json::from_slice(&diff.stdout).unwrap();
-    assert_eq!(diff_json["changes"][0]["status"], "modified");
+    assert_envelope(&diff_json, "diff", "differences");
+    assert_eq!(diff_json["data"]["changes"][0]["status"], "modified");
+
+    let rollback = fence(root.path(), &["rollback", session, "--format", "json"]);
+    assert_eq!(rollback.status.code(), Some(3));
+    let rollback_json: serde_json::Value = serde_json::from_slice(&rollback.stdout).unwrap();
+    assert_envelope(&rollback_json, "rollback", "preview");
+
+    let restore_index = fence(
+        root.path(),
+        &["restore-index", session, "--yes", "--format", "json"],
+    );
+    assert_success("restore-index", &restore_index);
+    let restore_index_json: serde_json::Value =
+        serde_json::from_slice(&restore_index.stdout).unwrap();
+    assert_eq!(restore_index_json["schema"], 1);
+    assert_eq!(restore_index_json["operation"], "restore-index");
+    assert!(matches!(
+        restore_index_json["status"].as_str(),
+        Some("applied" | "no-change")
+    ));
 
     let restore = fence(
         root.path(),
@@ -39,15 +74,40 @@ fn capture_diff_restore_doctor_and_gc_need_no_git_executable() {
         ],
     );
     assert_success("restore", &restore);
+    let restore_json: serde_json::Value = serde_json::from_slice(&restore.stdout).unwrap();
+    assert_envelope(&restore_json, "restore-file", "applied");
     assert_eq!(fs::read(root.path().join("file")).unwrap(), b"base");
 
     let doctor = fence(root.path(), &["doctor", "--format", "json"]);
     assert_success("doctor", &doctor);
     let doctor_json: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
-    assert_eq!(doctor_json["unfinished_transactions"], 0);
+    assert_envelope(&doctor_json, "doctor", "ok");
+    assert_eq!(doctor_json["data"]["unfinished_transactions"], 0);
 
     let gc = fence(root.path(), &["gc", "--dry-run", "--format", "json"]);
     assert_success("gc", &gc);
+    let gc_json: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_envelope(&gc_json, "gc", "ok");
+
+    for (operation, arguments) in [
+        ("recover", vec!["recover", "--format", "json"]),
+        (
+            "recover-transactions",
+            vec!["recover-transactions", "--yes", "--format", "json"],
+        ),
+    ] {
+        let output = fence(root.path(), &arguments);
+        assert_success(operation, &output);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_envelope(&value, operation, "ok");
+    }
+}
+
+fn assert_envelope(value: &serde_json::Value, operation: &str, status: &str) {
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["operation"], operation);
+    assert_eq!(value["status"], status);
+    assert!(value.get("data").is_some());
 }
 
 fn fence(root: &Path, arguments: &[&str]) -> Output {

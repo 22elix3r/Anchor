@@ -1,4 +1,10 @@
 //! Safety-critical, platform-neutral primitives for Fence.
+//!
+//! # Stability
+//!
+//! This crate is published to support the `fence` CLI. Its Rust API is
+//! prerelease and may change between `0.1.0-alpha.N` versions. Persisted-data
+//! compatibility follows Fence's stricter documented recovery policy.
 
 pub mod capture;
 pub mod diff;
