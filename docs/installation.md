@@ -10,7 +10,7 @@ The npm package contains a prebuilt executable selected by npm. It has no
 installation lifecycle scripts and performs no installation-time download.
 
 ```console
-npm install -g fence-cli@0.1.0-alpha.1
+npm install -g fence-cli@0.1.0-alpha.2
 fence --version
 ```
 
@@ -29,7 +29,7 @@ platform binary and exits without touching a Fence store.
 Cargo does not select prereleases implicitly, so include the exact version:
 
 ```console
-cargo install fence-cli --version 0.1.0-alpha.1 --locked
+cargo install fence-cli --version 0.1.0-alpha.2 --locked
 fence --version
 ```
 
@@ -42,13 +42,13 @@ source build should prefer the attested npm or GitHub artifacts.
 Download the archive and the central checksum manifest for the host target:
 
 ```console
-sha256sum --check --ignore-missing fence-0.1.0-alpha.1-SHA256SUMS
+sha256sum --check --ignore-missing fence-0.1.0-alpha.2-SHA256SUMS
 gh attestation verify \
-  fence-0.1.0-alpha.1-x86_64-unknown-linux-gnu.tar.gz \
+  fence-0.1.0-alpha.2-x86_64-unknown-linux-gnu.tar.gz \
   --repo 22elix3r/fence
-tar -xzf fence-0.1.0-alpha.1-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf fence-0.1.0-alpha.2-x86_64-unknown-linux-gnu.tar.gz
 install -m 0755 \
-  fence-0.1.0-alpha.1-x86_64-unknown-linux-gnu/fence \
+  fence-0.1.0-alpha.2-x86_64-unknown-linux-gnu/fence \
   "$HOME/.local/bin/fence"
 ```
 

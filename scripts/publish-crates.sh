@@ -10,6 +10,7 @@ version="$(
     cargo metadata --locked --no-deps --format-version 1 |
         jq -r '.packages[] | select(.name == "fence-cli") | .version'
 )"
+user_agent="Fence/${version} release publisher (+https://github.com/22elix3r/fence)"
 temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/fence-crates.XXXXXX")"
 trap 'rm -rf "$temporary_directory"' EXIT HUP INT TERM
 
@@ -29,7 +30,7 @@ do
     remote_crate="${temporary_directory}/${crate}-${version}.crate"
     download_url="https://crates.io/api/v1/crates/${crate}/${version}/download"
 
-    if curl --fail --silent --show-error --location \
+    if curl --fail --silent --show-error --location --user-agent "$user_agent" \
         "$download_url" --output "$remote_crate"
     then
         cmp "$local_crate" "$remote_crate" || {
@@ -42,7 +43,7 @@ do
 
     cargo publish --locked -p "$crate"
     attempt=0
-    while ! curl --fail --silent --show-error --location \
+    while ! curl --fail --silent --show-error --location --user-agent "$user_agent" \
         "$download_url" --output "$remote_crate"
     do
         attempt=$((attempt + 1))

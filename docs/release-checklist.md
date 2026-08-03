@@ -117,7 +117,7 @@ one at a time, waiting for registry/index visibility before its consumer:
   troubleshooting, platforms, migration, configuration, storage, and safety
   links work from the packaged documentation.
 - [ ] Release notes clearly exclude Windows binaries/npm, Windows ARM, Linux
-  ARM, and musl for `alpha.1`.
+  ARM, and musl for `alpha.2`.
 - [ ] `SECURITY.md` identifies the supported alpha and private reporting path.
 
 ## Bad-release response

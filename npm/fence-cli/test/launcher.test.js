@@ -41,7 +41,7 @@ test("verifies version, target, and binary digest", (context) => {
   const integrity = path.join(root, "integrity.json");
   fs.writeFileSync(binary, "test binary");
   fs.writeFileSync(integrity, JSON.stringify({
-    version: "0.1.0-alpha.1",
+    version: "0.1.0-alpha.2",
     target: "linux-x64-gnu",
     sha256: sha256(binary)
   }));
@@ -49,12 +49,12 @@ test("verifies version, target, and binary digest", (context) => {
   assert.doesNotThrow(() => verifyBinary(
     binary,
     integrity,
-    "0.1.0-alpha.1",
+    "0.1.0-alpha.2",
     "linux-x64-gnu"
   ));
   fs.appendFileSync(binary, "corrupt");
   assert.throws(
-    () => verifyBinary(binary, integrity, "0.1.0-alpha.1", "linux-x64-gnu"),
+    () => verifyBinary(binary, integrity, "0.1.0-alpha.2", "linux-x64-gnu"),
     /checksum verification failed/
   );
 });
@@ -95,18 +95,18 @@ test("replaces itself and preserves child exit and signal behavior", async (cont
   fs.copyFileSync(path.join(__dirname, "../bin/fence.js"), path.join(meta, "bin/fence.js"));
   fs.writeFileSync(
     path.join(meta, "package.json"),
-    JSON.stringify({ name: "fence-cli", version: "0.1.0-alpha.1" })
+    JSON.stringify({ name: "fence-cli", version: "0.1.0-alpha.2" })
   );
   fs.writeFileSync(
     path.join(leaf, "package.json"),
-    JSON.stringify({ name: "@22elix3r/fence-linux-x64-gnu", version: "0.1.0-alpha.1" })
+    JSON.stringify({ name: "@22elix3r/fence-linux-x64-gnu", version: "0.1.0-alpha.2" })
   );
   const binary = path.join(leaf, "bin/fence");
   fs.writeFileSync(binary, "#!/bin/sh\nexit \"$2\"\n", { mode: 0o755 });
   fs.writeFileSync(
     path.join(leaf, "integrity.json"),
     JSON.stringify({
-      version: "0.1.0-alpha.1",
+      version: "0.1.0-alpha.2",
       target: "linux-x64-gnu",
       sha256: sha256(binary)
     })
@@ -127,7 +127,7 @@ test("replaces itself and preserves child exit and signal behavior", async (cont
   fs.writeFileSync(
     path.join(leaf, "integrity.json"),
     JSON.stringify({
-      version: "0.1.0-alpha.1",
+      version: "0.1.0-alpha.2",
       target: "linux-x64-gnu",
       sha256: sha256(binary)
     })

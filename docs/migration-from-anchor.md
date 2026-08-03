@@ -9,7 +9,7 @@ the old worktree and store intact until its retained sessions are no longer
 needed. If Fence detects a legacy store for the same repository, `fence doctor`
 reports it and session start or mutation refuses instead of guessing.
 
-There is no automatic migration tool in `0.1.0-alpha.1`. To begin using Fence:
+There is no automatic migration tool in `0.1.0-alpha.2`. To begin using Fence:
 
 1. Finish recovery using the exact compatible Anchor version, against a copy if
    recovery is uncertain.

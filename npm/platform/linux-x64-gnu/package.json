@@ -1,6 +1,6 @@
 {
   "name": "@22elix3r/fence-linux-x64-gnu",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Fence CLI binary for x86-64 GNU/Linux",
   "license": "MIT OR Apache-2.0",
   "repository": "https://github.com/22elix3r/fence",

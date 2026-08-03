@@ -65,9 +65,9 @@ and hunk-level restore. Those cases are refused rather than approximated.
 Fence uses Rust 2024 and has an MSRV of Rust 1.85.
 
 ```console
-npm install -g fence-cli@0.1.0-alpha.1
+npm install -g fence-cli@0.1.0-alpha.2
 # or compile the exact prerelease from crates.io
-cargo install fence-cli --version 0.1.0-alpha.1 --locked
+cargo install fence-cli --version 0.1.0-alpha.2 --locked
 
 fence --version
 ```
@@ -240,16 +240,16 @@ Tagged Unix alpha releases provide `.tar.gz` archives for Linux x86-64 and
 macOS x86-64/arm64. Verify the central SHA-256 manifest before installing:
 
 ```console
-sha256sum --check --ignore-missing fence-0.1.0-alpha.1-SHA256SUMS
-tar -xzf fence-0.1.0-alpha.1-<target>.tar.gz
-install fence-0.1.0-alpha.1-<target>/fence ~/.local/bin/fence
+sha256sum --check --ignore-missing fence-0.1.0-alpha.2-SHA256SUMS
+tar -xzf fence-0.1.0-alpha.2-<target>.tar.gz
+install fence-0.1.0-alpha.2-<target>/fence ~/.local/bin/fence
 ```
 
 On macOS, use `shasum -a 256 -c` in place of `sha256sum --check`. GitHub build
 provenance can additionally be checked with:
 
 ```console
-gh attestation verify fence-0.1.0-alpha.1-<target>.tar.gz \
+gh attestation verify fence-0.1.0-alpha.2-<target>.tar.gz \
   -R 22elix3r/fence
 ```
 
@@ -264,7 +264,7 @@ checklist](docs/release-checklist.md).
 | macOS | Supported | Experimental single-path and batch |
 | Windows | Experimental native support | Not claimed; metadata-safe mutation is pending |
 
-Windows does not receive an npm or direct-download artifact in `alpha.1`.
+Windows does not receive an npm or direct-download artifact in `alpha.2`.
 Linux ARM, Windows ARM, and Alpine/musl are also unsupported. See the complete
 [platform policy](docs/platforms.md).
 

@@ -424,7 +424,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fence-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "blake3",
  "cap-fs-ext",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "fence-git"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "blake3",
  "cap-std",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "fence-session"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "atomic-write-file",
  "blake3",
@@ -491,14 +491,14 @@ dependencies = [
 
 [[package]]
 name = "fence-unix"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "fence-windows"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "thiserror",
  "windows-sys 0.61.2",

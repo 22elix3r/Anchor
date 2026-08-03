@@ -357,6 +357,22 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token || secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
         run: scripts/publish-crates.sh
+      - name: Yank the incomplete alpha.1 leaf after successful replacement
+        if: github.ref_name == 'v0.1.0-alpha.2'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_url="https://crates.io/api/v1/crates/fence-unix/0.1.0-alpha.1"
+          if curl --fail --silent --show-error \
+            --user-agent 'Fence release recovery (+https://github.com/22elix3r/fence)' \
+            "${version_url}" | jq --exit-status '.version.yanked == true' >/dev/null
+          then
+            echo "fence-unix 0.1.0-alpha.1 is already yanked"
+          else
+            cargo yank --version 0.1.0-alpha.1 fence-unix
+          fi
 
   publish-npm:
     name: Publish npm packages under alpha
