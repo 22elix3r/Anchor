@@ -438,7 +438,7 @@ jobs:
               test "$(node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "${remote}")" = "${integrity}"
               echo "${name}@${version} already exists with identical integrity"
             else
-              npm publish "${tarball}" --tag alpha --access public --provenance
+              npm publish "${PWD}/${tarball}" --tag alpha --access public --provenance
               for attempt in $(seq 1 60); do
                 npm view "${name}@${version}" version >/dev/null 2>&1 && break
                 test "${attempt}" -lt 60
@@ -557,7 +557,7 @@ jobs:
             test "$(npm view fence-cli dist-tags.latest)" = "${version}"
             echo "fence-cli@${version} already exists with identical integrity and is latest"
           else
-            npm publish "${tarball}" --tag latest --access public --provenance
+            npm publish "${PWD}/${tarball}" --tag latest --access public --provenance
           fi
       - name: Publish GitHub prerelease
         env:
