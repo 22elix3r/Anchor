@@ -4,11 +4,11 @@ All notable changes to Fence are recorded here. Versions follow Semantic
 Versioning; persisted-data compatibility has its own policy because this
 project stores safety-critical snapshots and recovery journals.
 
-## [0.1.0-alpha.1] - Unreleased
+## [0.1.0-alpha.2] - 2026-08-03
 
 This is the first public Unix alpha. Filesystem mutation is not yet stable and
 is not supported on Windows. Cargo and npm versions, the Git tag, and release
-artifacts use the same immutable `0.1.0-alpha.1` version.
+artifacts use the same immutable `0.1.0-alpha.2` version.
 
 ### Included
 
@@ -50,3 +50,11 @@ artifacts use the same immutable `0.1.0-alpha.1` version.
 - Older ad-hoc JSON output is not compatible with the public schema-1 envelope.
 
 See `docs/safety.md` for the complete guarantee and refusal model.
+
+## [0.1.0-alpha.1] - 2026-08-03
+
+This incomplete publication uploaded only `fence-unix` before release
+verification was blocked by crates.io rejecting download probes without a
+descriptive HTTP user agent. It was never announced as an installable Fence
+release. `fence-unix 0.1.0-alpha.1` will be yanked after the complete alpha.2
+crate set is published.

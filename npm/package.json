@@ -1,7 +1,7 @@
 {
   "name": "fence-release-packages",
   "private": true,
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "scripts": {
     "test": "node --test fence-cli/test/*.test.js",
     "check:versions": "node ../scripts/check-release-version.mjs"

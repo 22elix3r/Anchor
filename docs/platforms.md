@@ -10,7 +10,7 @@ release smoke workflow covers capture, diff, restore, doctor, and GC.
 | Arch x86-64 | Supported after release-artifact smoke | Current pinned CI image |
 | macOS 13.5+ Intel | Supported | Built and tested on native Intel runner |
 | macOS 13.5+ Apple silicon | Supported | Built and tested on native ARM runner |
-| Windows x64 | Source-level experimental | No npm or direct binary in `alpha.1`; mutation remains publicly refused |
+| Windows x64 | Source-level experimental | No npm or direct binary in `alpha.2`; mutation remains publicly refused |
 | Windows ARM | Unsupported | No release artifact |
 | Linux ARM | Unsupported | No release artifact |
 | Alpine/musl | Unsupported | The Linux npm package requires glibc |

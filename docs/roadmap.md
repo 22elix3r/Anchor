@@ -144,7 +144,7 @@ Acceptance:
 
 ### R5. Unix release hardening
 
-Status: in progress. The workspace is versioned as `0.1.0-alpha.1`; release
+Status: in progress. The workspace is versioned as `0.1.0-alpha.2`; release
 archives, checksums, build-provenance attestations, a no-`git` executable smoke
 test, and an operator release checklist are implemented. Retention policies,
 terminal-journal pruning, benchmarks, streaming objects, and the full persisted
