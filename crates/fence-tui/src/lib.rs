@@ -1,4 +1,7 @@
 //! Terminal review frontend for Fence.
+//!
+//! This crate is published as an implementation layer for the `fence` CLI. Its
+//! Rust API is prerelease and may change between `0.1.0-alpha.N` versions.
 
 use std::io;
 use std::time::Duration;

@@ -1,0 +1,45 @@
+{
+  "name": "fence-cli",
+  "version": "0.1.0-alpha.1",
+  "description": "Local-first filesystem recovery for coding-agent sessions",
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://github.com/22elix3r/fence",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/22elix3r/fence.git"
+  },
+  "bugs": "https://github.com/22elix3r/fence/issues",
+  "keywords": [
+    "filesystem",
+    "snapshot",
+    "recovery",
+    "git",
+    "cli"
+  ],
+  "bin": {
+    "fence": "bin/fence.js"
+  },
+  "files": [
+    "bin/fence.js",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "THIRD_PARTY_LICENSES"
+  ],
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "optionalDependencies": {
+    "@22elix3r/fence-linux-x64-gnu": "0.1.0-alpha.1",
+    "@22elix3r/fence-darwin-x64": "0.1.0-alpha.1",
+    "@22elix3r/fence-darwin-arm64": "0.1.0-alpha.1"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

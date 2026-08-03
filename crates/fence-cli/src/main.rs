@@ -182,6 +182,14 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Serialize)]
+struct JsonEnvelope<'a, T: ?Sized> {
+    schema: u8,
+    operation: &'static str,
+    status: &'static str,
+    data: &'a T,
+}
+
 fn main() -> ExitCode {
     match execute(Cli::parse()) {
         Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),
@@ -248,11 +256,16 @@ fn execute(cli: Cli) -> Result<i32> {
                 .into_diagnostic()
                 .wrap_err("cannot list sessions")?;
             if let Some(session) = sessions.first() {
-                print_sessions(std::slice::from_ref(session), format)?;
+                let status = if session.state.is_terminal() {
+                    "ok"
+                } else {
+                    "nonterminal"
+                };
+                print_sessions(std::slice::from_ref(session), format, "status", status)?;
                 Ok(if session.state.is_terminal() { 0 } else { 3 })
             } else {
                 if format == OutputFormat::Json {
-                    println!("null");
+                    print_json("status", "empty", &serde_json::Value::Null)?;
                 } else {
                     println!("No sessions in this worktree.");
                 }
@@ -269,7 +282,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 .list_sessions()
                 .into_diagnostic()
                 .wrap_err("cannot list sessions")?;
-            print_sessions(&sessions, format)?;
+            print_sessions(&sessions, format, "sessions", "ok")?;
             Ok(0)
         }
         Commands::DeletedSessions { format } => {
@@ -282,7 +295,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 .list_deleted_sessions()
                 .into_diagnostic()
                 .wrap_err("cannot list deleted sessions")?;
-            print_sessions(&sessions, format)?;
+            print_sessions(&sessions, format, "deleted-sessions", "ok")?;
             Ok(0)
         }
         Commands::Show { session, format } => {
@@ -292,7 +305,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 .into_diagnostic()
                 .wrap_err("Fence storage is busy")?;
             let session = load_session(&store, &session)?;
-            print_sessions(std::slice::from_ref(&session), format)?;
+            print_sessions(std::slice::from_ref(&session), format, "show", "ok")?;
             Ok(0)
         }
         Commands::Diff {
@@ -470,12 +483,13 @@ fn execute(cli: Cli) -> Result<i32> {
                 .wrap_err("session ID is not a UUID")?;
             if !merge && !yes {
                 if format == OutputFormat::Json {
-                    print_json(&serde_json::json!({
-                        "schema": 1,
-                        "operation": "restore-file",
-                        "status": "confirmation-required",
-                        "session": session,
-                    }))?;
+                    print_json(
+                        "restore-file",
+                        "confirmation-required",
+                        &serde_json::json!({
+                            "session": session,
+                        }),
+                    )?;
                 } else {
                     eprintln!(
                         "no change made; review `fence diff {session}` and rerun this command with --yes"
@@ -521,16 +535,17 @@ fn execute(cli: Cli) -> Result<i32> {
             } = result
             {
                 if format == OutputFormat::Json {
-                    print_json(&serde_json::json!({
-                        "schema": 1,
-                        "operation": "restore-file",
-                        "status": "merge-preview",
-                        "path": PathJson::from(&path),
-                        "current_object": current_object.to_string(),
-                        "current_raw_size": current_raw_size,
-                        "merged_object": merged_object.to_string(),
-                        "merged_raw_size": merged_raw_size,
-                    }))?;
+                    print_json(
+                        "restore-file",
+                        "merge-preview",
+                        &serde_json::json!({
+                            "path": PathJson::from(&path),
+                            "current_object": current_object.to_string(),
+                            "current_raw_size": current_raw_size,
+                            "merged_object": merged_object.to_string(),
+                            "merged_raw_size": merged_raw_size,
+                        }),
+                    )?;
                     return Ok(3);
                 }
                 let current = store
@@ -602,10 +617,17 @@ fn execute(cli: Cli) -> Result<i32> {
             let report = MaintenanceService::doctor(&store, &context)
                 .into_diagnostic()
                 .wrap_err("integrity verification failed")?;
+            let needs_attention = report.incomplete_sessions > 0
+                || report.transactions_needing_recovery > 0
+                || report.unfinished_transactions > 0
+                || report.repository_drift_from_latest
+                || !report.store_private
+                || report.legacy_anchor_store_present;
             if format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                print_json(
+                    "doctor",
+                    if needs_attention { "attention" } else { "ok" },
+                    &serde_json::json!({
                         "sessions": report.sessions,
                         "deleted_sessions": report.deleted_sessions,
                         "incomplete_sessions": report.incomplete_sessions,
@@ -622,9 +644,8 @@ fn execute(cli: Cli) -> Result<i32> {
                         "repository_drift_from_latest": report.repository_drift_from_latest,
                         "store_private": report.store_private,
                         "legacy_anchor_store_present": report.legacy_anchor_store_present,
-                    }))
-                    .into_diagnostic()?
-                );
+                    }),
+                )?;
             } else {
                 println!("sessions: {}", report.sessions);
                 println!("deleted sessions: {}", report.deleted_sessions);
@@ -670,14 +691,7 @@ fn execute(cli: Cli) -> Result<i32> {
                     report.legacy_anchor_store_present
                 );
             }
-            Ok(i32::from(
-                report.incomplete_sessions > 0
-                    || report.transactions_needing_recovery > 0
-                    || report.unfinished_transactions > 0
-                    || report.repository_drift_from_latest
-                    || !report.store_private
-                    || report.legacy_anchor_store_present,
-            ))
+            Ok(i32::from(needs_attention))
         }
         Commands::Gc { dry_run, format } => {
             let store = current_store()?;
@@ -685,16 +699,16 @@ fn execute(cli: Cli) -> Result<i32> {
                 .into_diagnostic()
                 .wrap_err("garbage collection failed")?;
             if format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                print_json(
+                    "gc",
+                    "ok",
+                    &serde_json::json!({
                         "dry_run": report.dry_run,
                         "manifests_removed": report.manifests_removed,
                         "objects_removed": report.objects_removed,
                         "bytes_reclaimed": report.bytes_reclaimed,
-                    }))
-                    .into_diagnostic()?
-                );
+                    }),
+                )?;
             } else {
                 let verb = if report.dry_run {
                     "would reclaim"
@@ -714,16 +728,16 @@ fn execute(cli: Cli) -> Result<i32> {
                 .into_diagnostic()
                 .wrap_err("cannot recover stale session metadata")?;
             if format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                print_json(
+                    "recover",
+                    "ok",
+                    &serde_json::json!({
                         "abandoned_sessions": abandoned
                             .iter()
                             .map(ToString::to_string)
                             .collect::<Vec<_>>(),
-                    }))
-                    .into_diagnostic()?
-                );
+                    }),
+                )?;
             } else if abandoned.is_empty() {
                 println!("No stale nonterminal sessions.");
             } else {
@@ -742,15 +756,15 @@ fn execute(cli: Cli) -> Result<i32> {
                 .into_diagnostic()
                 .wrap_err("restore transaction recovery was refused")?;
             if format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                print_json(
+                    "recover-transactions",
+                    "ok",
+                    &serde_json::json!({
                         "rolled_back": report.rolled_back,
                         "completed": report.completed,
                         "skipped_other_worktrees": report.skipped_other_worktrees,
-                    }))
-                    .into_diagnostic()?
-                );
+                    }),
+                )?;
             } else {
                 for transaction in &report.rolled_back {
                     println!("rolled back transaction {transaction}");
@@ -845,15 +859,15 @@ fn load_session(store: &SessionStore, value: &str) -> Result<Session> {
         .wrap_err("cannot load session")
 }
 
-fn print_sessions(sessions: &[Session], format: OutputFormat) -> Result<()> {
+fn print_sessions(
+    sessions: &[Session],
+    format: OutputFormat,
+    operation: &'static str,
+    status: &'static str,
+) -> Result<()> {
     if format == OutputFormat::Json {
         let records = sessions.iter().map(SessionJson::from).collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&records)
-                .into_diagnostic()
-                .wrap_err("cannot encode JSON output")?
-        );
+        print_json(operation, status, &records)?;
         return Ok(());
     }
     for session in sessions {
@@ -923,15 +937,16 @@ fn execute_whole_restore(
             no_changes,
         } => {
             if format == OutputFormat::Json {
-                print_json(&serde_json::json!({
-                    "schema": 1,
-                    "operation": "rollback",
-                    "status": "preview",
-                    "session": session,
-                    "current_manifest": current_manifest.to_string(),
-                    "writes": writes,
-                    "no_changes": no_changes,
-                }))?;
+                print_json(
+                    "rollback",
+                    "preview",
+                    &serde_json::json!({
+                        "session": session,
+                        "current_manifest": current_manifest.to_string(),
+                        "writes": writes,
+                        "no_changes": no_changes,
+                    }),
+                )?;
             } else {
                 println!(
                     "whole restore preview: {writes} path(s) would change; \
@@ -946,13 +961,14 @@ fn execute_whole_restore(
         }
         WholeRestoreResult::Applied { paths } => {
             if format == OutputFormat::Json {
-                print_json(&serde_json::json!({
-                    "schema": 1,
-                    "operation": "rollback",
-                    "status": "applied",
-                    "session": session,
-                    "paths": paths,
-                }))?;
+                print_json(
+                    "rollback",
+                    "applied",
+                    &serde_json::json!({
+                        "session": session,
+                        "paths": paths,
+                    }),
+                )?;
             } else {
                 println!("restored {paths} included path(s) as a verified batch");
             }
@@ -969,13 +985,14 @@ fn execute_whole_restore(
                         })
                     })
                     .collect::<Vec<_>>();
-                print_json(&serde_json::json!({
-                    "schema": 1,
-                    "operation": "rollback",
-                    "status": "conflict",
-                    "session": session,
-                    "conflicts": conflicts,
-                }))?;
+                print_json(
+                    "rollback",
+                    "conflict",
+                    &serde_json::json!({
+                        "session": session,
+                        "conflicts": conflicts,
+                    }),
+                )?;
             } else {
                 for conflict in conflicts {
                     eprintln!(
@@ -999,14 +1016,15 @@ fn report_restore_result(result: RestoreApplyResult, format: OutputFormat) -> Re
             merged,
         } => {
             if format == OutputFormat::Json {
-                print_json(&serde_json::json!({
-                    "schema": 1,
-                    "operation": "restore-file",
-                    "status": "applied",
-                    "session": session_id.to_string(),
-                    "path": PathJson::from(&path),
-                    "merged": merged,
-                }))?;
+                print_json(
+                    "restore-file",
+                    "applied",
+                    &serde_json::json!({
+                        "session": session_id.to_string(),
+                        "path": PathJson::from(&path),
+                        "merged": merged,
+                    }),
+                )?;
             } else {
                 println!("restored {}", display_path(&path));
             }
@@ -1014,12 +1032,13 @@ fn report_restore_result(result: RestoreApplyResult, format: OutputFormat) -> Re
         }
         RestoreApplyResult::NoChange { reason } => {
             if format == OutputFormat::Json {
-                print_json(&serde_json::json!({
-                    "schema": 1,
-                    "operation": "restore-file",
-                    "status": "no-change",
-                    "reason": format!("{reason:?}"),
-                }))?;
+                print_json(
+                    "restore-file",
+                    "no-change",
+                    &serde_json::json!({
+                        "reason": format!("{reason:?}"),
+                    }),
+                )?;
             } else {
                 println!("no change: {reason:?}");
             }
@@ -1027,12 +1046,13 @@ fn report_restore_result(result: RestoreApplyResult, format: OutputFormat) -> Re
         }
         RestoreApplyResult::Conflict { reason } => {
             if format == OutputFormat::Json {
-                print_json(&serde_json::json!({
-                    "schema": 1,
-                    "operation": "restore-file",
-                    "status": "conflict",
-                    "reason": format!("{reason:?}"),
-                }))?;
+                print_json(
+                    "restore-file",
+                    "conflict",
+                    &serde_json::json!({
+                        "reason": format!("{reason:?}"),
+                    }),
+                )?;
             } else {
                 eprintln!("conflict: {reason:?}; no filesystem change was made");
             }
@@ -1046,11 +1066,7 @@ fn report_restore_result(result: RestoreApplyResult, format: OutputFormat) -> Re
 
 fn report_index_restore(status: &'static str, format: OutputFormat) -> Result<()> {
     if format == OutputFormat::Json {
-        return print_json(&serde_json::json!({
-            "schema": 1,
-            "operation": "restore-index",
-            "status": status,
-        }));
+        return print_json("restore-index", status, &serde_json::json!({}));
     }
     match status {
         "applied" => println!("restored exact pre-session index bytes"),
@@ -1060,12 +1076,17 @@ fn report_index_restore(status: &'static str, format: OutputFormat) -> Result<()
     Ok(())
 }
 
-fn print_json(value: &serde_json::Value) -> Result<()> {
+fn print_json<T: Serialize>(operation: &'static str, status: &'static str, data: &T) -> Result<()> {
     println!(
         "{}",
-        serde_json::to_string_pretty(value)
-            .into_diagnostic()
-            .wrap_err("cannot encode JSON output")?
+        serde_json::to_string_pretty(&JsonEnvelope {
+            schema: 1,
+            operation,
+            status,
+            data,
+        })
+        .into_diagnostic()
+        .wrap_err("cannot encode JSON output")?
     );
     Ok(())
 }
@@ -1088,17 +1109,20 @@ fn print_diff(
                 previous_path: change.previous_path.as_ref().map(PathJson::from),
             })
             .collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&DiffJson {
+        print_json(
+            "diff",
+            if diff.is_empty() {
+                "no-differences"
+            } else {
+                "differences"
+            },
+            &DiffJson {
                 view,
                 repository_drift,
                 index_drift,
                 changes,
-            })
-            .into_diagnostic()
-            .wrap_err("cannot encode JSON output")?
-        );
+            },
+        )?;
         return Ok(());
     }
     if repository_drift == Some(true) {

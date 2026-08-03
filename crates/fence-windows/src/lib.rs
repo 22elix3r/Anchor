@@ -2,6 +2,9 @@
 //!
 //! This crate is deliberately the only Fence crate allowed to invoke Win32 APIs through
 //! `unsafe`. Its public API owns every handle and never exposes raw pointers or handles.
+//!
+//! This implementation crate's Rust API is prerelease and may change between
+//! `0.1.0-alpha.N` versions.
 
 #![cfg(windows)]
 

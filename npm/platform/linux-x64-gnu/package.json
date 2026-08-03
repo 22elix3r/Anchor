@@ -1,0 +1,12 @@
+{
+  "name": "@22elix3r/fence-linux-x64-gnu",
+  "version": "0.1.0-alpha.1",
+  "description": "Fence CLI binary for x86-64 GNU/Linux",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/22elix3r/fence",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"],
+  "files": ["bin/fence", "integrity.json", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_LICENSES"],
+  "publishConfig": { "access": "public", "provenance": true }
+}

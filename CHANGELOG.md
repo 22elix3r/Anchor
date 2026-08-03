@@ -6,8 +6,9 @@ project stores safety-critical snapshots and recovery journals.
 
 ## [0.1.0-alpha.1] - Unreleased
 
-This is an experimental Unix alpha. Filesystem mutation is not yet stable and
-is not supported on Windows.
+This is the first public Unix alpha. Filesystem mutation is not yet stable and
+is not supported on Windows. Cargo and npm versions, the Git tag, and release
+artifacts use the same immutable `0.1.0-alpha.1` version.
 
 ### Included
 
@@ -23,6 +24,11 @@ is not supported on Windows.
 - Process-crash recovery, doctor, recoverable deletion, and verified GC.
 - Linux x86-64 and macOS x86-64/arm64 release archives with checksums and
   GitHub build-provenance attestations.
+- crates.io distribution as `fence-cli` with the six lockstep internal crates.
+- npm distribution as `fence-cli`, installing the `fence` command from an
+  exact-version platform package without lifecycle scripts or runtime download.
+- A versioned JSON envelope with `schema`, `operation`, `status`, and `data`
+  fields for every command that supports `--format json`.
 
 ### Safety boundaries
 
@@ -39,5 +45,8 @@ is not supported on Windows.
 - The rename is a hard pre-alpha break: no `anchor` command alias,
   `.anchorignore` behavior, `ANCHOR_*` environment fallback, or automatic old
   store import is provided.
+- The first npm alpha and direct binaries support GNU/Linux x86-64 and macOS
+  x86-64/arm64. Windows remains source-tested but is not distributed.
+- Older ad-hoc JSON output is not compatible with the public schema-1 envelope.
 
 See `docs/safety.md` for the complete guarantee and refusal model.

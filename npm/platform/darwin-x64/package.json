@@ -1,0 +1,11 @@
+{
+  "name": "@22elix3r/fence-darwin-x64",
+  "version": "0.1.0-alpha.1",
+  "description": "Fence CLI binary for Intel macOS",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/22elix3r/fence",
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "files": ["bin/fence", "integrity.json", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_LICENSES"],
+  "publishConfig": { "access": "public", "provenance": true }
+}

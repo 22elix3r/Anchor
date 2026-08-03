@@ -2,6 +2,15 @@
 /fuzz/target/
 /fuzz/artifacts/
 /fuzz/corpus/
+/dist/
+/inputs/
+/stage/
+/package-fixtures/
+/npm-staged/
+/npm-tarballs/
+/npm-publish/
+/npm-signature-audit/
+*.cdx.json
 /.idea/
 /.vscode/
 *.swp

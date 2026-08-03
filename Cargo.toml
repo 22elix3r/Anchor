@@ -18,14 +18,17 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/22elix3r/fence"
 homepage = "https://github.com/22elix3r/fence"
 authors = ["Fence contributors"]
+readme = "README.md"
+keywords = ["filesystem", "snapshot", "recovery", "git", "cli"]
+categories = ["command-line-utilities", "development-tools", "filesystem"]
 
 [workspace.dependencies]
-fence-unix = { version = "0.1.0-alpha.1", path = "crates/fence-unix" }
-fence-windows = { version = "0.1.0-alpha.1", path = "crates/fence-windows" }
-fence-core = { version = "0.1.0-alpha.1", path = "crates/fence-core" }
-fence-git = { version = "0.1.0-alpha.1", path = "crates/fence-git" }
-fence-session = { version = "0.1.0-alpha.1", path = "crates/fence-session" }
-fence-tui = { version = "0.1.0-alpha.1", path = "crates/fence-tui" }
+fence-unix = { version = "=0.1.0-alpha.1", path = "crates/fence-unix" }
+fence-windows = { version = "=0.1.0-alpha.1", path = "crates/fence-windows" }
+fence-core = { version = "=0.1.0-alpha.1", path = "crates/fence-core" }
+fence-git = { version = "=0.1.0-alpha.1", path = "crates/fence-git" }
+fence-session = { version = "=0.1.0-alpha.1", path = "crates/fence-session" }
+fence-tui = { version = "=0.1.0-alpha.1", path = "crates/fence-tui" }
 
 base64 = "0.23.0"
 atomic-write-file = "0.3.0"

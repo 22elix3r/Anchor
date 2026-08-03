@@ -1,4 +1,9 @@
 //! Durable session lifecycle and interactive command execution.
+//!
+//! This crate is published as an implementation layer for the `fence` CLI. Its
+//! Rust API is prerelease and may change between `0.1.0-alpha.N` versions;
+//! persisted sessions and recovery journals follow the stricter compatibility
+//! and refusal rules documented by Fence.
 
 mod config;
 mod frozen_policy;
