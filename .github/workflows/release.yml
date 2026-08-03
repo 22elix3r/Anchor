@@ -526,7 +526,7 @@ jobs:
           mkdir npm-signature-audit
           cd npm-signature-audit
           npm init --yes >/dev/null
-          npm install --package-lock-only --ignore-scripts --include=optional \
+          npm install --ignore-scripts --include=optional \
             "${GITHUB_WORKSPACE}/npm-tarballs/fence-cli-${version}.tgz"
           npm audit signatures
 
