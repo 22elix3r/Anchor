@@ -503,7 +503,11 @@ jobs:
           export NPM_CONFIG_PREFIX="${RUNNER_TEMP}/fence-npm-prefix"
           npm install --global --ignore-scripts --include=optional \
             "${GITHUB_WORKSPACE}/npm-tarballs/fence-cli-${version}.tgz"
-          test "$(find "$(npm root --global)/@22elix3r" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 1
+          platform_package_count="$(
+            npm ls --global --all --parseable |
+              grep -c '/node_modules/@22elix3r/fence-'
+          )"
+          test "${platform_package_count}" = 1
           PATH="${NPM_CONFIG_PREFIX}/bin:${PATH}" fence --version | grep -F "${version}"
           scripts/release-smoke.sh "${NPM_CONFIG_PREFIX}/bin/fence"
       - name: Verify public-registry signatures and provenance
